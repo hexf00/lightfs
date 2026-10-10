@@ -70,10 +70,18 @@ SERVER_PID=$!
 sleep 1
 
 echo "target endpoint: $LIGHTFS_OSS_ENDPOINT bucket: $LIGHTFS_OSS_BUCKET (credentials redacted)"
-echo "== 1. signature/region/addressing: create + read back"
+echo "== 1. signature/region/addressing: create + read back (byte-exact)"
+head -c 1048576 /dev/urandom > "$RUN/payload.bin"
+EXPECT_SHA=$({ sha256sum 2>/dev/null || shasum -a 256; } < "$RUN/payload.bin" | awk '{print $1}')
 ./target/release/lightfs-shell --config "$CFG" mkdir /oss-acc
-head -c 1048576 /dev/urandom | ./target/release/lightfs-shell --config "$CFG" write /oss-acc/blob --stdin
-./target/release/lightfs-shell --config "$CFG" cat /oss-acc/blob | { sha256sum 2>/dev/null || shasum -a 256; } | head -1
+./target/release/lightfs-shell --config "$CFG" write /oss-acc/blob --stdin < "$RUN/payload.bin"
+ACTUAL_SHA=$(./target/release/lightfs-shell --config "$CFG" cat /oss-acc/blob | { sha256sum 2>/dev/null || shasum -a 256; } | awk '{print $1}')
+if [[ "$ACTUAL_SHA" == "$EXPECT_SHA" ]]; then
+    echo "  read-back byte-exact: $ACTUAL_SHA"
+else
+    echo "  ERROR: read-back sha mismatch: expected $EXPECT_SHA got $ACTUAL_SHA" >&2
+    exit 1
+fi
 
 echo "== 2. range reads"
 ./target/release/lightfs-shell --config "$CFG" read /oss-acc/blob 0 2>/dev/null | head -1 || true

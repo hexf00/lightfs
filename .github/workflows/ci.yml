@@ -2,7 +2,7 @@
 # scripts/ci.sh (runnable locally with no arguments). Required for merge:
 # unit tests, dependency gate, MinIO integration tests.
 #
-# NOT in this workflow (separate release gates):
+# NOT in this workflow (separate gates, see docs/TESTING.md):
 # - Linux FUSE semantic acceptance (requires a runner with /dev/fuse)
 # - real-OSS external acceptance (requires isolated test credentials)
 # - performance/soak runs (manual: scripts/perf-*.sh)
@@ -10,7 +10,7 @@ name: ci
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
 
 jobs:

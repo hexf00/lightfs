@@ -1,5 +1,5 @@
 //! Shell adapter: CLI + scripted mode over any FsApi backend.
-//! Deliberately business-logic-free (adapters only).
+//! Deliberately business-logic-free (docs/AGENT.md: adapters only).
 //!
 //! Commands: ls, stat, mkdir, touch, cat, write, mv, rm, tree,
 //! plus `assert-error <cmd...>` inside scripts.
@@ -194,7 +194,12 @@ impl Shell {
             std::io::copy(&mut reader, &mut lock)?;
             lock.flush()?;
         }
-        Ok(vec![String::new()])
+        // NO trailing newline: cat streams raw bytes and must stay
+        // byte-exact for binaries. The caller (the shell binary) prints a
+        // line per returned String - returning an empty one used to append
+        // a \n to every cat output (found by a real byte-exact comparison
+        // on the ECS/VPC run; cat-vs-cat comparisons had cancelled it out).
+        Ok(vec![])
     }
 
     /// write PATH --string TEXT | write PATH --stdin
@@ -295,7 +300,7 @@ impl Shell {
 
     /// bench-generate DIR COUNT AVG_SIZE: deterministic dataset through the
     /// backend (files sharded 60/dirs; sizes vary ±10% like the target
-    /// workload).
+    /// workload in docs/IMPLEMENTATION.md Phase 13).
     fn cmd_bench_generate(&self, args: &[String]) -> Result<Vec<String>> {
         let dir = self.one_path(args, "bench-generate")?;
         let count: u64 = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(6000);
