@@ -1,5 +1,5 @@
 //! Shell adapter: CLI + scripted mode over any FsApi backend.
-//! Deliberately business-logic-free (docs/AGENT.md: adapters only).
+//! Deliberately business-logic-free (adapters only).
 //!
 //! Commands: ls, stat, mkdir, touch, cat, write, mv, rm, tree,
 //! plus `assert-error <cmd...>` inside scripts.
@@ -300,7 +300,7 @@ impl Shell {
 
     /// bench-generate DIR COUNT AVG_SIZE: deterministic dataset through the
     /// backend (files sharded 60/dirs; sizes vary ±10% like the target
-    /// workload in docs/IMPLEMENTATION.md Phase 13).
+    /// workload).
     fn cmd_bench_generate(&self, args: &[String]) -> Result<Vec<String>> {
         let dir = self.one_path(args, "bench-generate")?;
         let count: u64 = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(6000);
