@@ -85,31 +85,34 @@ jobs:
           cd minio-src
           go build -trimpath -ldflags "-s -w" -o ..\minio.exe .
 
-      - name: Start MinIO
+      - name: "WinFsp mount smoke (single step: servers must outlive step-local process cleanup)"
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force D:\minio-data | Out-Null
-          Start-Process -FilePath .\minio.exe `
-            -ArgumentList 'server','D:\minio-data','--address',':9000' `
-            -RedirectStandardError minio.err -RedirectStandardOutput minio.out
-          $ok = $false
-          foreach ($i in 1..60) {
-            try {
-              Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 `
-                http://127.0.0.1:9000/minio/health/live | Out-Null
-              $ok = $true; break
-            } catch { Start-Sleep -Milliseconds 500 }
-          }
-          if (-not $ok) {
-            Get-Content minio.err -ErrorAction SilentlyContinue
-            throw "MinIO did not become healthy"
+          $ErrorActionPreference = 'Stop'
+          $env:Path += ";$env:WINFSP_BIN"
+          $procs = @()
+          function Wait-Url($url, $tries, $what) {
+            $ok = $false
+            foreach ($i in 1..$tries) {
+              try {
+                Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 $url | Out-Null
+                $ok = $true; break
+              } catch { Start-Sleep -Milliseconds 500 }
+            }
+            if (-not $ok) { throw "$what did not become healthy" }
           }
 
-      - name: Configure + create bucket + start server
-        shell: pwsh
-        run: |
-          $env:Path += ";$env:WINFSP_BIN"
-          @"
+          try {
+            # ---- [1] MinIO on :9000 ----
+            New-Item -ItemType Directory -Force D:\minio-data | Out-Null
+            $p = Start-Process -FilePath .\minio.exe `
+              -ArgumentList 'server','D:\minio-data','--address',':9000' `
+              -PassThru -RedirectStandardError minio.err -RedirectStandardOutput minio.out
+            $procs += $p
+            Wait-Url 'http://127.0.0.1:9000/minio/health/live' 60 'MinIO'
+
+            # ---- [2] lightfs server on :18085 (server mode, S3 = MinIO) ----
+            @"
           mode = "server"
           [s3]
           endpoint = "http://127.0.0.1:9000"
@@ -127,109 +130,91 @@ jobs:
           [cache.data]
           enabled = false
           "@ | Set-Content -Encoding ascii cfg.toml
-          .\bin\lightfs.exe create-bucket --config cfg.toml
-          Start-Process -FilePath .\bin\lightfs.exe `
-            -ArgumentList 'server','--config',"$PWD\cfg.toml" `
-            -RedirectStandardError server.err -RedirectStandardOutput server.out
-          $ok = $false
-          foreach ($i in 1..60) {
-            try {
-              Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 `
-                http://127.0.0.1:18085/health | Out-Null
-              $ok = $true; break
-            } catch { Start-Sleep -Milliseconds 500 }
-          }
-          if (-not $ok) {
-            Get-Content server.err -ErrorAction SilentlyContinue
-            throw "lightfs server did not become healthy"
-          }
+            .\bin\lightfs.exe create-bucket --config cfg.toml
+            $p = Start-Process -FilePath .\bin\lightfs.exe `
+              -ArgumentList 'server','--config',"$PWD\cfg.toml" `
+              -PassThru -RedirectStandardError server.err -RedirectStandardOutput server.out
+            $procs += $p
+            Wait-Url 'http://127.0.0.1:18085/health' 60 'lightfs server'
 
-      - name: "Mount as drive Q:"
-        shell: pwsh
-        run: |
-          $env:Path += ";$env:WINFSP_BIN"
-          $mount = Start-Process -FilePath .\bin\lightfs.exe `
-            -ArgumentList 'mount','--config',"$PWD\cfg.toml",'Q:' `
-            -PassThru `
-            -RedirectStandardError mount.err -RedirectStandardOutput mount.out
-          $mount.Id | Set-Content mount.pid
-          $ok = $false
-          foreach ($i in 1..120) {
-            if (Test-Path 'Q:\') { $ok = $true; break }
-            if ($mount.HasExited) {
-              Get-Content mount.err -ErrorAction SilentlyContinue
-              throw "mount process exited early (code $($mount.ExitCode))"
+            # ---- [3] mount as drive Q: through the WinFsp adapter ----
+            $mount = Start-Process -FilePath .\bin\lightfs.exe `
+              -ArgumentList 'mount','--config',"$PWD\cfg.toml",'Q:' `
+              -PassThru -RedirectStandardError mount.err -RedirectStandardOutput mount.out
+            $mount.Id | Set-Content mount.pid
+            $ok = $false
+            foreach ($i in 1..120) {
+              if (Test-Path 'Q:\') { $ok = $true; break }
+              if ($mount.HasExited) {
+                Get-Content mount.err -ErrorAction SilentlyContinue
+                throw "mount process exited early (code $($mount.ExitCode))"
+              }
+              Start-Sleep -Milliseconds 500
             }
-            Start-Sleep -Milliseconds 500
+            if (-not $ok) {
+              Get-Content mount.err -ErrorAction SilentlyContinue
+              throw "drive Q: never appeared"
+            }
+            "MOUNTED"
+
+            # ---- [4] roundtrip through the drive ----
+            $shellbin = ".\bin\lightfs-shell.exe"
+            $srv = "--server","http://127.0.0.1:18085"
+
+            # [4.1] text file: create through the drive, read through the drive
+            New-Item -ItemType Directory Q:\docs -Force | Out-Null
+            Set-Content Q:\docs\a.txt -NoNewline 'hello lightfs'
+            if ((Get-Content Q:\docs\a.txt -Raw) -ne 'hello lightfs') { throw "text roundtrip" }
+
+            # [4.2] 5MB random binary through the drive, byte-exact by hash
+            $b = New-Object byte[] (5MB)
+            (New-Object Random 42).NextBytes($b)
+            [IO.File]::WriteAllBytes("$PWD\expect.bin", $b)
+            [IO.File]::Copy("$PWD\expect.bin", 'Q:\docs\rand.bin')
+            $h1 = (Get-FileHash "$PWD\expect.bin" -Algorithm SHA256).Hash
+            $h2 = (Get-FileHash 'Q:\docs\rand.bin' -Algorithm SHA256).Hash
+            if ($h1 -ne $h2) { throw "binary roundtrip hash mismatch" }
+
+            # [4.3] shell client sees the same namespace (server mode)
+            $seen = & $shellbin --config "$PWD\cfg.toml" @srv ls /docs
+            if (-not ($seen -match 'rand.bin')) { throw "shell ls misses rand.bin: $seen" }
+            $cat = (& $shellbin --config "$PWD\cfg.toml" @srv cat /docs/a.txt) -join ""
+            if ($cat -ne 'hello lightfs') { throw "shell cat mismatch: '$cat'" }
+
+            # [4.4] append + read back (write-back buffer path)
+            Add-Content Q:\docs\a.txt -NoNewline '-more'
+            if ((Get-Content Q:\docs\a.txt -Raw) -ne 'hello lightfs-more') { throw "append roundtrip" }
+
+            # [4.5] rename through the drive
+            Move-Item Q:\docs\a.txt Q:\docs\renamed.txt
+            if ((Test-Path Q:\docs\a.txt) -or -not (Test-Path Q:\docs\renamed.txt)) { throw "rename" }
+
+            # [4.6] listing shows both entries
+            $items = @(Get-ChildItem Q:\docs)
+            if ($items.Count -lt 2) { throw "dir listing too small" }
+
+            # [4.7] delete through the drive, gone from the shell too
+            Remove-Item Q:\docs\renamed.txt
+            if (Test-Path Q:\docs\renamed.txt) { throw "delete" }
+            & $shellbin --config "$PWD\cfg.toml" @srv stat /docs/renamed.txt 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) { throw "deleted file still visible to shell" }
+
+            "ROUNDTRIP OK"
+
+            # ---- [5] kill mount process -> drive must disappear ----
+            Stop-Process -Id $mount.Id -Force
+            $ok = $false
+            foreach ($i in 1..60) {
+              if (-not (Test-Path 'Q:\')) { $ok = $true; break }
+              Start-Sleep -Milliseconds 500
+            }
+            if (-not $ok) { throw "drive Q: still present after mount process kill" }
+            "UNMOUNT OK"
           }
-          if (-not $ok) {
-            Get-Content mount.err -ErrorAction SilentlyContinue
-            throw "drive Q: never appeared"
+          finally {
+            foreach ($p in $procs) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+            if (Test-Path mount.pid) { Stop-Process -Id (Get-Content mount.pid) -Force -ErrorAction SilentlyContinue }
           }
-          "MOUNTED"
-
-      - name: Roundtrip through the drive
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $env:Path += ";$env:WINFSP_BIN"
-          $shell = ".\bin\lightfs-shell.exe"
-          $srv = "--server","http://127.0.0.1:18085"
-
-          # [1] text file: create through the drive, read through the drive
-          New-Item -ItemType Directory Q:\docs -Force | Out-Null
-          Set-Content Q:\docs\a.txt -NoNewline 'hello lightfs'
-          if ((Get-Content Q:\docs\a.txt -Raw) -ne 'hello lightfs') { throw "text roundtrip" }
-
-          # [2] 5MB random binary: write through the drive via a plain
-          #     .NET copy, verify byte-exact via hash
-          $b = New-Object byte[] (5MB)
-          (New-Object Random 42).NextBytes($b)
-          [IO.File]::WriteAllBytes("$PWD\expect.bin", $b)
-          [IO.File]::Copy("$PWD\expect.bin", 'Q:\docs\rand.bin')
-          $h1 = (Get-FileHash "$PWD\expect.bin" -Algorithm SHA256).Hash
-          $h2 = (Get-FileHash 'Q:\docs\rand.bin' -Algorithm SHA256).Hash
-          if ($h1 -ne $h2) { throw "binary roundtrip hash mismatch" }
-
-          # [3] shell client sees the same namespace (server mode)
-          $seen = & $shell --config "$PWD\cfg.toml" @srv ls /docs
-          if (-not ($seen -match 'rand.bin')) { throw "shell ls misses rand.bin: $seen" }
-          & $shell --config "$PWD\cfg.toml" @srv cat /docs/a.txt | ForEach-Object { }
-          $cat = & $shell --config "$PWD\cfg.toml" @srv cat /docs/a.txt
-          if ("$cat" -ne 'hello lightfs') { throw "shell cat mismatch: '$cat'" }
-
-          # [4] append + read back (write-back buffer path)
-          Add-Content Q:\docs\a.txt -NoNewline '-more'
-          if ((Get-Content Q:\docs\a.txt -Raw) -ne 'hello lightfs-more') { throw "append roundtrip" }
-
-          # [5] rename through the drive
-          Move-Item Q:\docs\a.txt Q:\docs\renamed.txt
-          if ((Test-Path Q:\docs\a.txt) -or -not (Test-Path Q:\docs\renamed.txt)) { throw "rename" }
-
-          # [6] listing shows both entries with sizes
-          $items = Get-ChildItem Q:\docs
-          if ($items.Count -lt 2) { throw "dir listing: $items" }
-
-          # [7] delete through the drive, gone from the shell too
-          Remove-Item Q:\docs\renamed.txt
-          if (Test-Path Q:\docs\renamed.txt) { throw "delete" }
-          $stat = & $shell --config "$PWD\cfg.toml" @srv stat /docs/renamed.txt 2>&1
-          if ($LASTEXITCODE -eq 0) { throw "deleted file still visible to shell: $stat" }
-
-          "ROUNDTRIP OK"
-
-      - name: Kill mount process -> drive must disappear
-        shell: pwsh
-        run: |
-          $mountId = Get-Content mount.pid
-          Stop-Process -Id $mountId -Force
-          $ok = $false
-          foreach ($i in 1..60) {
-            if (-not (Test-Path 'Q:\')) { $ok = $true; break }
-            Start-Sleep -Milliseconds 500
-          }
-          if (-not $ok) { throw "drive Q: still present after mount process kill" }
-          "UNMOUNT OK"
 
       - name: Dump logs on failure
         if: failure()
