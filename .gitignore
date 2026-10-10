@@ -1,0 +1,9 @@
+dist/
+data/
+mnt/
+target/
+nohup.out
+.DS_Store
+*.db
+*.db-wal
+*.db-shm

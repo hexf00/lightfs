@@ -1,0 +1,52 @@
+[package]
+name = "lightfs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "A small S3-backed shared filesystem"
+
+[dependencies]
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+tiny_http = "0.12"
+base64 = "0.22"
+
+# fuser builds only where FUSE exists (Linux); mounting needs /dev/fuse at runtime.
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.18", default-features = false }
+libc = "0.2"
+
+[[bin]]
+name = "lightfs"
+path = "src/main.rs"
+
+[[bin]]
+name = "lightfs-shell"
+path = "src/bin/lightfs_shell.rs"
+
+[[bin]]
+name = "lightfs-bench"
+path = "src/bin/lightfs_bench.rs"
+
+[profile.dev]
+debug = 1
+incremental = true
+
+[profile.dev.package."*"]
+debug = 0
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[features]
+default = ["fuse"]
+fuse = []

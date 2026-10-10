@@ -1,0 +1,101 @@
+# Release-blocking gates that CANNOT run in the standard CI environment.
+# These must pass before LightFS touches real user data:
+#   1. Linux FUSE semantic acceptance (requires a runner with /dev/fuse)
+#   2. Real-OSS external acceptance (requires isolated test credentials)
+# Both jobs fail loudly while their prerequisites are missing - an absent
+# gate is NEVER reported as passed.
+name: release-gates
+
+on:
+  workflow_dispatch: {}   # release manager triggers this on the release commit
+
+jobs:
+  fuse-acceptance:
+    runs-on: [self-hosted, linux, fuse]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Preflight
+        run: |
+          if [[ ! -e /dev/fuse ]]; then
+            echo "FAIL: no /dev/fuse on this runner - FUSE semantics NOT verified"
+            exit 1
+          fi
+      - name: Install Rust toolchain (pinned)
+        run: |
+          rustup toolchain install 1.85.1 --profile minimal
+          rustup default 1.85.1
+
+      # Build FROM THE CHECKED-OUT COMMIT: the gate verifies the hash of
+      # these exact binaries before testing - no stale target/ artifacts.
+      - name: Build release binaries
+        run: cargo build --release --bin lightfs --bin lightfs-shell
+      - name: Compute deployment hash
+        run: |
+          SHA=$(sha256sum target/release/lightfs | awk '{print $1}')
+          echo "EXPECTED_LIGHTFS_SHA=$SHA" >> "$GITHUB_ENV"
+          echo "built lightfs sha256: $SHA"
+
+      - name: Start MinIO (pinned version)
+        run: |
+          docker run -d --name minio-fuse -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:RELEASE.2025-10-15T17-29-55Z server /data
+          for i in $(seq 1 50); do
+            curl -sf -m 1 -o /dev/null http://127.0.0.1:9000/minio/health/live && exit 0
+            sleep 0.2
+          done
+          echo "MinIO unhealthy" >&2; exit 1
+
+      # fuse-gate.sh: R1-R9 regressions (dup-close first-write, ftruncate
+      # extend, write-truncate-write, truncate-to-zero, empty file,
+      # multi-write SHA-256, same-handle drain lifecycle, dirty-write
+      # resurrected-by-truncate, partial-shrink chunk trim) + remount
+      # persistence, with deployment hash verification REQUIRED.
+      # This is THE FUSE gate; scripts/test-fuse.sh remains available for
+      # manual exploration but is not release-blocking.
+      - name: FUSE regression gate
+        env:
+          EXPECTED_LIGHTFS_SHA: required
+          DEPLOY_DIR: ${{ github.workspace }}/target/release
+        run: bash scripts/fuse-gate.sh ci
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f minio-fuse || true
+
+  oss-acceptance:
+    runs-on: ubuntu-latest
+    environment: oss-test-credentials   # secrets configured there, scoped to a TEST bucket
+    steps:
+      - uses: actions/checkout@v4
+      - name: Preflight (credentials must be present; default is explicit PENDING)
+        env:
+          ENDPOINT: ${{ secrets.OSS_TEST_ENDPOINT }}
+          ACCESS_KEY: ${{ secrets.OSS_TEST_ACCESS_KEY }}
+          SECRET_KEY: ${{ secrets.OSS_TEST_SECRET_KEY }}
+          BUCKET: ${{ secrets.OSS_TEST_BUCKET }}
+        run: |
+          if [[ -z "$ENDPOINT" || -z "$ACCESS_KEY" || -z "$SECRET_KEY" || -z "$BUCKET" ]]; then
+            echo "PENDING: real-OSS acceptance not executed - credentials not configured."
+            echo "This gate stays red until the external acceptance has actually run."
+            exit 1
+          fi
+          # sanitized target info only; never print credentials
+          echo "target: $ENDPOINT bucket: $BUCKET"
+      - name: Install Rust toolchain (pinned)
+        run: |
+          rustup toolchain install 1.85.1 --profile minimal
+          rustup default 1.85.1
+      - name: External acceptance
+        env:
+          ENDPOINT: ${{ secrets.OSS_TEST_ENDPOINT }}
+          ACCESS_KEY: ${{ secrets.OSS_TEST_ACCESS_KEY }}
+          SECRET_KEY: ${{ secrets.OSS_TEST_SECRET_KEY }}
+          BUCKET: ${{ secrets.OSS_TEST_BUCKET }}
+        run: |
+          LIGHTFS_OSS_ENDPOINT="$ENDPOINT" \
+          LIGHTFS_OSS_ACCESS_KEY="$ACCESS_KEY" \
+          LIGHTFS_OSS_SECRET_KEY="$SECRET_KEY" \
+          LIGHTFS_OSS_BUCKET="$BUCKET" \
+          LIGHTFS_OSS_PREFIX="ci-$(date +%s)/" \
+          bash scripts/oss-acceptance.sh

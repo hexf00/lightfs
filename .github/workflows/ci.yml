@@ -1,0 +1,58 @@
+# PR-required checks for LightFS. This workflow is the CI counterpart of
+# scripts/ci.sh (runnable locally with no arguments). Required for merge:
+# unit tests, dependency gate, MinIO integration tests.
+#
+# NOT in this workflow (separate release gates):
+# - Linux FUSE semantic acceptance (requires a runner with /dev/fuse)
+# - real-OSS external acceptance (requires isolated test credentials)
+# - performance/soak runs (manual: scripts/perf-*.sh)
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Rust toolchain version is pinned by rust-toolchain.toml (1.85.1);
+      # it is the required baseline. Latest-stable checks are an extra,
+      # non-blocking job and never replace this baseline.
+      - name: Install Rust toolchain (pinned)
+        run: |
+          rustup toolchain install 1.85.1 --profile minimal
+          rustup default 1.85.1
+
+      - name: Start MinIO (pinned version)
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:RELEASE.2025-10-15T17-29-55Z \
+            server /data
+          for i in $(seq 1 50); do
+            curl -sf -m 1 -o /dev/null http://127.0.0.1:9000/minio/health/live && exit 0
+            sleep 0.2
+          done
+          echo "MinIO did not become healthy" >&2
+          exit 1
+
+      - name: Formatting + lints
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+
+      # MinIO integration tests are REQUIRED: LIGHTFS_TEST_MINIO=1 must be
+      # set in this job, otherwise the integration tests self-skip and the
+      # job would pass without exercising the S3 backend.
+      - name: Unit + integration tests (no silent skips)
+        env:
+          LIGHTFS_TEST_MINIO: "1"
+          LIGHTFS_S3_ENDPOINT: http://127.0.0.1:9000
+          LIGHTFS_S3_BUCKET: lightfs-test
+        run: bash scripts/ci.sh

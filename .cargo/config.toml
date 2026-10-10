@@ -1,0 +1,5 @@
+[build]
+# Keep build behavior deterministic and easy to tune locally.
+
+[term]
+verbose = false

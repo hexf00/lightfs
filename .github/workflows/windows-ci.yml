@@ -1,0 +1,37 @@
+# Windows CI: build portable executables on windows-latest.
+#
+# Product decision (2026-10): Windows is at the "make it work" stage and the
+# shape will still change a lot - NO test investment yet. This job only
+# builds the binaries and publishes them as artifacts (no installer). The
+# core is one platform-independent codebase; only the mount layer is
+# OS-specific (Linux FUSE today, WinFsp adapter planned).
+name: windows-ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned)
+        run: |
+          rustup toolchain install 1.85.1 --profile minimal
+          rustup default 1.85.1
+
+      - name: Build release binaries
+        run: cargo build --release --bin lightfs --bin lightfs-shell --bin lightfs-bench
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: lightfs-windows-x64
+          path: |
+            target/release/lightfs.exe
+            target/release/lightfs-shell.exe
+          retention-days: 7

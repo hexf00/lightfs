@@ -1,0 +1,31 @@
+mode = "embedded" # embedded | server | client
+
+[s3]
+endpoint = "http://127.0.0.1:9000"
+region = "us-east-1"
+bucket = "lightfs"
+access_key = "minioadmin"
+secret_key = "minioadmin"
+path_style = true
+
+[metadata]
+path = "./data/lightfs.db"
+
+[server]
+bind = "127.0.0.1:8080"
+
+[cache.metadata]
+enabled = true
+ttl_seconds = 5
+
+[cache.data]
+enabled = false
+max_size_bytes = 10737418240
+max_age_seconds = 3600
+
+# Superseded-object retention: replaced/deleted committed objects stay in
+# the bucket this long, so `lightfs backup` snapshots can restore
+# point-in-time CONTENT (not just names). `lightfs gc` purges objects whose
+# window has passed. 0 = delete immediately (backups become metadata-only).
+[retention]
+superseded_secs = 604800

@@ -1,0 +1,22 @@
+#!/bin/sh
+# zig cc wrapper for CLT-less macOS: normalize Apple-specific flags for zig, fix target.
+target="aarch64-macos"
+args=""
+prev=""
+for a in "$@"; do
+  case "$prev" in
+    -arch|-isysroot) prev=""; continue ;;
+  esac
+  case "$a" in
+    -arch) prev="$a"; continue ;;
+    -arch\ *) continue ;;
+    -isysroot) prev="$a"; continue ;;
+    -Wl,-syslibroot*) continue ;;
+    --target=arm64-apple-macosx*|--target=arm64-apple-*)
+      args="$args -target $target"; continue ;;
+    --target=*|-target) args="$args $a"; continue ;;
+    -target\ *) args="$args $a"; continue ;;
+  esac
+  args="$args $a"
+done
+exec "$HOME/.local/zig/zig" cc -target "$target" $args

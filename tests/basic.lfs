@@ -1,0 +1,14 @@
+# Basic filesystem semantics over the shell adapter (TEST_PLAN §10).
+# Runs against the embedded engine. No FUSE required.
+mkdir /docs
+write /docs/report.txt --string quarter one
+stat /docs/report.txt
+cat /docs/report.txt
+ls /docs
+mkdir /archive
+mv /docs/report.txt /archive/report-v1.txt
+assert-error cat /docs/report.txt
+cat /archive/report-v1.txt
+tree /
+rm /archive/report-v1.txt
+assert-error cat /archive/report-v1.txt
