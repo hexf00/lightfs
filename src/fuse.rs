@@ -19,9 +19,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    Config, Errno, FileAttr, FileHandle, FileType, Filesystem, INodeNo, LockOwner, OpenFlags,
-    RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyWrite, Request, TimeOrNow, WriteFlags,
+    Errno, FileAttr, FileHandle, FileType, Filesystem, INodeNo, LockOwner, OpenFlags, RenameFlags,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyWrite, Request, TimeOrNow,
 };
 
 use crate::api::FsApi;
@@ -93,19 +93,6 @@ fn attr_for(node: &Node, uid: u32, gid: u32) -> FileAttr {
         blksize: 4096,
         flags: 0,
     }
-}
-
-fn assemble(chunks: &std::collections::BTreeMap<u64, Vec<u8>>) -> Vec<u8> {
-    let mut content: Vec<u8> = Vec::new();
-    for (&off, data) in chunks.iter() {
-        if off > content.len() as u64 {
-            content.resize(off as usize, 0);
-        }
-        let end = (off as usize + data.len()).max(content.len());
-        content.resize(end, 0);
-        content[off as usize..off as usize + data.len()].copy_from_slice(data);
-    }
-    content
 }
 
 impl FuseAdapter {
@@ -205,14 +192,9 @@ impl FuseAdapter {
                 return Ok(());
             }
             let drained = std::mem::take(&mut state.chunks);
-            (
-                state.path.clone(),
-                state.expected_version,
-                assemble(&drained),
-                drained,
-            )
+            (state.path.clone(), state.expected_version, drained)
         };
-        let (path, expected, chunks, drained) = snapshot;
+        let (path, expected, drained) = snapshot;
         // Write-back overlay: final content = the file's CURRENT committed
         // content with the drained chunks overlaid at their offsets (the
         // kernel only sends dirty pages - chunks alone would zero-fill the
@@ -421,7 +403,7 @@ impl Filesystem for FuseAdapter {
             };
             entries.push((c.id as u64, kind, c.name.clone()));
         }
-        for (i, (child_ino, kind, name)) in entries.iter().enumerate().skip(offset.max(0) as usize)
+        for (i, (child_ino, kind, name)) in entries.iter().enumerate().skip(offset as usize)
         {
             if reply.add(INodeNo(*child_ino), (i + 1) as u64, *kind, name.as_str()) {
                 break;
