@@ -195,7 +195,7 @@ jobs:
                 if ($bad -ge 0) {
                   for ($i = $bad; $i -lt [Math]::Min($bad + $block, $b.Length); $i++) {
                     if ($b[$i] -ne $got[$i]) {
-                      "DIAG: first diff at offset $i: want $($b[$i]) got $($got[$i])"
+                      "DIAG: first diff at offset ${i}: want $($b[$i]) got $($got[$i])"
                       break
                     }
                   }
