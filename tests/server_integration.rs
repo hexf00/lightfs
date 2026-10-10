@@ -425,7 +425,7 @@ fn write_length_mismatch_never_commits() {
     // Scoped to files created BY THIS TEST: the test takes a snapshot first,
     // so pre-existing orphans from other processes do not create noise.
     // (Known limitation: a SIGKILLed server cannot run RAII cleanup and
-    // leaves staging files behind — documented in docs/TESTING.md.)
+    // leaves staging files behind — documented in the design notes.)
     let new_leaks: Vec<_> = std::fs::read_dir(std::env::temp_dir())
         .unwrap()
         .filter_map(|e| e.ok())

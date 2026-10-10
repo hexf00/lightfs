@@ -139,10 +139,8 @@ fn run(args: Args) -> Result<()> {
     // Server-mode (lfs-*) benchmarks must not require a reachable MinIO:
     // they exercise the SERVER's S3 path, wherever that points. Constructed
     // lazily below; found when benchmarking against real cloud endpoints.
-    let need_s3 = matches!(
-        args.scenario.as_str(),
-        "all" | "prepare"
-    ) || args.scenario.starts_with("raw-");
+    let need_s3 =
+        matches!(args.scenario.as_str(), "all" | "prepare") || args.scenario.starts_with("raw-");
     let s3: Option<Arc<S3ObjectStore>> = if need_s3 {
         let s3 = Arc::new(S3ObjectStore::new(S3Config {
             endpoint: args.endpoint.clone(),
@@ -204,12 +202,28 @@ fn run(args: Args) -> Result<()> {
     for s in scenarios {
         match s {
             "prepare" => {}
-            "raw-large" => raw_large(&args, s3.as_ref().expect("raw scenario without s3 store"), false)?,
-            "raw-chunked" => raw_large(&args, s3.as_ref().expect("raw scenario without s3 store"), true)?,
-            "raw-serial" => raw_many(&args, s3.as_ref().expect("raw scenario without s3 store"), 1)?,
+            "raw-large" => raw_large(
+                &args,
+                s3.as_ref().expect("raw scenario without s3 store"),
+                false,
+            )?,
+            "raw-chunked" => raw_large(
+                &args,
+                s3.as_ref().expect("raw scenario without s3 store"),
+                true,
+            )?,
+            "raw-serial" => raw_many(
+                &args,
+                s3.as_ref().expect("raw scenario without s3 store"),
+                1,
+            )?,
             s if s.starts_with("raw-par") => {
                 let c: usize = s.trim_start_matches("raw-par").parse().unwrap();
-                raw_many(&args, s3.as_ref().expect("raw scenario without s3 store"), c)?;
+                raw_many(
+                    &args,
+                    s3.as_ref().expect("raw scenario without s3 store"),
+                    c,
+                )?;
             }
             "lfs-large" => lfs_large(&args, false)?,
             "lfs-stream-write" => lfs_stream_write(&args)?,
@@ -230,10 +244,18 @@ fn run(args: Args) -> Result<()> {
                 let c: usize = s.trim_start_matches("lfs-meta-par").parse().unwrap();
                 lfs_meta(&args, c)?;
             }
-            "raw-4k-rand" => raw_4k_rand(&args, s3.as_ref().expect("raw scenario without s3 store"), 1)?,
+            "raw-4k-rand" => raw_4k_rand(
+                &args,
+                s3.as_ref().expect("raw scenario without s3 store"),
+                1,
+            )?,
             s if s.starts_with("raw-4k-rand") => {
                 let c: usize = s.trim_start_matches("raw-4k-rand").parse().unwrap();
-                raw_4k_rand(&args, s3.as_ref().expect("raw scenario without s3 store"), c)?;
+                raw_4k_rand(
+                    &args,
+                    s3.as_ref().expect("raw scenario without s3 store"),
+                    c,
+                )?;
             }
             "raw-proxy-par" => raw_proxy_par(&args, 1)?,
             s if s.starts_with("raw-proxy-par") => {

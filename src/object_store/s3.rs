@@ -760,10 +760,7 @@ impl ObjectStore for S3ObjectStore {
             // fetch the error XML (SignatureDoesNotMatch vs AccessDenied
             // vs InvalidAccessKeyId is exactly what you want to see here).
             let (gurl, gheaders) = self.signed("GET", None, "", b"");
-            let body = match self
-                .apply_headers(self.agent.get(&gurl), &gheaders)
-                .call()
-            {
+            let body = match self.apply_headers(self.agent.get(&gurl), &gheaders).call() {
                 // http_status_as_error(false): error statuses arrive as Ok
                 Ok(mut r) => Self::read_body(&mut r),
                 Err(e) => format!("(transport: {e})"),
