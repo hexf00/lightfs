@@ -1091,8 +1091,13 @@ pub fn mount(fs: Arc<dyn FsApi>, mountpoint: &str) -> crate::error::Result<()> {
     let main_real: MainRealFn = unsafe { std::mem::transmute(proc_addr) };
 
     // Mount options: owner/group = the mounting user (uid=-1 resolves via
-    // the process token), and create modes land at 0644/0755.
-    let opts = c"uid=-1,gid=-1,create_file_umask=133,create_dir_umask=022".to_bytes_with_nul();
+    // the process token), create modes land at 0644/0755, and
+    // FileInfoTimeout=0 disables the kernel's metadata cache - our metadata
+    // is a SQLite lookup away (~0.1ms) and a 1s stale-size window breaks
+    // close-open consistency (app writes, closes, immediately reads back
+    // and sees the pre-write size through the cached attributes).
+    let opts = c"uid=-1,gid=-1,create_file_umask=133,create_dir_umask=022,FileInfoTimeout=0"
+        .to_bytes_with_nul();
     let prog = c"lightfs".to_bytes_with_nul();
     let mnt = std::ffi::CString::new(target)
         .map_err(|e| Error::Config(format!("invalid mountpoint: {e}")))?;

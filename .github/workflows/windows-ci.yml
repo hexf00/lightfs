@@ -164,7 +164,11 @@ jobs:
             # [4.1] text file: create through the drive, read through the drive
             New-Item -ItemType Directory Q:\docs -Force | Out-Null
             Set-Content Q:\docs\a.txt -NoNewline 'hello lightfs'
-            if ((Get-Content Q:\docs\a.txt -Raw) -ne 'hello lightfs') { throw "text roundtrip" }
+            $raw = Get-Content Q:\docs\a.txt -Raw
+            if ($raw -ne 'hello lightfs') {
+              "DIAG-T: len=$($raw.Length) hex=$([BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes($raw)))"
+              throw "text roundtrip"
+            }
 
             # [4.2] random binaries through the drive, byte-exact by hash.
             # Two sizes: 64KB (a single cache-manager page) and 5MB (80
