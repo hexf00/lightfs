@@ -403,8 +403,7 @@ impl Filesystem for FuseAdapter {
             };
             entries.push((c.id as u64, kind, c.name.clone()));
         }
-        for (i, (child_ino, kind, name)) in entries.iter().enumerate().skip(offset as usize)
-        {
+        for (i, (child_ino, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
             if reply.add(INodeNo(*child_ino), (i + 1) as u64, *kind, name.as_str()) {
                 break;
             }
