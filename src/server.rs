@@ -3,6 +3,7 @@
 //! are a fixed pool — concurrency is bounded by design (TECH_STACK.md).
 
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
 
@@ -221,7 +222,7 @@ fn handle_request(mut req: tiny_http::Request, core: &Core) {
             // (disk, not RAM), then PUT with a real Content-Length — S3
             // rejects chunked unsigned PUTs (411). True reader-to-reader
             // streaming onto S3 needs multipart upload (documented
-            // follow-up).
+            // follow-up in docs/PERFORMANCE.md).
             let outcome = (|| -> Result<crate::metadata::Node> {
                 // Exclusive creation (atomic, no symlink/target collision),
                 // owner-only permissions: this file holds user data.
@@ -235,12 +236,12 @@ fn handle_request(mut req: tiny_http::Request, core: &Core) {
                             .unwrap()
                             .as_nanos()
                     ));
-                    let f = std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create_new(true)
-                        .mode(0o600)
-                        .open(&p);
+                    let mut f = std::fs::OpenOptions::new();
+                    f.read(true).write(true).create_new(true);
+                    // Owner-only staging file; the mode(2) call is unix-only.
+                    #[cfg(unix)]
+                    f.mode(0o600);
+                    let f = f.open(&p);
                     match f {
                         Ok(file) => {
                             stage = Some((p, file));
