@@ -5,7 +5,9 @@
 # NOT in this workflow (separate release gates):
 # - Linux FUSE semantic acceptance (requires a runner with /dev/fuse)
 # - real-OSS external acceptance (requires isolated test credentials)
-# - performance/soak runs (manual: scripts/perf-*.sh)
+#
+# perf-smoke is a NON-gating trend probe: shared 2-core runners are noisy,
+# numbers are for catching order-of-magnitude regressions only.
 name: ci
 
 on:
@@ -84,3 +86,121 @@ jobs:
           LIGHTFS_S3_ENDPOINT: http://127.0.0.1:9000
           LIGHTFS_S3_BUCKET: lightfs-test
         run: bash scripts/ci.sh
+
+  perf-smoke:
+    # Small-dataset benchmark against MinIO + a real server on the runner.
+    # NON-GATING: hosted runners are shared 2-core VMs; absolute numbers are
+    # noisy. This exists to catch ORDER-OF-MAGNITUDE regressions between
+    # runs and to keep a machine-readable history in artifacts.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned)
+        run: |
+          rustup toolchain install 1.85.1 --profile minimal
+          rustup default 1.85.1
+
+      - name: Restore pinned MinIO (cache)
+        id: minio-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/minio
+          key: minio-RELEASE.2025-10-15T17-29-55Z-linux-amd64-v2
+
+      - name: Check out pinned MinIO source
+        if: steps.minio-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: minio/minio
+          ref: RELEASE.2025-10-15T17-29-55Z
+          path: minio-src
+
+      - name: Install Go (MinIO build)
+        if: steps.minio-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Build pinned MinIO from source
+        if: steps.minio-cache.outputs.cache-hit != 'true'
+        run: |
+          cd minio-src
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /tmp/minio .
+
+      - name: Build lightfs (release)
+        run: cargo build --release --bin lightfs --bin lightfs-shell --bin lightfs-bench
+
+      - name: Start MinIO
+        run: |
+          mkdir -p /tmp/minio-data
+          /tmp/minio server /tmp/minio-data --address :9000 > /tmp/minio.log 2>&1 &
+          for i in $(seq 1 150); do
+            curl -sf -m 1 -o /dev/null http://127.0.0.1:9000/minio/health/live && exit 0
+            sleep 0.2
+          done
+          cat /tmp/minio.log >&2 || true
+          echo "MinIO did not become healthy" >&2
+          exit 1
+
+      - name: Run perf smoke (small dataset)
+        run: |
+          PORT=18085
+          DB=/tmp/perf-smoke-$$.db
+          cat > /tmp/perf-smoke.toml <<CFG
+          mode = "server"
+          [s3]
+          endpoint = "http://127.0.0.1:9000"
+          region = "us-east-1"
+          bucket = "lightfs-perf-smoke"
+          access_key = "minioadmin"
+          secret_key = "minioadmin"
+          path_style = true
+          [metadata]
+          path = "$DB"
+          [server]
+          bind = "127.0.0.1:$PORT"
+          [cache.metadata]
+          enabled = false
+          [cache.data]
+          enabled = false
+          CFG
+          ./target/release/lightfs create-bucket --config /tmp/perf-smoke.toml
+          ./target/release/lightfs server --config /tmp/perf-smoke.toml > /tmp/server.log 2>&1 &
+          SERVER_PID=$!
+          for i in $(seq 1 100); do
+            curl -sf -m 1 -o /dev/null http://127.0.0.1:$PORT/health && break
+            sleep 0.2
+          done
+          {
+            echo "# perf-smoke ($(date -u +%FT%TZ), ubuntu-latest, shared 2-core runner — noisy)"
+            echo "# dataset: 200 x 100KB + 32MB large + stream-write + 4KiB reads + meta lookups"
+            ./target/release/lightfs-bench \
+              --server "http://127.0.0.1:$PORT" \
+              --s3-endpoint http://127.0.0.1:9000 \
+              --bucket lightfs-perf-smoke \
+              --objects 200 --obj-size 102400 \
+              --large-mb 32 --lfs-large-mb 32 \
+              --scenario "raw-serial,raw-par8,lfs-serial,lfs-par8,lfs-large,lfs-stream-write,lfs-4k-rand,lfs-meta" \
+              2>&1
+          } | tee perf-smoke.txt
+          kill $SERVER_PID 2>/dev/null || true
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## perf-smoke"
+            echo '```'
+            cat perf-smoke.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-smoke
+          path: perf-smoke.txt
+          retention-days: 30
+

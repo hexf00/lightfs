@@ -1,10 +1,9 @@
-# Windows CI: build portable executables on windows-latest.
+# Windows CI: build portable executables on windows-latest, then run a REAL
+# mount smoke test through WinFsp (rclone-style: the hosted runner installs
+# the WinFsp driver and mounts a drive letter).
 #
-# Product decision (2026-10): Windows is at the "make it work" stage and the
-# shape will still change a lot - NO test investment yet. This job only
-# builds the binaries and publishes them as artifacts (no installer). The
-# core is one platform-independent codebase; only the mount layer is
-# OS-specific (Linux FUSE today, WinFsp adapter planned).
+# Product note (2026-10): the core is one platform-independent codebase; the
+# mount layer is OS-specific (Linux FUSE / WinFsp adapter).
 name: windows-ci
 
 on:
@@ -35,3 +34,207 @@ jobs:
             target/release/lightfs.exe
             target/release/lightfs-shell.exe
           retention-days: 7
+
+  mount-smoke:
+    # Real end-to-end validation of the WinFsp adapter on a hosted runner:
+    # install WinFsp, run MinIO + lightfs server, mount the filesystem as
+    # drive Q:, exercise file operations THROUGH the drive letter, then kill
+    # the mount process and verify the drive disappears.
+    runs-on: windows-latest
+    needs: windows
+    env:
+      WINFSP_BIN: 'C:\Program Files (x86)\WinFsp\bin'
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: lightfs-windows-x64
+          path: bin
+
+      - name: Install WinFsp (driver + FUSE-compat DLL)
+        run: choco install winfsp -y --no-progress
+
+      - name: Restore pinned MinIO (cache)
+        id: minio-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            minio-src
+            minio.exe
+          key: minio-RELEASE.2025-10-15T17-29-55Z-windows-amd64-v1
+
+      - name: Check out pinned MinIO source
+        if: steps.minio-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: minio/minio
+          ref: RELEASE.2025-10-15T17-29-55Z
+          path: minio-src
+
+      - name: Install Go (MinIO build)
+        if: steps.minio-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Build pinned MinIO from source
+        if: steps.minio-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $env:GOOS='windows'
+          cd minio-src
+          go build -trimpath -ldflags "-s -w" -o ..\minio.exe .
+
+      - name: Start MinIO
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force D:\minio-data | Out-Null
+          Start-Process -FilePath .\minio.exe `
+            -ArgumentList 'server','D:\minio-data','--address',':9000' `
+            -RedirectStandardError minio.err -RedirectStandardOutput minio.out
+          $ok = $false
+          foreach ($i in 1..60) {
+            try {
+              Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 `
+                http://127.0.0.1:9000/minio/health/live | Out-Null
+              $ok = $true; break
+            } catch { Start-Sleep -Milliseconds 500 }
+          }
+          if (-not $ok) {
+            Get-Content minio.err -ErrorAction SilentlyContinue
+            throw "MinIO did not become healthy"
+          }
+
+      - name: Configure + create bucket + start server
+        shell: pwsh
+        run: |
+          $env:Path += ";$env:WINFSP_BIN"
+          @"
+          mode = "server"
+          [s3]
+          endpoint = "http://127.0.0.1:9000"
+          region = "us-east-1"
+          bucket = "lightfs-smoke"
+          access_key = "minioadmin"
+          secret_key = "minioadmin"
+          path_style = true
+          [metadata]
+          path = "C:/lightfs-smoke/metadata.db"
+          [server]
+          bind = "127.0.0.1:18085"
+          [cache.metadata]
+          enabled = false
+          [cache.data]
+          enabled = false
+          "@ | Set-Content -Encoding ascii cfg.toml
+          .\bin\lightfs.exe create-bucket --config cfg.toml
+          Start-Process -FilePath .\bin\lightfs.exe `
+            -ArgumentList 'server','--config',"$PWD\cfg.toml" `
+            -RedirectStandardError server.err -RedirectStandardOutput server.out
+          $ok = $false
+          foreach ($i in 1..60) {
+            try {
+              Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 `
+                http://127.0.0.1:18085/health | Out-Null
+              $ok = $true; break
+            } catch { Start-Sleep -Milliseconds 500 }
+          }
+          if (-not $ok) {
+            Get-Content server.err -ErrorAction SilentlyContinue
+            throw "lightfs server did not become healthy"
+          }
+
+      - name: "Mount as drive Q:"
+        shell: pwsh
+        run: |
+          $env:Path += ";$env:WINFSP_BIN"
+          $mount = Start-Process -FilePath .\bin\lightfs.exe `
+            -ArgumentList 'mount','--config',"$PWD\cfg.toml",'Q:' `
+            -PassThru `
+            -RedirectStandardError mount.err -RedirectStandardOutput mount.out
+          $mount.Id | Set-Content mount.pid
+          $ok = $false
+          foreach ($i in 1..120) {
+            if (Test-Path 'Q:\') { $ok = $true; break }
+            if ($mount.HasExited) {
+              Get-Content mount.err -ErrorAction SilentlyContinue
+              throw "mount process exited early (code $($mount.ExitCode))"
+            }
+            Start-Sleep -Milliseconds 500
+          }
+          if (-not $ok) {
+            Get-Content mount.err -ErrorAction SilentlyContinue
+            throw "drive Q: never appeared"
+          }
+          "MOUNTED"
+
+      - name: Roundtrip through the drive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:Path += ";$env:WINFSP_BIN"
+          $shell = ".\bin\lightfs-shell.exe"
+          $srv = "--server","http://127.0.0.1:18085"
+
+          # [1] text file: create through the drive, read through the drive
+          New-Item -ItemType Directory Q:\docs -Force | Out-Null
+          Set-Content Q:\docs\a.txt -NoNewline 'hello lightfs'
+          if ((Get-Content Q:\docs\a.txt -Raw) -ne 'hello lightfs') { throw "text roundtrip" }
+
+          # [2] 5MB random binary: write through the drive via a plain
+          #     .NET copy, verify byte-exact via hash
+          $b = New-Object byte[] (5MB)
+          (New-Object Random 42).NextBytes($b)
+          [IO.File]::WriteAllBytes("$PWD\expect.bin", $b)
+          [IO.File]::Copy("$PWD\expect.bin", 'Q:\docs\rand.bin')
+          $h1 = (Get-FileHash "$PWD\expect.bin" -Algorithm SHA256).Hash
+          $h2 = (Get-FileHash 'Q:\docs\rand.bin' -Algorithm SHA256).Hash
+          if ($h1 -ne $h2) { throw "binary roundtrip hash mismatch" }
+
+          # [3] shell client sees the same namespace (server mode)
+          $seen = & $shell --config "$PWD\cfg.toml" @srv ls /docs
+          if (-not ($seen -match 'rand.bin')) { throw "shell ls misses rand.bin: $seen" }
+          & $shell --config "$PWD\cfg.toml" @srv cat /docs/a.txt | ForEach-Object { }
+          $cat = & $shell --config "$PWD\cfg.toml" @srv cat /docs/a.txt
+          if ("$cat" -ne 'hello lightfs') { throw "shell cat mismatch: '$cat'" }
+
+          # [4] append + read back (write-back buffer path)
+          Add-Content Q:\docs\a.txt -NoNewline '-more'
+          if ((Get-Content Q:\docs\a.txt -Raw) -ne 'hello lightfs-more') { throw "append roundtrip" }
+
+          # [5] rename through the drive
+          Move-Item Q:\docs\a.txt Q:\docs\renamed.txt
+          if ((Test-Path Q:\docs\a.txt) -or -not (Test-Path Q:\docs\renamed.txt)) { throw "rename" }
+
+          # [6] listing shows both entries with sizes
+          $items = Get-ChildItem Q:\docs
+          if ($items.Count -lt 2) { throw "dir listing: $items" }
+
+          # [7] delete through the drive, gone from the shell too
+          Remove-Item Q:\docs\renamed.txt
+          if (Test-Path Q:\docs\renamed.txt) { throw "delete" }
+          $stat = & $shell --config "$PWD\cfg.toml" @srv stat /docs/renamed.txt 2>&1
+          if ($LASTEXITCODE -eq 0) { throw "deleted file still visible to shell: $stat" }
+
+          "ROUNDTRIP OK"
+
+      - name: Kill mount process -> drive must disappear
+        shell: pwsh
+        run: |
+          $mountId = Get-Content mount.pid
+          Stop-Process -Id $mountId -Force
+          $ok = $false
+          foreach ($i in 1..60) {
+            if (-not (Test-Path 'Q:\')) { $ok = $true; break }
+            Start-Sleep -Milliseconds 500
+          }
+          if (-not $ok) { throw "drive Q: still present after mount process kill" }
+          "UNMOUNT OK"
+
+      - name: Dump logs on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          foreach ($f in 'mount.err','server.err','minio.err') {
+            if (Test-Path $f) { "===== $f ====="; Get-Content $f }
+          }
