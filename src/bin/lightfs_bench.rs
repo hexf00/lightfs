@@ -135,12 +135,20 @@ fn main() {
 }
 
 fn run(args: Args) -> Result<()> {
-    // The direct-S3 store is only needed by raw-* comparison scenarios.
-    // Server-mode (lfs-*) benchmarks must not require a reachable MinIO:
-    // they exercise the SERVER's S3 path, wherever that points. Constructed
-    // lazily below; found when benchmarking against real cloud endpoints.
-    let need_s3 =
-        matches!(args.scenario.as_str(), "all" | "prepare") || args.scenario.starts_with("raw-");
+    // Scenario selection is a comma-separated list (or "all"). Requirement
+    // detection is per-part: a combined list like "prepare,raw-serial,lfs-…"
+    // must behave like the union of its parts (a plain starts_with on the
+    // whole string silently skipped dataset preparation for such lists).
+    let parts: Vec<&str> = args.scenario.split(',').collect();
+    let is_all = parts.iter().any(|s| *s == "all");
+    let need_prepare = is_all || parts.iter().any(|s| *s == "prepare");
+
+    // The direct-S3 store is only needed by raw-* comparison scenarios and
+    // dataset preparation. Server-mode (lfs-*) benchmarks must not require a
+    // reachable MinIO: they exercise the SERVER's S3 path, wherever that
+    // points. Constructed lazily below; found when benchmarking against
+    // real cloud endpoints.
+    let need_s3 = is_all || need_prepare || parts.iter().any(|s| s.starts_with("raw-"));
     let s3: Option<Arc<S3ObjectStore>> = if need_s3 {
         let s3 = Arc::new(S3ObjectStore::new(S3Config {
             endpoint: args.endpoint.clone(),
@@ -157,24 +165,14 @@ fn run(args: Args) -> Result<()> {
         None
     };
 
-    let need_lfs = matches!(
-        args.scenario.as_str(),
-        "all"
-            | "lfs-large"
-            | "lfs-serial"
-            | "lfs-par"
-            | "lfs-chunked"
-            | "lfs-stream-large"
-            | "lfs-stream-write"
-            | "lfs-presign-par"
-    ) || args.scenario.starts_with("lfs-");
+    let need_lfs = is_all || parts.iter().any(|s| s.starts_with("lfs-"));
     if need_lfs && args.server.is_none() {
         return Err(lightfs::error::Error::Config(
             "lfs scenarios need --server URL".into(),
         ));
     }
 
-    if args.scenario == "prepare" || args.scenario == "all" {
+    if need_prepare {
         prepare(&args, s3.as_ref().expect("raw scenario without s3 store"))?;
     }
 

@@ -144,7 +144,9 @@ jobs:
           exit 1
 
       - name: Run perf smoke (small dataset)
+        shell: bash
         run: |
+          set -euo pipefail
           PORT=18085
           DB=/tmp/perf-smoke-$$.db
           cat > /tmp/perf-smoke.toml <<CFG
@@ -181,7 +183,7 @@ jobs:
               --bucket lightfs-perf-smoke \
               --objects 200 --obj-size 102400 \
               --large-mb 32 --lfs-large-mb 32 \
-              --scenario "raw-serial,raw-par8,lfs-serial,lfs-par8,lfs-large,lfs-stream-write,lfs-4k-rand,lfs-meta" \
+              --scenario "prepare,raw-serial,raw-par8,lfs-serial,lfs-par8,lfs-large,lfs-stream-write,lfs-4k-rand,lfs-meta" \
               2>&1
           } | tee perf-smoke.txt
           kill $SERVER_PID 2>/dev/null || true
