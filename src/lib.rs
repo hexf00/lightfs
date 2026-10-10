@@ -11,6 +11,11 @@ pub mod fsck;
 #[cfg(all(feature = "fuse", target_os = "linux"))]
 pub mod fuse;
 
+// Windows mounts through WinFsp's FUSE-compat layer in winfsp-x64.dll
+// (hand-declared bindings, no external crate).
+#[cfg(all(feature = "fuse", target_os = "windows"))]
+pub mod winfsp;
+
 pub mod metadata;
 pub mod object_store;
 pub mod rpc;

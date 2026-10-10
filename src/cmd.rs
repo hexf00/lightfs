@@ -179,12 +179,31 @@ pub fn mount(cfg: &Config, mountpoint: &str, allow_other: bool) -> Result<()> {
     crate::fuse::mount(fs, mountpoint, allow_other)
 }
 
+/// `lightfs mount` on Windows: WinFsp adapter. The backend selection is the
+/// same as Linux; `allow_other` has no Windows equivalent (access follows
+/// the mounting user via -o uid/gid=-1).
+#[cfg(all(feature = "fuse", target_os = "windows"))]
+pub fn mount(cfg: &Config, mountpoint: &str, _allow_other: bool) -> Result<()> {
+    let fs: std::sync::Arc<dyn crate::api::FsApi> = if cfg.mode == "server" {
+        std::sync::Arc::new(crate::client::Client::new(crate::client::ClientConfig {
+            url: format!("http://{}", cfg.server.bind),
+            metadata_ttl: cache_ttl(cfg),
+        }))
+    } else {
+        engine::open_embedded(cfg)?.core
+    };
+    crate::winfsp::mount(fs, mountpoint)
+}
+
 /// `lightfs mount` on platforms without a kernel FUSE integration here.
-#[cfg(not(all(feature = "fuse", target_os = "linux")))]
+#[cfg(not(any(
+    all(feature = "fuse", target_os = "linux"),
+    all(feature = "fuse", target_os = "windows")
+)))]
 pub fn mount(_cfg: &Config, _mountpoint: &str, _allow_other: bool) -> Result<()> {
     Err(Error::Config(
-        "FUSE mounting requires a Linux host with /dev/fuse; \
-         run scripts/test-fuse.sh there)"
+        "FUSE mounting requires a Linux host with /dev/fuse (run \
+         scripts/test-fuse.sh there) or Windows with WinFsp installed"
             .to_string(),
     ))
 }

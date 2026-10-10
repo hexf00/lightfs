@@ -192,6 +192,12 @@ impl FuseAdapter {
                 return Ok(());
             }
             let drained = std::mem::take(&mut state.chunks);
+            if drained.is_empty() {
+                // A write-intent open that never wrote: commit nothing, or
+                // every such open+close would re-upload the whole file.
+                state.committed = true;
+                return Ok(());
+            }
             (state.path.clone(), state.expected_version, drained)
         };
         let (path, expected, drained) = snapshot;
