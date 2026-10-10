@@ -166,14 +166,45 @@ jobs:
             Set-Content Q:\docs\a.txt -NoNewline 'hello lightfs'
             if ((Get-Content Q:\docs\a.txt -Raw) -ne 'hello lightfs') { throw "text roundtrip" }
 
-            # [4.2] 5MB random binary through the drive, byte-exact by hash
-            $b = New-Object byte[] (5MB)
-            (New-Object Random 42).NextBytes($b)
-            [IO.File]::WriteAllBytes("$PWD\expect.bin", $b)
-            [IO.File]::Copy("$PWD\expect.bin", 'Q:\docs\rand.bin')
-            $h1 = (Get-FileHash "$PWD\expect.bin" -Algorithm SHA256).Hash
-            $h2 = (Get-FileHash 'Q:\docs\rand.bin' -Algorithm SHA256).Hash
-            if ($h1 -ne $h2) { throw "binary roundtrip hash mismatch" }
+            # [4.2] random binaries through the drive, byte-exact by hash.
+            # Two sizes: 64KB (a single cache-manager page) and 5MB (80
+            # pages, multi-chunk write path). On mismatch, locate the first
+            # differing 64KB block (block-hash bisect), then the first
+            # differing byte inside it - distinguishes lost-chunk zero-fill
+            # from misplaced data.
+            foreach ($sz in 64KB, 5MB) {
+              $b = New-Object byte[] ($sz)
+              (New-Object Random 42).NextBytes($b)
+              [IO.File]::WriteAllBytes("$PWD\expect.bin", $b)
+              [IO.File]::Copy("$PWD\expect.bin", 'Q:\docs\rand.bin')
+              $h1 = (Get-FileHash "$PWD\expect.bin" -Algorithm SHA256).Hash
+              $h2 = (Get-FileHash 'Q:\docs\rand.bin' -Algorithm SHA256).Hash
+              if ($h1 -ne $h2) {
+                $got = [IO.File]::ReadAllBytes('Q:\docs\rand.bin')
+                "DIAG: size want=$($b.Length) got=$($got.Length)"
+                $block = 64KB
+                $bad = -1
+                for ($off = 0; $off -lt [Math]::Min($b.Length, $got.Length); $off += $block) {
+                  $len = [Math]::Min($block, $b.Length - $off)
+                  $sa = New-Object Security.Cryptography.SHA256Managed
+                  $ha = ($sa.ComputeHash($b, $off, $len) | ForEach-Object { $_.ToString('x2') }) -join ''
+                  $hb = ($sa.ComputeHash($got, $off, $len) | ForEach-Object { $_.ToString('x2') }) -join ''
+                  $sa.Dispose()
+                  if ($ha -ne $hb) { $bad = $off; break }
+                }
+                if ($bad -ge 0) {
+                  for ($i = $bad; $i -lt [Math]::Min($bad + $block, $b.Length); $i++) {
+                    if ($b[$i] -ne $got[$i]) {
+                      "DIAG: first diff at offset $i: want $($b[$i]) got $($got[$i])"
+                      break
+                    }
+                  }
+                } else {
+                  "DIAG: all present blocks identical (length tail only)"
+                }
+                throw "binary roundtrip hash mismatch (size $sz)"
+              }
+            }
 
             # [4.3] shell client sees the same namespace (server mode)
             $seen = & $shellbin --config "$PWD\cfg.toml" @srv ls /docs
