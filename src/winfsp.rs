@@ -524,7 +524,15 @@ fn commit_write(fh: u64) -> Result<(), Error> {
                     // by the next flush against the re-based version.
                     sess.note_commit_success(committed_node.version);
                 }
-                visible_eof(&path, committed_node.size as u64)
+                // Inline scan: visible_eof would re-lock WRITES (not
+                // reentrant) and deadlock the flush that is holding it.
+                let mut e = committed_node.size as u64;
+                for sess in writes.values() {
+                    if sess.path == path {
+                        e = e.max(sess.chunks.max_end());
+                    }
+                }
+                e
             };
             pending_eof_rebase(&path, end);
             Ok(())
