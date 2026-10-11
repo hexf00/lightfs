@@ -308,6 +308,7 @@ fn node_from_json(v: &Value) -> Result<Node> {
     let kind = match v["kind"].as_str() {
         Some("dir") => crate::metadata::NodeKind::Dir,
         Some("file") => crate::metadata::NodeKind::File,
+        Some("symlink") => crate::metadata::NodeKind::Symlink,
         _ => return Err(Error::Io("bad node kind from server".into())),
     };
     Ok(Node {
@@ -321,6 +322,7 @@ fn node_from_json(v: &Value) -> Result<Node> {
         object_key: v["object_key"].as_str().map(String::from),
         version: v["version"].as_i64().unwrap_or(0),
         etag: v["etag"].as_str().unwrap_or_default().into(),
+        target: v["target"].as_str().map(String::from),
     })
 }
 
@@ -367,6 +369,18 @@ impl FsApi for Client {
 
     fn open(&self, path: &str) -> Result<Node> {
         self.lookup(path)
+    }
+
+    fn symlink(&self, target: &str, path: &str) -> Result<Node> {
+        let r = self.call("symlink", json!({"path": path, "target": target}))?;
+        let node = node_from_json(&r)?;
+        self.after_mutation(path);
+        Ok(node)
+    }
+
+    fn readlink(&self, path: &str) -> Result<String> {
+        let r = self.call("readlink", json!({"path": path}))?;
+        Ok(r["target"].as_str().unwrap_or_default().to_string())
     }
 
     fn read(&self, path: &str, offset: u64, size: u64) -> Result<Vec<u8>> {

@@ -651,6 +651,136 @@ fn section_a(ctx: &Ctx, root: &Path) {
         );
         println!("    OK A13 readdirplus bounds (create/delete converge, local immediate)");
     }
+
+    // A14 symlink semantics on the real mount: the kernel resolves links;
+    // the filesystem stores targets verbatim and answers readlink.
+    // Covers: lstat vs stat, relative/absolute/dir/dangling links, loops,
+    // rename/unlink interactions, and the mount-root escape clamp.
+    // Compile-time gated: libc and unix extensions do not exist on the
+    // Windows build of this binary (A13-style runtime guards are not enough).
+    #[cfg(unix)]
+    if ctx.sections_want("a") {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        println!("  A14 symlinks on the mount (lstat/stat/resolve/loops)");
+        let dir = root.join("a14");
+        std::fs::create_dir_all(&dir).expect("A14 mkdir");
+        std::fs::write(dir.join("real.txt"), b"payload").expect("A14 seed");
+
+        // relative + absolute targets; readlink returns them verbatim
+        symlink("real.txt", dir.join("rel")).expect("A14 rel link");
+        symlink(dir.join("real.txt"), dir.join("abs")).expect("A14 abs link");
+        assert_eq!(
+            std::fs::read_link(dir.join("rel"))
+                .unwrap()
+                .to_string_lossy(),
+            "real.txt"
+        );
+        assert_eq!(
+            std::fs::read_link(dir.join("abs")).unwrap(),
+            dir.join("real.txt")
+        );
+
+        // lstat vs stat
+        let lst = std::fs::symlink_metadata(dir.join("rel")).expect("A14 lstat");
+        assert!(lst.file_type().is_symlink(), "lstat must see the link");
+        assert_eq!(lst.len(), "real.txt".len() as u64, "link size = target len");
+        let st = std::fs::metadata(dir.join("rel")).expect("A14 stat follows");
+        assert!(!st.file_type().is_symlink());
+        assert_eq!(st.len(), 7, "stat follows to the file content");
+        // read through the link
+        assert_eq!(std::fs::read(dir.join("rel")).unwrap(), b"payload");
+
+        // directory link: listing and creation land in the target dir
+        symlink("sub", dir.join("dirlink")).expect("A14 dir link");
+        std::fs::create_dir(dir.join("sub")).expect("A14 sub");
+        std::fs::write(dir.join("dirlink").join("via-link"), b"v").expect("A14 create via link");
+        assert!(
+            dir.join("sub").join("via-link").exists(),
+            "create through a dir link must land in the target dir"
+        );
+        let mut listed = std::fs::read_dir(dir.join("dirlink"))
+            .expect("A14 readdir via link")
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        listed.sort();
+        assert!(listed.contains(&"via-link".to_string()));
+
+        // dangling: lstat sees the link, stat and read fail ENOENT
+        symlink("nowhere-here", dir.join("dangling")).expect("A14 dangling");
+        assert!(
+            std::fs::symlink_metadata(dir.join("dangling"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(std::fs::metadata(dir.join("dangling")).is_err());
+        assert!(std::fs::read(dir.join("dangling")).is_err());
+
+        // loop: the kernel must fail with ELOOP, lstat still works
+        symlink("b", dir.join("a")).expect("A14 loop a");
+        symlink("a", dir.join("b")).expect("A14 loop b");
+        let err = std::fs::metadata(dir.join("a")).unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "loop must be ELOOP, got {err}"
+        );
+
+        // rename the LINK: target rides along verbatim
+        std::fs::rename(dir.join("rel"), dir.join("rel2")).expect("A14 rename link");
+        assert_eq!(
+            std::fs::read_link(dir.join("rel2"))
+                .unwrap()
+                .to_string_lossy(),
+            "real.txt"
+        );
+        assert_eq!(std::fs::read(dir.join("rel2")).unwrap(), b"payload");
+
+        // rename the TARGET: the link goes dangling, target string unchanged
+        std::fs::rename(dir.join("real.txt"), dir.join("moved.txt")).expect("A14 rename target");
+        assert!(std::fs::metadata(dir.join("rel2")).is_err());
+        assert_eq!(
+            std::fs::read_link(dir.join("rel2"))
+                .unwrap()
+                .to_string_lossy(),
+            "real.txt"
+        );
+        // ...and back: the link heals itself (resolution is by name)
+        std::fs::rename(dir.join("moved.txt"), dir.join("real.txt")).expect("A14 rename back");
+        assert_eq!(std::fs::read(dir.join("rel2")).unwrap(), b"payload");
+
+        // deleting a link never touches the target
+        std::fs::remove_file(dir.join("rel2")).expect("A14 unlink link");
+        assert!(dir.join("real.txt").exists());
+        assert!(std::fs::read_link(dir.join("rel2")).is_err());
+
+        // an occupied name rejects link creation (any kind)
+        let e = symlink("real.txt", dir.join("real.txt")).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EEXIST));
+
+        // dot-dot above the mount root stays INSIDE the mount: /../x
+        // resolves to <mount>/x, so it dangles instead of escaping
+        symlink("/../escaped-the-mount", dir.join("esc")).expect("A14 esc link");
+        assert_eq!(
+            std::fs::read_link(dir.join("esc"))
+                .unwrap()
+                .to_string_lossy(),
+            "/../escaped-the-mount"
+        );
+        assert!(
+            std::fs::metadata(dir.join("esc")).is_err(),
+            ".. above the mount root must not reach the host filesystem"
+        );
+
+        // same name file+link coexistence: distinct inodes, distinct kinds
+        symlink("real.txt", dir.join("twin")).expect("A14 twin link");
+        let l = std::fs::symlink_metadata(dir.join("twin")).unwrap();
+        let f = std::fs::symlink_metadata(dir.join("real.txt")).unwrap();
+        assert!(l.file_type().is_symlink() && f.file_type().is_file());
+        assert_ne!(l.ino(), f.ino(), "link and file are distinct nodes");
+
+        println!("    OK A14 symlinks (all 10 behaviors)");
+    }
 }
 
 /// Minimal raw-HTTP RPC used by A13 to act as a second (out-of-band)

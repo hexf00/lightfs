@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     object_key TEXT,
     version TEXT,
     etag TEXT,
+    target TEXT,
     UNIQUE(parent_id, name)
 );
 CREATE TABLE IF NOT EXISTS superseded_objects (
@@ -71,10 +72,12 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
         etag: row.get::<_, Option<String>>("etag")?.unwrap_or_default(),
+        target: row.get("target")?,
     })
 }
 
-const NODE_COLS: &str = "id, parent_id, name, kind, size, mtime, mode, object_key, version, etag";
+const NODE_COLS: &str =
+    "id, parent_id, name, kind, size, mtime, mode, object_key, version, etag, target";
 
 impl SqliteMetadataStore {
     /// Open (creating if needed) the store and ensure schema + root.
@@ -84,6 +87,16 @@ impl SqliteMetadataStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        // Migration: stores created before symlinks lack the target column
+        // (CREATE TABLE IF NOT EXISTS does not add columns). Idempotent.
+        let has_target: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('nodes') WHERE name = 'target'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_target == 0 {
+            conn.execute_batch("ALTER TABLE nodes ADD COLUMN target TEXT;")?;
+        }
         // Root: id 1, no parent. Ignore conflict on reopen.
         conn.execute(
             "INSERT OR IGNORE INTO nodes (id, parent_id, name, kind, size, mtime, mode) VALUES (1, NULL, '', 'dir', 0, ?1, ?2)",
@@ -144,6 +157,42 @@ impl MetadataStore for SqliteMetadataStore {
         // the first write commit installs the version key via CAS, and no
         // superseded record or delete ever references a key that never
         // existed. Rename/move never touches bytes either way (AD-010).
+        let node = tx.query_row(
+            &format!("SELECT {NODE_COLS} FROM nodes WHERE id = ?1"),
+            params![id],
+            row_to_node,
+        )?;
+        tx.commit()?;
+        Ok(node)
+    }
+
+    fn create_symlink(&self, parent_id: i64, name: &str, target: &str, mode: u32) -> Result<Node> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let parent_kind: Option<String> = tx
+            .query_row(
+                "SELECT kind FROM nodes WHERE id = ?1",
+                params![parent_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(pk) = parent_kind else {
+            return Err(Error::ParentNotFound(format!("id {parent_id}")));
+        };
+        if pk != "dir" {
+            return Err(Error::KindMismatch {
+                path: format!("id {parent_id}"),
+                expected: "dir",
+                actual: pk.clone(),
+            });
+        }
+        tx.execute(
+            "INSERT INTO nodes (parent_id, name, kind, size, mtime, mode, object_key, version, etag, target)
+             VALUES (?1, ?2, 'symlink', ?3, ?4, ?5, NULL, '0', '', ?6)",
+            params![parent_id, name, target.len() as i64, now(), mode as i64, target],
+        )
+        .map_err(|e| map_constraint(e, || Error::AlreadyExists(name.to_string())))?;
+        let id = tx.last_insert_rowid();
         let node = tx.query_row(
             &format!("SELECT {NODE_COLS} FROM nodes WHERE id = ?1"),
             params![id],

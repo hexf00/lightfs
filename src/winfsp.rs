@@ -50,6 +50,7 @@ const FSP_FUSE_CAP_STAT_EX: u32 = 1 << 23;
 /// POSIX file type bits (st_mode & 0o170000).
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
+const S_IFLNK: u32 = 0o120000;
 
 // ---------------------------------------------------------------------------
 // Struct layouts. Field offsets verified with a compile-time probe against
@@ -355,7 +356,16 @@ unsafe fn path_of<'a>(p: *const c_char) -> Result<&'a str, c_int> {
 }
 
 fn fill_stat(st: &mut FuseStat, node: &Node) {
-    let mode_type = if node.is_dir() { S_IFDIR } else { S_IFREG };
+    // EXPERIMENTAL: symlink nodes report S_IFLNK. WinFsp FUSE resolves
+    // far less of the symlink machinery than Linux VFS does - see the
+    // documented platform limitation before relying on links on Windows.
+    let mode_type = if node.is_dir() {
+        S_IFDIR
+    } else if node.is_symlink() {
+        S_IFLNK
+    } else {
+        S_IFREG
+    };
     st.st_dev = 0;
     st.st_ino = node.id as u64;
     st.st_mode = mode_type | (node.mode & 0o7777);

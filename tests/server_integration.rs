@@ -446,3 +446,77 @@ fn write_length_mismatch_never_commits() {
         new_leaks
     );
 }
+
+#[test]
+fn symlink_wire_semantics() {
+    let srv = TestServer::start("symlink").unwrap();
+
+    // create + readlink over the wire; target rides verbatim
+    let (ok, _) = srv.rpc("mkdir", json!({ "path": "/d" }));
+    assert!(ok);
+    let (ok, node) = srv.rpc(
+        "symlink",
+        json!({ "path": "/d/link", "target": "../target-file" }),
+    );
+    assert!(ok, "symlink rpc failed: {node:?}");
+    assert_eq!(node["kind"], "symlink");
+    assert_eq!(node["target"], "../target-file");
+    assert_eq!(node["size"], "../target-file".len() as i64);
+
+    let (ok, r) = srv.rpc("readlink", json!({ "path": "/d/link" }));
+    assert!(ok);
+    assert_eq!(r["target"], "../target-file");
+
+    // lstat (lookup) keeps the link node; the target field rides along
+    let (ok, node) = srv.rpc("lookup", json!({ "path": "/d/link" }));
+    assert!(ok);
+    assert_eq!(node["kind"], "symlink");
+
+    // dangling until the target exists
+    let (ok, _) = srv.rpc("write", json!({ "path": "/target-file", "data": "aGk=" }));
+    assert!(ok);
+    // A dir symlink resolves as an intermediate component: readdir through
+    // it lists the target directory. (Literal ".." never reaches Core -
+    // path_components rejects it - because the FUSE kernel normalizes the
+    // path before issuing RPCs.)
+    let (ok, _) = srv.rpc("symlink", json!({ "path": "/dirlink", "target": "d" }));
+    assert!(ok);
+    let (ok, r) = srv.rpc("readdir", json!({ "path": "/dirlink" }));
+    assert!(ok, "readdir through a dir symlink must follow it: {r:?}");
+    assert!(
+        r["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["name"] == "link")
+    );
+
+    // readlink on a non-symlink is a kind error, not a crash
+    let (ok, _) = srv.rpc("readlink", json!({ "path": "/target-file" }));
+    assert!(!ok);
+
+    // EEXIST on occupied names, any kind
+    let (ok, _) = srv.rpc("symlink", json!({ "path": "/d/link", "target": "/x" }));
+    assert!(!ok);
+
+    // a symlink counts as an occupied name for create/mkdir too
+    let (ok, _) = srv.rpc("create", json!({ "path": "/d/link", "mode": 0o644 }));
+    assert!(!ok);
+
+    // delete the link; the target file is untouched
+    let (ok, _) = srv.rpc("unlink", json!({ "path": "/d/link" }));
+    assert!(ok);
+    let (ok, node) = srv.rpc("lookup", json!({ "path": "/target-file" }));
+    assert!(ok);
+    assert_eq!(node["kind"], "file");
+
+    // the escape contract over the wire: .. clamps at the root
+    let (ok, _) = srv.rpc(
+        "symlink",
+        json!({ "path": "/esc", "target": "../../../../etc" }),
+    );
+    assert!(ok);
+    let (ok, node) = srv.rpc("lookup", json!({ "path": "/esc" }));
+    assert!(ok);
+    assert_eq!(node["kind"], "symlink", "dangling inside the mount only");
+}

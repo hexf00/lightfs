@@ -355,3 +355,56 @@ fn point_in_time_restore_minio() {
         let _ = std::fs::remove_file(f);
     }
 }
+
+#[test]
+fn symlinks_with_minio_fsck_and_reopen() {
+    let cfg = match minio_config("symlink") {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let _ = std::fs::remove_file(&cfg.metadata.path);
+    let eng = lightfs::engine::open_embedded(&cfg).expect("embedded engine opens");
+
+    // a real file, a relative link, a dangling link, a dir link
+    eng.core.mkdir("/app", 0o755).unwrap();
+    eng.core.create("/app/cli.js", 0o644).unwrap();
+    let h = eng.core.open_write("/app/cli.js", None).unwrap();
+    eng.core.write(&h, 0, b"#!/usr/bin/env node\n").unwrap();
+    eng.core.commit_write(&h).unwrap();
+    eng.core.symlink("cli.js", "/app/run").unwrap();
+    eng.core.symlink("../app/cli.js", "/shortcut").unwrap();
+    eng.core.symlink("/app", "/appdir").unwrap();
+
+    // stat vs lstat through the MinIO-backed store
+    assert!(eng.core.lookup("/app/run").unwrap().is_symlink());
+    assert_eq!(
+        eng.core.read("/shortcut", 0, 100).unwrap(),
+        b"#!/usr/bin/env node\n"
+    );
+    let names: Vec<String> = eng
+        .core
+        .readdir("/appdir")
+        .unwrap()
+        .into_iter()
+        .map(|n| n.name)
+        .collect();
+    assert_eq!(names, vec!["cli.js".to_string(), "run".to_string()]);
+
+    // fsck: symlinks carry no object, must not be problems
+    let report = lightfs::fsck::fsck(&eng.core).unwrap();
+    assert_eq!(report.problems(), 0, "{}", report.render());
+
+    // reopen the SAME database: targets survive (persistence of the
+    // metadata that backup snapshots would carry)
+    let eng2 = lightfs::engine::open_embedded(&cfg).expect("reopen");
+    assert_eq!(eng2.core.readlink("/app/run").unwrap(), "cli.js");
+    assert_eq!(eng2.core.readlink("/shortcut").unwrap(), "../app/cli.js");
+    assert_eq!(
+        eng2.core.read("/shortcut", 0, 100).unwrap(),
+        b"#!/usr/bin/env node\n"
+    );
+
+    let _ = std::fs::remove_file(&cfg.metadata.path);
+    let _ = std::fs::remove_file(format!("{}-wal", cfg.metadata.path));
+    let _ = std::fs::remove_file(format!("{}-shm", cfg.metadata.path));
+}

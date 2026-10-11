@@ -9,6 +9,7 @@ use crate::error::Result;
 pub enum NodeKind {
     Dir,
     File,
+    Symlink,
 }
 
 impl NodeKind {
@@ -16,14 +17,16 @@ impl NodeKind {
         match self {
             NodeKind::Dir => "dir",
             NodeKind::File => "file",
+            NodeKind::Symlink => "symlink",
         }
     }
-    /// Parse the stored string form ("dir"/"file"). Named to avoid confusion
-    /// with std::str::FromStr.
+    /// Parse the stored string form ("dir"/"file"/"symlink"). Named to avoid
+    /// confusion with std::str::FromStr.
     pub fn parse_kind(s: &str) -> Option<Self> {
         match s {
             "dir" => Some(NodeKind::Dir),
             "file" => Some(NodeKind::File),
+            "symlink" => Some(NodeKind::Symlink),
             _ => None,
         }
     }
@@ -46,6 +49,9 @@ pub struct Node {
     pub version: i64,
     /// ETag of the last committed object.
     pub etag: String,
+    /// Symlink target, stored VERBATIM (relative or absolute); None for
+    /// every other kind. Resolution semantics live in Core, not here.
+    pub target: Option<String>,
 }
 
 impl Node {
@@ -54,6 +60,9 @@ impl Node {
     }
     pub fn is_file(&self) -> bool {
         self.kind == NodeKind::File
+    }
+    pub fn is_symlink(&self) -> bool {
+        self.kind == NodeKind::Symlink
     }
 }
 
@@ -67,6 +76,9 @@ pub trait MetadataStore: Send + Sync {
         mode: u32,
         object_key: Option<&str>,
     ) -> Result<Node>;
+    /// Create a symlink node whose `target` is stored verbatim (never
+    /// resolved at write time). size records target.len() for lstat.
+    fn create_symlink(&self, parent_id: i64, name: &str, target: &str, mode: u32) -> Result<Node>;
     fn get_node(&self, id: i64) -> Result<Option<Node>>;
     fn get_child(&self, parent_id: i64, name: &str) -> Result<Option<Node>>;
     fn list_children(&self, parent_id: i64) -> Result<Vec<Node>>;

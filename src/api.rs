@@ -41,6 +41,11 @@ pub trait FsApi: Send + Sync {
     fn unlink(&self, path: &str) -> Result<()>;
     fn rmdir(&self, path: &str) -> Result<()>;
     fn setattr(&self, path: &str, mode: Option<u32>, mtime: Option<i64>) -> Result<Node>;
+    /// Create a symlink at `path` whose target is stored verbatim
+    /// (no-follow by definition).
+    fn symlink(&self, target: &str, path: &str) -> Result<Node>;
+    /// Return the stored target of the symlink at `path` (no-follow).
+    fn readlink(&self, path: &str) -> Result<String>;
 }
 
 struct CoreWriteSession<'a> {
@@ -103,5 +108,11 @@ impl FsApi for Core {
     }
     fn setattr(&self, path: &str, mode: Option<u32>, mtime: Option<i64>) -> Result<Node> {
         Core::setattr(self, path, mode, mtime)
+    }
+    fn symlink(&self, target: &str, path: &str) -> Result<Node> {
+        Core::symlink(self, target, path)
+    }
+    fn readlink(&self, path: &str) -> Result<String> {
+        Core::readlink(self, path)
     }
 }

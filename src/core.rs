@@ -80,6 +80,38 @@ pub fn path_components(path: &str) -> Result<Vec<&str>> {
     Ok(out)
 }
 
+/// POSIX SYMLOOP_MAX: total symlink resolutions allowed during one path
+/// walk (the kernel uses the same bound; loops fail instead of hanging).
+pub const MAX_SYMLINK_RESOLUTIONS: usize = 40;
+
+/// Join a symlink target onto the directory the link lives in, producing
+/// the next candidate path. Pure string logic, unit-tested as the escape
+/// contract:
+/// - relative targets resolve against the link's directory
+/// - absolute targets restart at the mount root (mount-relative, chroot
+///   semantics - a link can never point outside this filesystem)
+/// - ".." pops one component and CLAMPS at the root instead of escaping
+pub fn resolve_target(link_dir: &str, target: &str) -> Result<String> {
+    if target.is_empty() || target.contains('\0') {
+        return Err(Error::InvalidArgument("empty symlink target".into()));
+    }
+    let mut out: Vec<&str> = if target.starts_with('/') {
+        Vec::new()
+    } else {
+        path_components(link_dir)?
+    };
+    for comp in target.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                out.pop(); // clamp at root: pop on empty stays empty
+            }
+            c => out.push(c),
+        }
+    }
+    Ok(format!("/{}", out.join("/")))
+}
+
 impl Core {
     pub fn new(meta: Arc<dyn MetadataStore>, objects: Arc<dyn ObjectStore>) -> Self {
         Self::with_retention(meta, objects, DEFAULT_SUPERSEDED_SECS)
@@ -127,25 +159,123 @@ impl Core {
             .as_secs() as i64
     }
 
-    /// Walk `path` from the root. Returns the node or NotFound naming the
-    /// full path of the first missing component.
+    /// Walk `path` from the root. Intermediate symlink components are
+    /// RESOLVED (POSIX path resolution); the final component is returned
+    /// as-is - lstat semantics. NotFound names the full path of the first
+    /// missing component; more than MAX_SYMLINK_RESOLUTIONS resolutions
+    /// in one walk fail with InvalidArgument (ELOOP analogue).
     pub fn lookup(&self, path: &str) -> Result<Node> {
-        let comps = path_components(path)?;
-        let mut node = self
-            .meta
-            .get_node(1)?
-            .ok_or_else(|| Error::NotFound("/".to_string()))?;
+        let mut comps: Vec<String> = path_components(path)?
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let mut budget = MAX_SYMLINK_RESOLUTIONS;
         let mut cur = String::new();
-        for comp in comps {
-            cur.push('/');
-            cur.push_str(comp);
-            let parent = node.id;
-            node = self
+        loop {
+            let mut node = self
                 .meta
-                .get_child(parent, comp)?
-                .ok_or_else(|| Error::NotFound(cur.clone()))?;
+                .get_node(1)?
+                .ok_or_else(|| Error::NotFound("/".to_string()))?;
+            cur.clear();
+            let mut i = 0usize;
+            while i < comps.len() {
+                cur.push('/');
+                cur.push_str(&comps[i]);
+                let parent = node.id;
+                node = self
+                    .meta
+                    .get_child(parent, &comps[i])?
+                    .ok_or_else(|| Error::NotFound(cur.clone()))?;
+                // Intermediate component that is a link: splice its target
+                // in front of the remaining components and restart the walk
+                // from the root. The loop budget bounds the WHOLE walk, so
+                // chains and cycles both terminate with the same error.
+                if node.is_symlink() && i + 1 < comps.len() {
+                    let target = node.target.clone().unwrap_or_default();
+                    let link_dir = if i == 0 {
+                        "/"
+                    } else {
+                        // cur currently ends with "/<comps[i]>"; strip it.
+                        &cur[..cur.len() - comps[i].len() - 1]
+                    };
+                    let next = resolve_target(link_dir, &target)?;
+                    let mut new_comps: Vec<String> = path_components(&next)?
+                        .into_iter()
+                        .map(String::from)
+                        .collect();
+                    new_comps.extend_from_slice(&comps[i + 1..]);
+                    comps = new_comps;
+                    budget -= 1;
+                    if budget == 0 {
+                        return Err(Error::InvalidArgument(format!(
+                            "too many symlink resolutions: {path}"
+                        )));
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            if i == comps.len() {
+                return Ok(node);
+            }
         }
-        Ok(node)
+    }
+
+    /// stat semantics: like lookup (lstat), but a final symlink resolves
+    /// to its target, recursively. Budget-bounded like lookup.
+    pub fn lookup_follow(&self, path: &str) -> Result<Node> {
+        let mut cur = path.to_string();
+        let mut budget = MAX_SYMLINK_RESOLUTIONS;
+        loop {
+            let node = self.lookup(&cur)?;
+            if !node.is_symlink() {
+                return Ok(node);
+            }
+            budget -= 1;
+            if budget == 0 {
+                return Err(Error::InvalidArgument(format!(
+                    "too many symlink resolutions: {path}"
+                )));
+            }
+            let target = node.target.clone().unwrap_or_default();
+            let dir = match cur.rfind('/') {
+                Some(0) | None => "/",
+                Some(i) => &cur[..i],
+            };
+            cur = resolve_target(dir, &target)?;
+        }
+    }
+
+    /// symlink(target, link_path): store the target VERBATIM. Fails with
+    /// AlreadyExists if ANY node occupies the final name (POSIX EEXIST).
+    pub fn symlink(&self, target: &str, link_path: &str) -> Result<Node> {
+        if target.is_empty() || target.contains('\0') || target.len() > 4096 {
+            return Err(Error::InvalidArgument(format!(
+                "symlink target length {} invalid",
+                target.len()
+            )));
+        }
+        let (parent, name) = self.parent_and_name(link_path)?;
+        if self.meta.get_child(parent.id, &name)?.is_some() {
+            return Err(Error::AlreadyExists(link_path.to_string()));
+        }
+        self.metrics.metadata_tx.fetch_add(1, Ordering::Relaxed);
+        self.meta.create_symlink(parent.id, &name, target, 0o777)
+    }
+
+    /// readlink: return the stored target of the symlink at `path`.
+    /// Not-following is the whole point; a non-symlink fails with
+    /// KindMismatch (EINVAL analogue).
+    pub fn readlink(&self, path: &str) -> Result<String> {
+        let node = self.lookup(path)?;
+        match node.target {
+            Some(t) => Ok(t),
+            None => Err(Error::KindMismatch {
+                path: path.to_string(),
+                expected: "symlink",
+                actual: node.kind.as_str().to_string(),
+            }),
+        }
     }
 
     /// Node for `path`'s parent, plus the final component name.
@@ -155,7 +285,9 @@ impl Core {
             return Err(Error::InvalidArgument("root has no parent".into()));
         };
         let parent_path = format!("/{}", comps[..comps.len() - 1].join("/"));
-        let parent = self.lookup(&parent_path)?;
+        // POSIX resolution of the dirname follows symlinks; only the FINAL
+        // component of the original path is treated no-follow by callers.
+        let parent = self.lookup_follow(&parent_path)?;
         if !parent.is_dir() {
             return Err(Error::KindMismatch {
                 path: parent_path,
@@ -167,16 +299,18 @@ impl Core {
     }
 
     pub fn getattr(&self, path: &str) -> Result<Node> {
-        self.lookup(path)
+        // stat(2) semantics: follow a final symlink.
+        self.lookup_follow(path)
     }
 
     pub fn readdir(&self, path: &str) -> Result<Vec<Node>> {
-        let node = self.lookup(path)?;
+        // opendir(3) semantics: follow a final symlink to the directory.
+        let node = self.lookup_follow(path)?;
         if !node.is_dir() {
             return Err(Error::KindMismatch {
                 path: path.to_string(),
                 expected: "dir",
-                actual: "file".into(),
+                actual: node.kind.as_str().to_string(),
             });
         }
         self.meta.list_children(node.id)
@@ -219,7 +353,7 @@ impl Core {
 
     /// Check a file exists and return it (FUSE open / shell read entry).
     pub fn open(&self, path: &str) -> Result<Node> {
-        let node = self.lookup(path)?;
+        let node = self.lookup_follow(path)?;
         if !node.is_file() {
             return Err(Error::KindMismatch {
                 path: path.to_string(),
@@ -232,7 +366,7 @@ impl Core {
 
     /// Read up to `size` bytes at `offset`. Read past EOF yields empty data.
     pub fn read(&self, path: &str, offset: u64, size: u64) -> Result<Vec<u8>> {
-        let node = self.lookup(path)?;
+        let node = self.lookup_follow(path)?;
         if !node.is_file() {
             return Err(Error::KindMismatch {
                 path: path.to_string(),
@@ -268,7 +402,7 @@ impl Core {
         offset: u64,
         size: u64,
     ) -> Result<(Box<dyn std::io::Read + Send>, u64)> {
-        let node = self.lookup(path)?;
+        let node = self.lookup_follow(path)?;
         if !node.is_file() {
             return Err(Error::KindMismatch {
                 path: path.to_string(),
@@ -312,7 +446,7 @@ impl Core {
                 Err(e) => return Err(e),
             }
         }
-        let node = self.lookup(path)?;
+        let node = self.lookup_follow(path)?;
         if !node.is_file() {
             return Err(Error::KindMismatch {
                 path: path.to_string(),
@@ -371,7 +505,7 @@ impl Core {
     /// Start a buffered write session on `path`. `expected_version = None`
     /// means "whatever the node holds now" (single-writer convenience).
     pub fn open_write(&self, path: &str, expected_version: Option<i64>) -> Result<WriteHandle> {
-        let node = self.lookup(path)?;
+        let node = self.lookup_follow(path)?;
         if !node.is_file() {
             return Err(Error::KindMismatch {
                 path: path.to_string(),
@@ -539,11 +673,13 @@ impl Core {
     /// row so fsck retries later.
     pub fn unlink(&self, path: &str) -> Result<()> {
         let node = self.lookup(path)?;
-        if !node.is_file() {
+        // POSIX: unlink removes files AND symlinks (never following the
+        // link); only directories are refused (that is rmdir's job).
+        if !node.is_file() && !node.is_symlink() {
             return Err(Error::KindMismatch {
                 path: path.to_string(),
                 expected: "file",
-                actual: "dir".into(),
+                actual: node.kind.as_str().to_string(),
             });
         }
         if let Some(key) = &node.object_key {
@@ -560,11 +696,13 @@ impl Core {
 
     pub fn rmdir(&self, path: &str) -> Result<()> {
         let node = self.lookup(path)?;
+        // A symlink is NOT a directory and rmdir never follows it (POSIX
+        // rmdir on a link fails ENOTDIR, it does not remove the target).
         if !node.is_dir() {
             return Err(Error::KindMismatch {
                 path: path.to_string(),
                 expected: "dir",
-                actual: "file".into(),
+                actual: node.kind.as_str().to_string(),
             });
         }
         if node.id == 1 {
@@ -1015,5 +1153,291 @@ mod tests {
         }
         assert_eq!(c.readdir("/").unwrap().len(), 4);
         assert_eq!(c.read("/t2/f", 0, 100).unwrap(), b"data-2");
+    }
+}
+
+#[cfg(test)]
+mod symlink_tests {
+    //! Symlink contract tests: these DEFINE the POSIX semantics we ship.
+    //! Written first (contract), implementation second.
+
+    use super::*;
+    use crate::metadata::sqlite::SqliteMetadataStore;
+    use crate::object_store::mem::MemObjectStore;
+
+    fn core() -> Core {
+        Core::new(
+            Arc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            Arc::new(MemObjectStore::new()),
+        )
+    }
+
+    fn put(c: &Core, path: &str, data: &[u8]) {
+        let _ = c.create(path, 0o644);
+        let h = c.open_write(path, None).unwrap();
+        c.write(&h, 0, data).unwrap();
+        c.commit_write(&h).unwrap();
+    }
+
+    #[test]
+    fn symlink_readlink_roundtrip() {
+        let c = core();
+        c.mkdir("/d", 0o755).unwrap();
+        let n = c.symlink("/d/target", "/d/link").unwrap();
+        assert!(n.is_symlink());
+        assert_eq!(n.target.as_deref(), Some("/d/target"));
+        assert_eq!(c.readlink("/d/link").unwrap(), "/d/target");
+        // size records the target length for lstat
+        assert_eq!(n.size, "/d/target".len() as i64);
+    }
+
+    #[test]
+    fn lstat_vs_stat_on_the_link() {
+        let c = core();
+        put(&c, "/f", b"hello");
+        c.symlink("/f", "/l").unwrap();
+        // lstat: the link itself (kind symlink, size = target length)
+        let st = c.lookup("/l").unwrap();
+        assert!(st.is_symlink());
+        assert_eq!(st.size, "/f".len() as i64);
+        // stat: follows to the file
+        let st = c.getattr("/l").unwrap();
+        assert!(st.is_file());
+        assert_eq!(st.size, 5);
+        // reading THROUGH the link returns the target's bytes
+        assert_eq!(c.read("/l", 0, 100).unwrap(), b"hello");
+        assert_eq!(c.open("/l").unwrap().id, c.lookup("/f").unwrap().id);
+    }
+
+    #[test]
+    fn relative_and_dir_links() {
+        let c = core();
+        c.mkdir("/data", 0o755).unwrap();
+        put(&c, "/data/inner", b"x");
+        // relative target resolves against the LINK's directory
+        c.symlink("../data", "/alias").unwrap();
+        // stat through the dir link
+        let st = c.getattr("/alias/inner").unwrap();
+        assert_eq!(st.size, 1);
+        // readdir through the dir link lists the target dir
+        let names: Vec<String> = c
+            .readdir("/alias")
+            .unwrap()
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        assert_eq!(names, vec!["inner".to_string()]);
+        // create THROUGH an intermediate dir link lands in the target dir
+        put(&c, "/alias/created_via_link", b"y");
+        assert!(c.lookup("/data/created_via_link").is_ok());
+    }
+
+    #[test]
+    fn absolute_target_is_mount_relative() {
+        let c = core();
+        put(&c, "/etc-passwd-like", b"z");
+        // An absolute target NEVER escapes the mount: it resolves from
+        // this filesystem's root, not the host's.
+        c.symlink("/etc-passwd-like", "/abs").unwrap();
+        assert_eq!(c.read("/abs", 0, 100).unwrap(), b"z");
+        // A target pointing at a nonexistent mount path is dangling.
+        c.symlink("/no/such/path", "/dangling").unwrap();
+        assert!(c.lookup("/dangling").unwrap().is_symlink());
+        assert!(matches!(
+            c.read("/dangling", 0, 10),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn dotdot_clamps_at_root_and_cannot_escape() {
+        // resolve_target contract (pure string level)
+        assert_eq!(resolve_target("/a", "../../etc").unwrap(), "/etc");
+        assert_eq!(resolve_target("/", "../../etc").unwrap(), "/etc");
+        assert_eq!(resolve_target("/a/b", "../../..").unwrap(), "/");
+        // And through an actual walk: /up -> /../.. stays inside.
+        let c = core();
+        put(&c, "/top", b"t");
+        c.mkdir("/sub", 0o755).unwrap();
+        c.symlink("/../top", "/sub/up").unwrap();
+        assert_eq!(c.read("/sub/up", 0, 10).unwrap(), b"t");
+        // .. above the root is not an escape hatch to anything.
+        c.symlink("../../../elsewhere", "/nowhere").unwrap();
+        assert!(matches!(c.read("/nowhere", 0, 10), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn cycles_fail_with_loop_error() {
+        let c = core();
+        c.symlink("/b", "/a").unwrap();
+        c.symlink("/a", "/b").unwrap();
+        let err = c.getattr("/a").unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(ref m) if m.contains("too many symlink")),
+            "expected loop error, got {err:?}"
+        );
+        // self-loop
+        c.symlink("/self", "/self").unwrap();
+        assert!(c.getattr("/self").is_err());
+        // a long chain still terminates correctly (well under the cap)
+        let c2 = core();
+        put(&c2, "/end", b"e");
+        for i in 0..30 {
+            let next = format!("/chain{}", i + 1);
+            let prev = if i == 0 {
+                "/end".to_string()
+            } else {
+                format!("/chain{i}")
+            };
+            c2.symlink(&prev, &next).unwrap();
+        }
+        assert_eq!(c2.read("/chain30", 0, 10).unwrap(), b"e");
+        // and a chain past the budget fails
+        let c3 = core();
+        for i in 0..45 {
+            let next = format!("/long{}", i + 1);
+            let prev = if i == 0 {
+                "/end".to_string()
+            } else {
+                format!("/long{i}")
+            };
+            c3.symlink(&prev, &next).unwrap();
+        }
+        assert!(c3.getattr("/long45").is_err());
+    }
+
+    #[test]
+    fn name_collisions_and_rename_unlink_semantics() {
+        let c = core();
+        put(&c, "/real", b"r");
+        c.symlink("/real", "/same").unwrap();
+        // the name is occupied by ANY kind
+        assert!(matches!(
+            c.symlink("/real", "/same"),
+            Err(Error::AlreadyExists(_))
+        ));
+        assert!(matches!(
+            c.create("/same", 0o644),
+            Err(Error::AlreadyExists(_))
+        ));
+        assert!(matches!(
+            c.mkdir("/same", 0o755),
+            Err(Error::AlreadyExists(_))
+        ));
+        // renaming the TARGET leaves the (now dangling) link untouched
+        c.rename("/real", "/moved").unwrap();
+        assert!(c.lookup("/same").unwrap().is_symlink());
+        assert!(matches!(c.read("/same", 0, 10), Err(Error::NotFound(_))));
+        assert_eq!(c.readlink("/same").unwrap(), "/real");
+        // renaming the LINK keeps its target verbatim
+        c.rename("/same", "/same2").unwrap();
+        assert_eq!(c.readlink("/same2").unwrap(), "/real");
+        // deleting the link never touches the target
+        put(&c, "/real2", b"r2");
+        c.symlink("/real2", "/l2").unwrap();
+        c.unlink("/l2").unwrap();
+        assert!(matches!(c.readlink("/l2"), Err(Error::NotFound(_))));
+        assert_eq!(c.read("/real2", 0, 10).unwrap(), b"r2");
+        // rmdir on a link fails instead of removing the target
+        c.symlink("/real2", "/l3").unwrap();
+        assert!(c.rmdir("/l3").is_err());
+        assert!(c.lookup("/real2").is_ok());
+        // unlinking a symlink does NOT delete the target's object
+        c.unlink("/real2").unwrap();
+        assert!(matches!(c.read("/real2", 0, 10), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn readlink_rejects_non_symlink() {
+        let c = core();
+        c.mkdir("/d", 0o755).unwrap();
+        put(&c, "/f", b"x");
+        for p in ["/d", "/f", "/"] {
+            let err = c.readlink(p).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Error::KindMismatch {
+                        expected: "symlink",
+                        ..
+                    }
+                ),
+                "{p}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn symlink_target_validation() {
+        let c = core();
+        assert!(matches!(
+            c.symlink("", "/bad-empty"),
+            Err(Error::InvalidArgument(_))
+        ));
+        // dangling targets ARE legal at creation time (checked only at use)
+        c.symlink("/not-yet", "/lazy").unwrap();
+        put(&c, "/not-yet", b"now");
+        assert_eq!(c.read("/lazy", 0, 10).unwrap(), b"now");
+    }
+
+    #[test]
+    fn fsck_ignores_symlink_nodes() {
+        let c = core();
+        put(&c, "/f", b"data");
+        c.symlink("/f", "/l").unwrap();
+        c.symlink("/nowhere", "/dangling").unwrap();
+        let report = crate::fsck::fsck(&c).unwrap();
+        assert_eq!(report.problems(), 0, "symlinks have no object");
+    }
+
+    #[test]
+    fn symlink_survives_metadata_snapshot_roundtrip() {
+        // backup = SQLite snapshot; the target column must ride along.
+        let dir = std::env::temp_dir().join(format!("lightfs-sym-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("meta.db");
+        let objects = Arc::new(MemObjectStore::new());
+        let store = SqliteMetadataStore::open(db.to_str().unwrap()).unwrap();
+        let c = Core::new(Arc::new(store), objects.clone());
+        put(&c, "/f", b"data");
+        c.symlink("../f", "/rel").unwrap();
+        c.symlink("/f", "/abs").unwrap();
+        drop(c);
+        // reopen: the target column must still be there and populated
+        let store = SqliteMetadataStore::open(db.to_str().unwrap()).unwrap();
+        let c = Core::new(Arc::new(store), objects);
+        assert_eq!(c.readlink("/rel").unwrap(), "../f");
+        assert_eq!(c.readlink("/abs").unwrap(), "/f");
+        assert_eq!(c.read("/rel", 0, 10).unwrap(), b"data");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_adds_target_column_to_legacy_db() {
+        let dir = std::env::temp_dir().join(format!("lightfs-sym-mig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("legacy.db");
+        // Build a PRE-symlink database with the old schema text.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS nodes (
+                id INTEGER PRIMARY KEY, parent_id INTEGER, name TEXT NOT NULL,
+                kind TEXT NOT NULL, size INTEGER NOT NULL DEFAULT 0,
+                mtime INTEGER NOT NULL, mode INTEGER, object_key TEXT,
+                version TEXT, etag TEXT, UNIQUE(parent_id, name)
+            );
+            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, mode)
+            VALUES (1, NULL, '', 'dir', 0, 0, 493);",
+        )
+        .unwrap();
+        drop(conn);
+        // Opening migrates; the store then works with symlinks.
+        let store = SqliteMetadataStore::open(db.to_str().unwrap()).unwrap();
+        let c = Core::new(Arc::new(store), Arc::new(MemObjectStore::new()));
+        c.symlink("/x", "/y").unwrap();
+        assert_eq!(c.readlink("/y").unwrap(), "/x");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

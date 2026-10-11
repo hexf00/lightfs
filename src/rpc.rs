@@ -63,6 +63,7 @@ pub fn node_to_json(n: &Node) -> Value {
         "object_key": n.object_key,
         "version": n.version,
         "etag": n.etag,
+        "target": n.target,
     })
 }
 
@@ -72,6 +73,7 @@ fn node_from_json(v: &Value) -> Result<Node> {
     let kind = match v["kind"].as_str() {
         Some("dir") => NodeKind::Dir,
         Some("file") => NodeKind::File,
+        Some("symlink") => NodeKind::Symlink,
         _ => return Err(Error::InvalidArgument("node kind".into())),
     };
     Ok(Node {
@@ -87,6 +89,7 @@ fn node_from_json(v: &Value) -> Result<Node> {
         object_key: v["object_key"].as_str().map(String::from),
         version: v["version"].as_i64().unwrap_or(0),
         etag: v["etag"].as_str().unwrap_or_default().to_string(),
+        target: v["target"].as_str().map(String::from),
     })
 }
 
@@ -157,6 +160,15 @@ fn handle(core: &Core, method: &str, params: &Value) -> Result<Value> {
             let path = p_str(params, "path")?;
             let mode = p_opt_u32(params, "mode").unwrap_or(0o755);
             Ok(node_to_json(&core.mkdir(&path, mode)?))
+        }
+        "symlink" => {
+            let path = p_str(params, "path")?;
+            let target = p_str(params, "target")?;
+            Ok(node_to_json(&core.symlink(&target, &path)?))
+        }
+        "readlink" => {
+            let path = p_str(params, "path")?;
+            Ok(json!({ "target": core.readlink(&path)? }))
         }
         "create" => {
             let path = p_str(params, "path")?;

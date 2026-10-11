@@ -110,6 +110,9 @@ impl MetadataStore for FaultyMeta {
         self.inner
             .create_node(parent_id, name, kind, mode, object_key)
     }
+    fn create_symlink(&self, parent_id: i64, name: &str, target: &str, mode: u32) -> Result<Node> {
+        self.inner.create_symlink(parent_id, name, target, mode)
+    }
     fn get_node(&self, id: i64) -> Result<Option<Node>> {
         self.inner.get_node(id)
     }

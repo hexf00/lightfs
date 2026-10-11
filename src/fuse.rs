@@ -108,7 +108,13 @@ fn errno(e: &Error) -> Errno {
         Error::KindMismatch {
             expected: "dir", ..
         } => Errno::ENOTDIR,
+        // readlink on a non-symlink is EINVAL per POSIX (not EISDIR)
+        Error::KindMismatch {
+            expected: "symlink",
+            ..
+        } => Errno::EINVAL,
         Error::KindMismatch { .. } => Errno::EISDIR,
+        Error::InvalidArgument(m) if m.contains("too many symlink") => Errno::ELOOP,
         Error::DirectoryNotEmpty(_) => Errno::ENOTEMPTY,
         Error::Cycle(_) | Error::InvalidPath(_) | Error::InvalidArgument(_) => Errno::EINVAL,
         Error::Conflict { .. } => Errno::EIO,
@@ -127,10 +133,17 @@ fn attr_for(node: &Node, uid: u32, gid: u32) -> FileAttr {
         crtime: unix_to_systemtime(node.mtime),
         kind: if node.is_dir() {
             FileType::Directory
+        } else if node.is_symlink() {
+            FileType::Symlink
         } else {
             FileType::RegularFile
         },
-        perm: (node.mode & 0o7777) as u16,
+        // Symlinks always appear as 0777 like on a real POSIX filesystem.
+        perm: if node.is_symlink() {
+            0o777
+        } else {
+            (node.mode & 0o7777) as u16
+        },
         nlink: if node.is_dir() { 2 } else { 1 },
         uid,
         gid,
@@ -202,6 +215,8 @@ impl FuseAdapter {
         for c in children {
             let kind = if c.is_dir() {
                 FileType::Directory
+            } else if c.is_symlink() {
+                FileType::Symlink
             } else {
                 FileType::RegularFile
             };
@@ -763,6 +778,51 @@ impl Filesystem for FuseAdapter {
                     fuser::Generation(0),
                 );
             }
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    fn symlink(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        link: &std::path::Path,
+        reply: ReplyEntry,
+    ) {
+        let _g = crate::metrics::scope("fuse.symlink");
+        let parent_path = match self.path_of(parent) {
+            Ok(p) => p,
+            Err(e) => return reply.error(e),
+        };
+        let path = Self::child_path(&parent_path, name);
+        // The kernel hands us the raw target bytes; store verbatim. All
+        // resolution happens kernel-side afterwards (it re-resolves and
+        // comes back with lookups), so no Core-side following here.
+        let target = link.to_string_lossy().to_string();
+        match self.fs.symlink(&target, &path) {
+            Ok(node) => {
+                self.dirent_invalidate();
+                self.remember(node.id as u64, &parent_path, name);
+                reply.entry(
+                    &self.attr_ttl,
+                    &attr_for(&node, self.uid, self.gid),
+                    fuser::Generation(0),
+                );
+            }
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let _g = crate::metrics::scope("fuse.readlink");
+        let path = match self.path_of(ino) {
+            Ok(p) => p,
+            Err(e) => return reply.error(e),
+        };
+        match self.fs.readlink(&path) {
+            // The kernel NUL-terminates; hand back the raw target bytes.
+            Ok(target) => reply.data(target.as_bytes()),
             Err(e) => reply.error(errno(&e)),
         }
     }
