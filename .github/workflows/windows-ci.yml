@@ -183,7 +183,16 @@ jobs:
               $dst = "Q:\docs\rand-$($sz).bin"
               [IO.File]::Copy("$PWD\expect.bin", $dst)
               $h1 = (Get-FileHash "$PWD\expect.bin" -Algorithm SHA256).Hash
-              $h2 = (Get-FileHash $dst -Algorithm SHA256).Hash
+              # Plain close (no FlushFileBuffers) has an async commit window
+              # in the WinFsp FUSE layer: flush/release run in the Close
+              # callback, AFTER CloseHandle returns. Retry the read hash a
+              # few times; the flush(true) path below must NOT need this.
+              $h2 = $null
+              foreach ($try in 1..30) {
+                $h2 = (Get-FileHash $dst -Algorithm SHA256).Hash
+                if ($h2 -eq $h1) { break }
+                Start-Sleep -Milliseconds 500
+              }
               if ($h1 -ne $h2) {
                 $got = [IO.File]::ReadAllBytes($dst)
                 "DIAG: size want=$($b.Length) got=$($got.Length)"
@@ -210,6 +219,20 @@ jobs:
                 throw "binary roundtrip hash mismatch (size $sz)"
               }
             }
+
+            # [4.2b] strict close-open coherence via FlushFileBuffers:
+            # our cb_flush commits synchronously, so a read right after
+            # flush(true) must be byte-exact with NO retry.
+            $sb = New-Object byte[] (1MB)
+            (New-Object Random 7).NextBytes($sb)
+            [IO.File]::WriteAllBytes("$PWD\flushin.bin", $sb)
+            $fs = [IO.File]::Open('Q:\docs\flushed.bin', 'Create', 'Write')
+            $fs.Write($sb, 0, $sb.Length)
+            $fs.Flush($true)
+            $fs.Close()
+            $hf1 = (Get-FileHash "$PWD\flushin.bin" -Algorithm SHA256).Hash
+            $hf2 = (Get-FileHash 'Q:\docs\flushed.bin' -Algorithm SHA256).Hash
+            if ($hf1 -ne $hf2) { throw "FlushFileBuffers coherence failed" }
 
             # [4.3] shell client sees the same namespace (server mode)
             $seen = & $shellbin --config "$PWD\cfg.toml" @srv ls /docs
