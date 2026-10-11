@@ -11,7 +11,10 @@ graph (enforced by `scripts/check-no-tokio.sh` in CI).
 - One `lightfs server` owns the metadata in multi-client mode; clients
   speak JSON-RPC over HTTP plus binary data endpoints.
 - `lightfs mount` (Linux, FUSE) exposes the namespace to existing Unix
-  tools.
+  tools. A Windows adapter (WinFsp, drive-letter mounts) exists and is
+  exercised in CI, but is **experimental**: after a plain `CloseHandle`
+  there is a short commit-visibility window (strict coherence is provided
+  by `FlushFileBuffers`; see the Windows docs in the project repository).
 
 ## Build
 

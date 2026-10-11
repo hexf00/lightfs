@@ -27,15 +27,9 @@ use fuser::{
 use crate::api::FsApi;
 use crate::error::Error;
 use crate::metadata::Node;
+use crate::writeback::PendingWrite;
 
 const ATTR_TTL: Duration = Duration::from_secs(1);
-
-struct PendingWrite {
-    path: String,
-    expected_version: i64,
-    chunks: std::collections::BTreeMap<u64, Vec<u8>>,
-    committed: bool,
-}
 
 pub struct FuseAdapter {
     fs: std::sync::Arc<dyn FsApi>,
@@ -157,15 +151,10 @@ impl FuseAdapter {
             });
         }
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-        self.writes.lock().unwrap().insert(
-            fh,
-            PendingWrite {
-                path: path.to_string(),
-                expected_version: node.version,
-                chunks: std::collections::BTreeMap::new(),
-                committed: false,
-            },
-        );
+        self.writes
+            .lock()
+            .unwrap()
+            .insert(fh, PendingWrite::new(path.to_string(), node.version));
         Ok(fh)
     }
 
@@ -176,12 +165,17 @@ impl FuseAdapter {
     /// kernel during the commit land in a fresh map instead of being
     /// silently merged with already-uploading data.
     ///
-    /// Write-back overlay: the commit content is the file's CURRENT
-    /// committed content with the drained chunks overlaid at their offsets
-    /// (the kernel only sends dirty pages - chunks alone would zero-fill
-    /// the base). On success the drained chunks stay drained
-    /// (committed=true); on CAS failure they are merged back into the
-    /// session so a retry flush can succeed against the rebased version.
+    /// Failure recovery: EVERY error after the drain puts the drained
+    /// chunks back (writeback::ChunkMap::restore_under - chunks that
+    /// arrived during the failed commit are newer and win) and re-bases
+    /// the session's CAS anchor to the version observed at attempt start,
+    /// so a retry flush can succeed. Without this a failed flush would
+    /// drop the drained data and the next flush would "succeed" on an
+    /// empty batch - silent data loss.
+    ///
+    /// Success: the session becomes committed ONLY when no new chunks
+    /// arrived during the commit window; a write-during-commit batch is
+    /// left for the next flush, CAS-anchored on the fresh version.
     fn commit_write(&self, fh: u64) -> Result<(), Error> {
         let snapshot = {
             let mut writes = self.writes.lock().unwrap();
@@ -191,7 +185,7 @@ impl FuseAdapter {
             if state.committed {
                 return Ok(());
             }
-            let drained = std::mem::take(&mut state.chunks);
+            let drained = state.chunks.drain();
             if drained.is_empty() {
                 // A write-intent open that never wrote: commit nothing, or
                 // every such open+close would re-upload the whole file.
@@ -201,58 +195,62 @@ impl FuseAdapter {
             (state.path.clone(), state.expected_version, drained)
         };
         let (path, expected, drained) = snapshot;
+        let fail = |e: Error, observed: Option<i64>| -> Error {
+            let mut writes = self.writes.lock().unwrap();
+            if let Some(state) = writes.get_mut(&fh) {
+                state.chunks.restore_under(&drained);
+                if let Some(v) = observed {
+                    state.rebase(v);
+                }
+            }
+            e
+        };
         // Write-back overlay: final content = the file's CURRENT committed
         // content with the drained chunks overlaid at their offsets (the
         // kernel only sends dirty pages - chunks alone would zero-fill the
         // base and destroy existing data).
         let node_now = match self.fs.lookup(&path) {
             Ok(n) => n,
-            Err(e) => {
-                Self::restore_chunks(fh, drained, self);
-                return Err(e);
-            }
+            Err(e) => return Err(fail(e, None)),
         };
         let mut content = match self.fs.read(&path, 0, node_now.size as u64) {
             Ok(c) => c,
             Err(Error::ObjectMissing(_)) => Vec::new(),
-            Err(e) => {
-                Self::restore_chunks(fh, drained, self);
-                return Err(e);
-            }
+            Err(e) => return Err(fail(e, Some(node_now.version))),
         };
-        for (&off, data) in drained.iter() {
-            let end = off as usize + data.len();
-            if end > content.len() {
-                content.resize(end, 0);
+        drained_overlay(&drained, &mut content);
+        let mut session = match self.fs.open_write(&path, Some(expected)) {
+            Ok(s) => s,
+            Err(e) => return Err(fail(e, Some(node_now.version))),
+        };
+        if let Err(e) = session.write(0, &content) {
+            return Err(fail(e, Some(node_now.version)));
+        }
+        match session.commit() {
+            Ok(committed_node) => {
+                let mut writes = self.writes.lock().unwrap();
+                if let Some(state) = writes.get_mut(&fh) {
+                    // chunks stay drained; a fresh kernel write starts a
+                    // new batch - but if one ALREADY arrived during the
+                    // commit, the session is NOT done (next flush commits
+                    // it against the re-based version).
+                    state.note_commit_success(committed_node.version);
+                }
+                Ok(())
             }
-            content[off as usize..off as usize + data.len()].copy_from_slice(data);
+            Err(e) => Err(fail(e, Some(node_now.version))),
         }
-        let mut session = self.fs.open_write(&path, Some(expected))?;
-        session.write(0, &content)?;
-        let committed_node = session.commit()?;
-        if let Some(state) = self.writes.lock().unwrap().get_mut(&fh) {
-            state.committed = true;
-            state.expected_version = committed_node.version;
-            // chunks stay drained; a fresh kernel write starts a new batch
-        }
-        Ok(())
     }
+}
 
-    /// Merge drained chunks back into a session's pending map (failure
-    /// recovery for retry). Newer writes at the same offsets win.
-    fn restore_chunks(
-        fh: u64,
-        drained: std::collections::BTreeMap<u64, Vec<u8>>,
-        adapter: &FuseAdapter,
-    ) {
-        if drained.is_empty() {
-            return;
+/// Overlay drained chunks onto the base content (zero-filling gaps).
+fn drained_overlay(drained: &std::collections::BTreeMap<u64, Vec<u8>>, content: &mut Vec<u8>) {
+    for (&off, data) in drained.iter() {
+        let end = off as usize + data.len();
+        if end > content.len() {
+            content.resize(end, 0);
         }
-        if let Some(state) = adapter.writes.lock().unwrap().get_mut(&fh) {
-            for (off, data) in drained {
-                state.chunks.insert(off, data);
-            }
-        }
+        content[off as usize..end].copy_from_slice(data);
     }
 }
 
@@ -343,13 +341,11 @@ impl Filesystem for FuseAdapter {
                             // ftruncate semantics: the kernel discards dirty
                             // pages beyond the new EOF and will NOT resend
                             // them. Pending chunks beyond new_size must be
-                            // dropped here, or the next flush resurrects
-                            // truncated-away data (review round 8 finding).
-                            let beyond: Vec<u64> =
-                                st.chunks.range(new_size..).map(|(off, _)| *off).collect();
-                            for off in beyond {
-                                st.chunks.remove(&off);
-                            }
+                            // dropped, and chunks STRADDLING the new EOF
+                            // trimmed to their pre-EOF prefix, or the next
+                            // flush resurrects truncated-away data (review
+                            // round 8 finding; straddle case review round 9).
+                            st.chunks.trim_truncate(new_size);
                         }
                     }
                 }

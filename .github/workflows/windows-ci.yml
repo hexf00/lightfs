@@ -245,6 +245,24 @@ jobs:
             Add-Content Q:\docs\a.txt -NoNewline '-more'
             if ((Get-Content Q:\docs\a.txt -Raw) -ne 'hello lightfs-more') { throw "append roundtrip" }
 
+            # [4.4b] truncate of a dirty chunk STRADDLING the new EOF:
+            # write 8KB (one chunk, no flush), then SetLength to 4096. The
+            # adapter must trim the chunk to its pre-EOF prefix - leaving
+            # it whole would re-extend the file to 8192 on close.
+            $f = [IO.File]::Open('Q:\docs\straddle.bin', 'Create', 'Write')
+            $sbuf = New-Object byte[] 8192
+            for ($i = 0; $i -lt 8192; $i++) { $sbuf[$i] = $i % 256 }
+            $f.Write($sbuf, 0, 8192)
+            $f.SetLength(4096)
+            $f.Flush($true)
+            $f.Close()
+            $fi = Get-Item 'Q:\docs\straddle.bin'
+            if ($fi.Length -ne 4096) { throw "straddle: length $($fi.Length), want 4096" }
+            $back = [IO.File]::ReadAllBytes('Q:\docs\straddle.bin')
+            for ($i = 0; $i -lt 4096; $i++) {
+              if ($back[$i] -ne ($i % 256)) { throw "straddle: byte $i is $($back[$i]), want $($i % 256)" }
+            }
+
             # [4.5] rename through the drive
             Move-Item Q:\docs\a.txt Q:\docs\renamed.txt
             if ((Test-Path Q:\docs\a.txt) -or -not (Test-Path Q:\docs\renamed.txt)) { throw "rename" }

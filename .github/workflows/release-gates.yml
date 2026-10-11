@@ -78,9 +78,25 @@ jobs:
           echo "MinIO did not become healthy" >&2
           exit 1
 
+      # THE ACTUAL GATE: deploy the freshly built binaries to the location
+      # the gate script hash-verifies, then run every FUSE regression
+      # scenario (R1-R10) against this exact commit's build.
+      - name: Deploy binaries + run fuse-gate.sh
+        env:
+          GATE_COMMIT: ${{ github.sha }}
+        run: |
+          mkdir -p /tmp/lightfs-accept
+          cp target/release/lightfs target/release/lightfs-shell /tmp/lightfs-accept/
+          chmod +x /tmp/lightfs-accept/lightfs /tmp/lightfs-accept/lightfs-shell
+          EXPECTED_LIGHTFS_SHA="$EXPECTED_LIGHTFS_SHA" \
+            bash scripts/fuse-gate.sh ci
       - name: Cleanup
         if: always()
-        run: pkill -x minio || true
+        run: |
+          # only OUR gate's processes (it records PIDs in split files)
+          [[ -f /tmp/lightfs-gate.pids.lightfs ]] && \
+            while read -r p; do kill "$p" 2>/dev/null || true; done < /tmp/lightfs-gate.pids.lightfs
+          pkill -x minio || true
 
   oss-acceptance:
     runs-on: ubuntu-latest

@@ -58,14 +58,21 @@ if [[ ! -x "$MINIO_BIN" || ! -x "$DEPLOY_DIR/lightfs" || ! -x "$DEPLOY_DIR/light
     echo "FAIL: binaries missing at $DEPLOY_DIR" >&2
     exit 1
 fi
-if [[ -n "${EXPECTED_LIGHTFS_SHA:-}" ]]; then
-    ACTUAL=$(sha256sum "$DEPLOY_DIR/lightfs" 2>/dev/null | awk '{print $1}')
-    if [[ "$ACTUAL" != "$EXPECTED_LIGHTFS_SHA" ]]; then
-        echo "FAIL: deployed lightfs sha256 $ACTUAL != expected $EXPECTED_LIGHTFS_SHA (stale deploy)" >&2
-        exit 1
-    fi
-    echo "  deployed lightfs sha256 verified: $ACTUAL"
+# The deployment hash check is MANDATORY: the gate must verify it is
+# testing exactly the binaries built from the commit under test - a gate
+# that can silently skip this check can green-light a stale deploy.
+if [[ -z "${EXPECTED_LIGHTFS_SHA:-}" ]]; then
+    echo "FAIL: EXPECTED_LIGHTFS_SHA is not set - refusing to run without hash verification" >&2
+    exit 1
 fi
+ACTUAL=$(sha256sum "$DEPLOY_DIR/lightfs" 2>/dev/null | awk '{print $1}')
+if [[ "$ACTUAL" != "$EXPECTED_LIGHTFS_SHA" ]]; then
+    echo "FAIL: deployed lightfs sha256 $ACTUAL != expected $EXPECTED_LIGHTFS_SHA (stale deploy)" >&2
+    exit 1
+fi
+echo "  deployed lightfs sha256 verified: $ACTUAL"
+echo "  commit: ${GATE_COMMIT:-unknown}  platform: $(uname -sm)  gate: fuse-gate"
+
 
 # stop leftovers from OUR previous runs only (by recorded PID files)
 kill_pids_file "$PIDS_MINIO"
@@ -236,6 +243,32 @@ if [[ "$R9SIZE" == "4096" && "$R9HEAD" == "r9 kept prefix" ]]; then
     pass "R9 partial shrink trims beyond-EOF chunks"
 else
     fail "R9 partial shrink (size=$R9SIZE, head='$R9HEAD')"
+fi
+
+# R10 (straddling chunk): ONE dirty write spanning the future EOF
+# [0, 8192), then shrink to 4096 WITHOUT flushing. The chunk starting
+# below the new EOF but extending past it must be trimmed to its prefix;
+# leaving it whole would re-extend the file to 8192 on close-flush.
+# Together with R8 (chunk fully beyond EOF) and R9 (beyond + below) this
+# covers all four truncate classes.
+M="$M" python3 - <<'PYEOF'
+import os, time
+m = os.environ["M"]
+fd = os.open(m + "/r10.txt", os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+os.write(fd, bytes(range(256)) * 32)   # 8192 bytes, one straddling chunk
+time.sleep(2.0)    # writeback delivers the dirty pages to the session
+os.truncate(m + "/r10.txt", 4096)
+time.sleep(1.0)
+os.close(fd)
+PYEOF
+sleep 1.5
+R10SIZE=$(stat -c %s "$M/r10.txt" 2>/dev/null || echo -1)
+R10SHA=$(cat "$M/r10.txt" 2>/dev/null | sha256sum | awk '{print $1}')
+R10WANT=$(python3 -c "import sys; sys.stdout.buffer.write(bytes(range(256))*16)" | sha256sum | awk '{print $1}')
+if [[ "$R10SIZE" == "4096" && "$R10SHA" == "$R10WANT" ]]; then
+    pass "R10 straddling chunk trimmed to pre-EOF prefix (sha exact)"
+else
+    fail "R10 straddling chunk (size=$R10SIZE, sha-mismatch)"
 fi
 printf 'line one\nline two\n' > "$M/r6.txt"; sleep 1.5
 printf 'line three\n' >> "$M/r6.txt"; sleep 1.5

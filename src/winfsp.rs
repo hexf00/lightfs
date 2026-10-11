@@ -26,6 +26,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use crate::api::FsApi;
 use crate::error::Error;
 use crate::metadata::Node;
+use crate::writeback::PendingWrite;
 
 // ---------------------------------------------------------------------------
 // ABI constants (winfsp v2.x / libfuse 2.8 surface)
@@ -308,13 +309,6 @@ fn state() -> Arc<dyn FsApi> {
         .expect("lightfs-winfsp: state not initialized")
 }
 
-struct PendingWrite {
-    path: String,
-    expected_version: i64,
-    chunks: std::collections::BTreeMap<u64, Vec<u8>>,
-    committed: bool,
-}
-
 static WRITES: LazyLock<Mutex<std::collections::HashMap<u64, PendingWrite>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 static NEXT_FH: AtomicU64 = AtomicU64::new(1);
@@ -382,24 +376,18 @@ fn start_write(fs: &dyn FsApi, path: &str) -> Result<u64, Error> {
         });
     }
     let fh = NEXT_FH.fetch_add(1, Ordering::Relaxed);
-    WRITES.lock().unwrap().insert(
-        fh,
-        PendingWrite {
-            path: path.to_string(),
-            expected_version: node.version,
-            chunks: std::collections::BTreeMap::new(),
-            committed: false,
-        },
-    );
+    WRITES
+        .lock()
+        .unwrap()
+        .insert(fh, PendingWrite::new(path.to_string(), node.version));
     Ok(fh)
 }
 
-/// Commit a buffered write (fuse.rs::commit_write). The commit content is
-/// the file's CURRENT committed content with the drained chunks overlaid;
-/// the session carries the version observed at open, so a concurrent
-/// external writer fails the CAS instead of clobbering it. A session with
-/// no buffered data commits nothing (a write-intent open that never wrote
-/// must not re-upload the file).
+/// Commit a buffered write (shared semantics with fuse.rs::commit_write;
+/// the state machine lives in crate::writeback so both adapters get failure
+/// recovery, write-during-commit handling and truncate trimming at once).
+/// A session with no buffered data commits nothing (a write-intent open
+/// that never wrote must not re-upload the file).
 fn commit_write(fh: u64) -> Result<(), Error> {
     let snapshot = {
         let mut writes = WRITES.lock().unwrap();
@@ -409,7 +397,7 @@ fn commit_write(fh: u64) -> Result<(), Error> {
         if sess.committed {
             return Ok(());
         }
-        let drained = std::mem::take(&mut sess.chunks);
+        let drained = sess.chunks.drain();
         if drained.is_empty() {
             sess.committed = true;
             return Ok(());
@@ -418,47 +406,55 @@ fn commit_write(fh: u64) -> Result<(), Error> {
     };
     let (path, expected, drained) = snapshot;
     let fs = state();
+    // Every error after the drain restores the chunks (newer writes win)
+    // and re-bases the CAS anchor to the version observed at attempt
+    // start, so a retry flush can succeed instead of silently dropping
+    // the drained data.
+    let fail = |e: Error, observed: Option<i64>| -> Error {
+        let mut writes = WRITES.lock().unwrap();
+        if let Some(sess) = writes.get_mut(&fh) {
+            sess.chunks.restore_under(&drained);
+            if let Some(v) = observed {
+                sess.rebase(v);
+            }
+        }
+        e
+    };
     let node_now = match fs.lookup(&path) {
         Ok(n) => n,
-        Err(e) => {
-            restore_chunks(fh, drained);
-            return Err(e);
-        }
+        Err(e) => return Err(fail(e, None)),
     };
     let mut content = match fs.read(&path, 0, node_now.size as u64) {
         Ok(c) => c,
         Err(Error::ObjectMissing(_)) => Vec::new(),
-        Err(e) => {
-            restore_chunks(fh, drained);
-            return Err(e);
-        }
+        Err(e) => return Err(fail(e, Some(node_now.version))),
     };
     for (&off, data) in drained.iter() {
         let end = off as usize + data.len();
         if end > content.len() {
             content.resize(end, 0);
         }
-        content[off as usize..off as usize + data.len()].copy_from_slice(data);
+        content[off as usize..end].copy_from_slice(data);
     }
-    let mut session = fs.open_write(&path, Some(expected))?;
-    session.write(0, &content)?;
-    let committed_node = session.commit()?;
-    if let Some(state) = WRITES.lock().unwrap().get_mut(&fh) {
-        state.committed = true;
-        state.expected_version = committed_node.version;
+    let mut session = match fs.open_write(&path, Some(expected)) {
+        Ok(s) => s,
+        Err(e) => return Err(fail(e, Some(node_now.version))),
+    };
+    if let Err(e) = session.write(0, &content) {
+        return Err(fail(e, Some(node_now.version)));
     }
-    Ok(())
-}
-
-/// Merge drained chunks back on failure so a retry flush can succeed.
-fn restore_chunks(fh: u64, drained: std::collections::BTreeMap<u64, Vec<u8>>) {
-    if drained.is_empty() {
-        return;
-    }
-    if let Some(state) = WRITES.lock().unwrap().get_mut(&fh) {
-        for (off, data) in drained {
-            state.chunks.insert(off, data);
+    match session.commit() {
+        Ok(committed_node) => {
+            let mut writes = WRITES.lock().unwrap();
+            if let Some(sess) = writes.get_mut(&fh) {
+                // Fully done only when no new chunks arrived during the
+                // commit window; a write-during-commit batch is committed
+                // by the next flush against the re-based version.
+                sess.note_commit_success(committed_node.version);
+            }
+            Ok(())
         }
+        Err(e) => Err(fail(e, Some(node_now.version))),
     }
 }
 
@@ -632,14 +628,12 @@ fn truncate_impl(path: Result<&str, c_int>, new_size: i64) -> c_int {
             for st in writes.values_mut() {
                 if st.path == path {
                     st.expected_version = new_node.version;
-                    let beyond: Vec<u64> = st
-                        .chunks
-                        .range(new_size as u64..)
-                        .map(|(off, _)| *off)
-                        .collect();
-                    for off in beyond {
-                        st.chunks.remove(&off);
-                    }
+                    // Drop chunks beyond the new EOF, trim chunks
+                    // straddling it to their pre-EOF prefix (the kernel
+                    // discards those dirty pages and will not resend them;
+                    // a straddling chunk left whole would re-extend the
+                    // file on the next flush).
+                    st.chunks.trim_truncate(new_size as u64);
                 }
             }
             0
