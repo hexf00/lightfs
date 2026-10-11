@@ -620,7 +620,16 @@ fn main() {
             "--lightfs" => lightfs = PathBuf::from(args.next().expect("--lightfs value")),
             "--shell" => shell = Some(PathBuf::from(args.next().expect("--shell value"))),
             "--config" => config = PathBuf::from(args.next().expect("--config value")),
-            "--mount-target" => mount_target = args.next().expect("--mount-target value"),
+            "--mount-target" => {
+                mount_target = args.next().expect("--mount-target value");
+                // A bare drive letter ("R:") is a RELATIVE path root on
+                // Windows: Path::new("R:").join("sm") yields "R:sm" (the
+                // drive's current directory). Normalize to "R:\\"
+                let b = mount_target.as_bytes();
+                if b.len() == 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+                    mount_target.push('\\');
+                }
+            }
             "--section" => {
                 sections = args
                     .next()
