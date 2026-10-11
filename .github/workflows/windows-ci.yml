@@ -120,6 +120,19 @@ jobs:
             -ArgumentList 'server','D:\minio-data','--address',':9000' -PassThru `
             -RedirectStandardError D:\lightfs-accept\minio.err `
             -RedirectStandardOutput D:\lightfs-accept\minio.out
+          # the suite's server pings MinIO at startup - it must be up first
+          $ok = $false
+          foreach ($i in 1..60) {
+            try {
+              Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 `
+                http://127.0.0.1:9000/minio/health/live | Out-Null
+              $ok = $true; break
+            } catch { Start-Sleep -Milliseconds 500 }
+          }
+          if (-not $ok) {
+            Get-Content D:\lightfs-accept\minio.err -ErrorAction SilentlyContinue
+            throw "MinIO did not become healthy"
+          }
           try {
             & .\bin\lightfs-accept.exe `
               --lightfs .\bin\lightfs.exe `
