@@ -158,6 +158,17 @@ impl ChunkMap {
 
     /// Overlay non-overlapping chunks onto the file's current committed
     /// content (zero-filling gaps), producing the commit payload.
+    /// End offset of the highest chunk (chunks are non-overlapping and the
+    /// map is sorted by offset). Adapters use this to publish the in-flight
+    /// EOF to getattr while a write session is open.
+    pub fn max_end(&self) -> u64 {
+        self.0
+            .iter()
+            .next_back()
+            .map(|(&off, d)| off + d.len() as u64)
+            .unwrap_or(0)
+    }
+
     pub fn overlay(&self, content: &mut Vec<u8>) {
         for (&off, data) in self.0.iter() {
             let end = off as usize + data.len();
@@ -362,5 +373,21 @@ mod tests {
         s.chunks.restore_under(&drained);
         let got = content_after(&s.chunks, b"");
         assert_eq!(got, b"newOLDOLD");
+    }
+
+    #[test]
+    fn max_end_tracks_last_chunk_end() {
+        let mut c = ChunkMap::new();
+        assert_eq!(c.max_end(), 0, "empty map");
+        c.insert(0, vec![0; 10]); // [0, 10)
+        assert_eq!(c.max_end(), 10);
+        c.insert(20, vec![0; 5]); // [20, 25)
+        assert_eq!(c.max_end(), 25);
+        // same-offset replace must not change the end
+        c.insert(20, vec![0; 3]); // [20, 23)
+        assert_eq!(c.max_end(), 25);
+        // hole in the middle does not matter: end is what append needs
+        c.insert(5, vec![0; 40]); // [5, 45) splits [0,10), replaces [20,23)
+        assert_eq!(c.max_end(), 45);
     }
 }

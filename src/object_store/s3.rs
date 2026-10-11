@@ -1216,7 +1216,25 @@ mod minio_tests {
             .new_agent();
         let mut resp = agent.get(&url).call().unwrap();
         let status = resp.status().as_u16();
-        assert_eq!(status, 200, "presigned fetch must succeed");
+        if status != 200 {
+            // Full diagnostics, fail immediately (no retry): on a healthy
+            // S3 a PUT-then-GET is strongly consistent, so a 404 here is
+            // either data loss or an environment anomaly we must see in
+            // full. Signature params are stripped from the URL.
+            let body = resp.body_mut().read_to_vec().unwrap_or_default();
+            let headers: Vec<String> = resp
+                .headers()
+                .iter()
+                .map(|(h, v)| format!("{}={}", h.as_str(), String::from_utf8_lossy(v.as_bytes())))
+                .collect();
+            let safe_url = url.split('?').next().unwrap_or("<no-url>");
+            panic!(
+                "presigned fetch failed: status {status}\nurl(path only) {safe_url}\n\
+                 headers: {}\nbody: {}",
+                headers.join(", "),
+                String::from_utf8_lossy(&body)
+            );
+        }
         let body = resp.body_mut().read_to_vec().unwrap();
         assert_eq!(body, payload);
         s3.delete("phase1/presign").unwrap();

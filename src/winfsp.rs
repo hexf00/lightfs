@@ -311,7 +311,78 @@ fn state() -> Arc<dyn FsApi> {
 
 static WRITES: LazyLock<Mutex<std::collections::HashMap<u64, PendingWrite>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+/// In-flight EOF per path. Windows appends (WriteToEndOfFile) re-derive
+/// the write offset from OUR getattr before every write, and in the
+/// write-back model the committed size only advances at flush - so two
+/// appends without an intervening flush would both target the COMMITTED
+/// EOF and the second would silently overwrite the first (found by the
+/// acceptance suite: "one\ntwo\nthree\n" came back as "one\nthree\n").
+/// Reporting max(committed, in-flight) to getattr is exactly what the
+/// Linux kernel page cache does internally for dirty writes.
+static PENDING_EOF: LazyLock<Mutex<std::collections::HashMap<String, u64>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 static NEXT_FH: AtomicU64 = AtomicU64::new(1);
+
+fn pending_eof_advance(path: &str, end: u64) {
+    let mut m = PENDING_EOF.lock().unwrap();
+    let e = m.entry(path.to_string()).or_insert(end);
+    if *e < end {
+        *e = end;
+    }
+}
+
+/// After a commit the committed size plus any still-open-session chunks
+/// defines the visible EOF. Never lowers an existing entry: a concurrent
+/// cb_write may have advanced it after the caller inspected WRITES.
+fn pending_eof_rebase(path: &str, end: u64) {
+    let mut m = PENDING_EOF.lock().unwrap();
+    match m.get_mut(path) {
+        Some(e) => {
+            if end > *e {
+                *e = end;
+            }
+        }
+        None => {
+            m.insert(path.to_string(), end);
+        }
+    }
+}
+
+/// Max over the committed size and the chunk ends of every open session
+/// for `path`. Callers must NOT hold WRITES (we take it).
+fn visible_eof(path: &str, committed_size: u64) -> u64 {
+    let writes = WRITES.lock().unwrap();
+    let mut end = committed_size;
+    for sess in writes.values() {
+        if sess.path == path {
+            end = end.max(sess.chunks.max_end());
+        }
+    }
+    end
+}
+
+fn pending_eof_for(path: &str) -> u64 {
+    PENDING_EOF.lock().unwrap().get(path).copied().unwrap_or(0)
+}
+
+fn pending_eof_drop(path: &str) {
+    PENDING_EOF.lock().unwrap().remove(path);
+}
+
+/// Recompute the entry from scratch after a session went away (release):
+/// unlike rebase this may LOWER the value - a failed final commit must not
+/// leave a phantom in-flight EOF (readers would see a zero hole).
+fn pending_eof_recompute(path: &str) {
+    // visible_eof takes WRITES; do not hold PENDING_EOF across it.
+    drop(PENDING_EOF.lock().unwrap());
+    let end = visible_eof(path, 0);
+    let mut m = PENDING_EOF.lock().unwrap();
+    if end == 0 {
+        m.remove(path);
+    } else {
+        m.insert(path.to_string(), end);
+    }
+}
 
 /// Map a core error onto Windows-CRT errno (mirrors fuse.rs).
 fn errno(e: &Error) -> c_int {
@@ -445,13 +516,17 @@ fn commit_write(fh: u64) -> Result<(), Error> {
     }
     match session.commit() {
         Ok(committed_node) => {
-            let mut writes = WRITES.lock().unwrap();
-            if let Some(sess) = writes.get_mut(&fh) {
-                // Fully done only when no new chunks arrived during the
-                // commit window; a write-during-commit batch is committed
-                // by the next flush against the re-based version.
-                sess.note_commit_success(committed_node.version);
-            }
+            let end = {
+                let mut writes = WRITES.lock().unwrap();
+                if let Some(sess) = writes.get_mut(&fh) {
+                    // Fully done only when no new chunks arrived during the
+                    // commit window; a write-during-commit batch is committed
+                    // by the next flush against the re-based version.
+                    sess.note_commit_success(committed_node.version);
+                }
+                visible_eof(&path, committed_node.size as u64)
+            };
+            pending_eof_rebase(&path, end);
             Ok(())
         }
         Err(e) => Err(fail(e, Some(node_now.version))),
@@ -473,6 +548,15 @@ unsafe extern "system" fn cb_getattr(path: *const c_char, st: *mut FuseStat) -> 
             Ok(node) => {
                 *st = std::mem::zeroed();
                 fill_stat(&mut *st, &node);
+                let in_flight = pending_eof_for(path);
+                if in_flight > (*st).st_size as u64 {
+                    // Write-back model: report the in-flight EOF exactly
+                    // like the Linux page cache reports dirty size, so
+                    // WinFsp's WriteToEndOfFile handler (which derives the
+                    // append offset from our getattr) does not fold two
+                    // appends onto the same offset between flushes.
+                    (*st).st_size = in_flight as i64;
+                }
                 0
             }
             Err(e) => -errno(&e),
@@ -528,6 +612,7 @@ unsafe extern "system" fn cb_create(
             .and_then(|_| start_write(fs.as_ref(), path))
         {
             Ok(fh) => {
+                pending_eof_drop(path);
                 (*fi).fh = fh;
                 0
             }
@@ -595,6 +680,7 @@ unsafe extern "system" fn cb_write(
             sess.committed = false;
         }
         sess.chunks.insert(offset as u64, data);
+        pending_eof_advance(path, offset as u64 + size as u64);
         size as c_int
     }
 }
@@ -624,18 +710,21 @@ fn truncate_impl(path: Result<&str, c_int>, new_size: i64) -> c_int {
     });
     match commit {
         Ok(new_node) => {
-            let mut writes = WRITES.lock().unwrap();
-            for st in writes.values_mut() {
-                if st.path == path {
-                    st.expected_version = new_node.version;
-                    // Drop chunks beyond the new EOF, trim chunks
-                    // straddling it to their pre-EOF prefix (the kernel
-                    // discards those dirty pages and will not resend them;
-                    // a straddling chunk left whole would re-extend the
-                    // file on the next flush).
-                    st.chunks.trim_truncate(new_size as u64);
+            {
+                let mut writes = WRITES.lock().unwrap();
+                for st in writes.values_mut() {
+                    if st.path == path {
+                        st.expected_version = new_node.version;
+                        // Drop chunks beyond the new EOF, trim chunks
+                        // straddling it to their pre-EOF prefix (the kernel
+                        // discards those dirty pages and will not resend
+                        // them; a straddling chunk left whole would
+                        // re-extend the file on the next flush).
+                        st.chunks.trim_truncate(new_size as u64);
+                    }
                 }
             }
+            pending_eof_drop(path);
             0
         }
         Err(e) => -errno(&e),
@@ -686,6 +775,7 @@ unsafe extern "system" fn cb_release(path: *const c_char, fi: *mut FuseFileInfo)
             );
         }
         WRITES.lock().unwrap().remove(&fh);
+        pending_eof_recompute(path);
         0
     }
 }
@@ -728,7 +818,10 @@ unsafe extern "system" fn cb_unlink(path: *const c_char) -> c_int {
             return -EINVAL;
         };
         match state().unlink(path) {
-            Ok(()) => 0,
+            Ok(()) => {
+                pending_eof_drop(path);
+                0
+            }
             Err(e) => -errno(&e),
         }
     }
@@ -754,7 +847,11 @@ unsafe extern "system" fn cb_rename(old: *const c_char, new: *const c_char) -> c
             return -EINVAL;
         };
         match state().rename(old, new) {
-            Ok(()) => 0,
+            Ok(()) => {
+                pending_eof_drop(old);
+                pending_eof_drop(new);
+                0
+            }
             Err(e) => -errno(&e),
         }
     }
