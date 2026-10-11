@@ -265,6 +265,9 @@ fn section_a(ctx: &Ctx, root: &Path) {
     let mut f = open_create(&p);
     write_at(&mut f, 0, &pattern(8, 1));
     write_at(&mut f, 0, &[0x42, 0x42]);
+    // Strong close: A-section asserts FINAL SEMANTICS; a plain close on
+    // Windows has the async-commit visibility window (B4 measures it).
+    flush_strong(&mut f, "A1 commit");
     drop(f);
     let mut want = vec![0x42u8, 0x42];
     want.extend_from_slice(&pattern(8, 1)[2..]);
@@ -277,6 +280,7 @@ fn section_a(ctx: &Ctx, root: &Path) {
     write_at(&mut f, 4096, &pattern(8192, 2));
     flush_strong(&mut f, "A2 first commit");
     write_at(&mut f, 0, &pattern(8192, 3));
+    flush_strong(&mut f, "A2 second commit");
     drop(f);
     let mut want = pattern(8192, 3);
     want.extend_from_slice(&pattern(8192, 2)[4096..]);
@@ -372,6 +376,7 @@ fn section_a(ctx: &Ctx, root: &Path) {
     {
         let mut f = open_create(&p);
         f.write_all(b"one\n").unwrap();
+        flush_strong(&mut f, "A8 first append");
     }
     {
         let mut f = std::fs::OpenOptions::new()
@@ -380,6 +385,7 @@ fn section_a(ctx: &Ctx, root: &Path) {
             .unwrap_or_else(|e| panic!("A8: append open failed: {e}"));
         f.write_all(b"two\n").unwrap();
         f.write_all(b"three\n").unwrap();
+        flush_strong(&mut f, "A8 second append");
     }
     assert_bytes("A8 append sequence", &p, b"one\ntwo\nthree\n");
 
@@ -398,8 +404,11 @@ fn section_a(ctx: &Ctx, root: &Path) {
     let p = sm.join("a10.bin");
     let f1 = open_create(&p);
     let mut f2 = f1.try_clone().expect("A10: dup fd");
-    drop(f1); // first close -> empty flush
+    drop(f1); // first close -> empty flush (the dup-close ordering)
     write_at(&mut f2, 0, b"first write content\n");
+    // Strong close on the SECOND fd: the write lands after the first
+    // flush, and the session re-arm must preserve it.
+    flush_strong(&mut f2, "A10 commit");
     drop(f2);
     assert_bytes(
         "A10 dup-close first-write preserved",
