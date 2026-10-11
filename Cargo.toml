@@ -35,6 +35,10 @@ path = "src/bin/lightfs_shell.rs"
 name = "lightfs-bench"
 path = "src/bin/lightfs_bench.rs"
 
+[[bin]]
+name = "lightfs-accept"
+path = "src/bin/lightfs_accept.rs"
+
 [profile.dev]
 debug = 1
 incremental = true

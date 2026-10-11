@@ -24,7 +24,7 @@ jobs:
           rustup default 1.85.1
 
       - name: Build release binaries
-        run: cargo build --release --bin lightfs --bin lightfs-shell --bin lightfs-bench
+        run: cargo build --release --bin lightfs --bin lightfs-shell --bin lightfs-accept
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
@@ -33,17 +33,19 @@ jobs:
           path: |
             target/release/lightfs.exe
             target/release/lightfs-shell.exe
+            target/release/lightfs-accept.exe
           retention-days: 7
 
   mount-smoke:
-    # Real end-to-end validation of the WinFsp adapter on a hosted runner:
-    # install WinFsp, run MinIO + lightfs server, mount the filesystem as
-    # drive Q:, exercise file operations THROUGH the drive letter, then kill
-    # the mount process and verify the drive disappears.
+    # Windows EXPERIMENTAL ADAPTER ACCEPTANCE (not production acceptance):
+    # the cross-platform suite (lightfs-accept, same binary the Linux FUSE
+    # gate runs) owns the server/mount lifecycles and every byte-exact
+    # assertion - write-back boundaries, flush failure injection, plain-
+    # close eventual visibility (measured), crash persistence, offline
+    # fsck. One step: the Windows runner tears down step-local processes
+    # at step end (Job Object cleanup).
     runs-on: windows-latest
     needs: windows
-    env:
-      WINFSP_BIN: 'C:\Program Files (x86)\WinFsp\bin'
     steps:
       - name: Download binaries
         uses: actions/download-artifact@v4
@@ -85,233 +87,65 @@ jobs:
           cd minio-src
           go build -trimpath -ldflags "-s -w" -o ..\minio.exe .
 
-      - name: "WinFsp mount smoke (single step: servers must outlive step-local process cleanup)"
+      - name: "Run acceptance suite (single step: servers must outlive step-local cleanup)"
         shell: pwsh
+        env:
+          GATE_COMMIT: ${{ github.sha }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $env:Path += ";$env:WINFSP_BIN"
-          $procs = @()
-          function Wait-Url($url, $tries, $what) {
-            $ok = $false
-            foreach ($i in 1..$tries) {
-              try {
-                Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 $url | Out-Null
-                $ok = $true; break
-              } catch { Start-Sleep -Milliseconds 500 }
-            }
-            if (-not $ok) { throw "$what did not become healthy" }
-          }
-
-          try {
-            # ---- [1] MinIO on :9000 ----
-            New-Item -ItemType Directory -Force D:\minio-data | Out-Null
-            $p = Start-Process -FilePath .\minio.exe `
-              -ArgumentList 'server','D:\minio-data','--address',':9000' `
-              -PassThru -RedirectStandardError minio.err -RedirectStandardOutput minio.out
-            $procs += $p
-            Wait-Url 'http://127.0.0.1:9000/minio/health/live' 60 'MinIO'
-
-            # ---- [2] lightfs server on :18085 (server mode, S3 = MinIO) ----
-            @"
+          $env:Path += ";C:\Program Files (x86)\WinFsp\bin"
+          New-Item -ItemType Directory -Force D:\minio-data, D:\lightfs-accept | Out-Null
+          @"
           mode = "server"
           [s3]
           endpoint = "http://127.0.0.1:9000"
           region = "us-east-1"
-          bucket = "lightfs-smoke"
+          bucket = "lightfs-accept"
           access_key = "minioadmin"
           secret_key = "minioadmin"
           path_style = true
           [metadata]
-          path = "C:/lightfs-smoke/metadata.db"
+          path = "D:/lightfs-accept/metadata.db"
           [server]
-          bind = "127.0.0.1:18085"
+          bind = "127.0.0.1:18087"
           [cache.metadata]
           enabled = false
           [cache.data]
           enabled = false
-          "@ | Set-Content -Encoding ascii cfg.toml
-            .\bin\lightfs.exe create-bucket --config cfg.toml
-            $p = Start-Process -FilePath .\bin\lightfs.exe `
-              -ArgumentList 'server','--config',"$PWD\cfg.toml" `
-              -PassThru -RedirectStandardError server.err -RedirectStandardOutput server.out
-            $procs += $p
-            Wait-Url 'http://127.0.0.1:18085/health' 60 'lightfs server'
-
-            # ---- [3] mount as drive Q: through the WinFsp adapter ----
-            $mount = Start-Process -FilePath .\bin\lightfs.exe `
-              -ArgumentList 'mount','--config',"$PWD\cfg.toml",'Q:' `
-              -PassThru -RedirectStandardError mount.err -RedirectStandardOutput mount.out
-            $mount.Id | Set-Content mount.pid
-            $ok = $false
-            foreach ($i in 1..120) {
-              if (Test-Path 'Q:\') { $ok = $true; break }
-              if ($mount.HasExited) {
-                Get-Content mount.err -ErrorAction SilentlyContinue
-                throw "mount process exited early (code $($mount.ExitCode))"
-              }
-              Start-Sleep -Milliseconds 500
-            }
-            if (-not $ok) {
-              Get-Content mount.err -ErrorAction SilentlyContinue
-              throw "drive Q: never appeared"
-            }
-            "MOUNTED"
-
-            # ---- [4] roundtrip through the drive ----
-            $shellbin = ".\bin\lightfs-shell.exe"
-            $srv = "--server","http://127.0.0.1:18085"
-
-            # [4.1] text file: create through the drive, read through the drive
-            New-Item -ItemType Directory Q:\docs -Force | Out-Null
-            Set-Content Q:\docs\a.txt -NoNewline 'hello lightfs'
-            $raw = Get-Content Q:\docs\a.txt -Raw
-            if ($raw -ne 'hello lightfs') {
-              "DIAG-T: len=$($raw.Length) hex=$([BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes($raw)))"
-              throw "text roundtrip"
-            }
-
-            # [4.2] random binaries through the drive, byte-exact by hash.
-            # Two sizes: 64KB (a single cache-manager page) and 5MB (80
-            # pages, multi-chunk write path). On mismatch, locate the first
-            # differing 64KB block (block-hash bisect), then the first
-            # differing byte inside it - distinguishes lost-chunk zero-fill
-            # from misplaced data.
-            foreach ($sz in 64KB, 5MB) {
-              $b = New-Object byte[] ($sz)
-              (New-Object Random 42).NextBytes($b)
-              [IO.File]::WriteAllBytes("$PWD\expect.bin", $b)
-              $dst = "Q:\docs\rand-$($sz).bin"
-              [IO.File]::Copy("$PWD\expect.bin", $dst)
-              $h1 = (Get-FileHash "$PWD\expect.bin" -Algorithm SHA256).Hash
-              # Plain close (no FlushFileBuffers) has an async commit window
-              # in the WinFsp FUSE layer: flush/release run in the Close
-              # callback, AFTER CloseHandle returns. Retry the read hash a
-              # few times; the flush(true) path below must NOT need this.
-              $h2 = $null
-              foreach ($try in 1..30) {
-                $h2 = (Get-FileHash $dst -Algorithm SHA256).Hash
-                if ($h2 -eq $h1) { break }
-                Start-Sleep -Milliseconds 500
-              }
-              if ($h1 -ne $h2) {
-                $got = [IO.File]::ReadAllBytes($dst)
-                "DIAG: size want=$($b.Length) got=$($got.Length)"
-                $block = 64KB
-                $bad = -1
-                for ($off = 0; $off -lt [Math]::Min($b.Length, $got.Length); $off += $block) {
-                  $len = [Math]::Min($block, $b.Length - $off)
-                  $sa = New-Object Security.Cryptography.SHA256Managed
-                  $ha = ($sa.ComputeHash($b, $off, $len) | ForEach-Object { $_.ToString('x2') }) -join ''
-                  $hb = ($sa.ComputeHash($got, $off, $len) | ForEach-Object { $_.ToString('x2') }) -join ''
-                  $sa.Dispose()
-                  if ($ha -ne $hb) { $bad = $off; break }
-                }
-                if ($bad -ge 0) {
-                  for ($i = $bad; $i -lt [Math]::Min($bad + $block, $b.Length); $i++) {
-                    if ($b[$i] -ne $got[$i]) {
-                      "DIAG: first diff at offset ${i}: want $($b[$i]) got $($got[$i])"
-                      break
-                    }
-                  }
-                } else {
-                  "DIAG: all present blocks identical (length tail only)"
-                }
-                throw "binary roundtrip hash mismatch (size $sz)"
-              }
-            }
-
-            # [4.2b] strict close-open coherence via FlushFileBuffers:
-            # our cb_flush commits synchronously, so a read right after
-            # flush(true) must be byte-exact with NO retry.
-            $sb = New-Object byte[] (1MB)
-            (New-Object Random 7).NextBytes($sb)
-            [IO.File]::WriteAllBytes("$PWD\flushin.bin", $sb)
-            $fs = [IO.File]::Open('Q:\docs\flushed.bin', 'Create', 'Write')
-            $fs.Write($sb, 0, $sb.Length)
-            $fs.Flush($true)
-            $fs.Close()
-            $hf1 = (Get-FileHash "$PWD\flushin.bin" -Algorithm SHA256).Hash
-            $hf2 = (Get-FileHash 'Q:\docs\flushed.bin' -Algorithm SHA256).Hash
-            if ($hf1 -ne $hf2) { throw "FlushFileBuffers coherence failed" }
-
-            # [4.3] shell client sees the same namespace (server mode)
-            $seen = & $shellbin --config "$PWD\cfg.toml" @srv ls /docs
-            if (-not ($seen -match 'rand-5242880')) { throw "shell ls misses the 5MB file: $seen" }
-            if (-not ($seen -match 'flushed')) { throw "shell ls misses the flushed file: $seen" }
-            $cat = (& $shellbin --config "$PWD\cfg.toml" @srv cat /docs/a.txt) -join ""
-            if ($cat -ne 'hello lightfs') { throw "shell cat mismatch: '$cat'" }
-
-            # [4.4] append + read back (write-back buffer path)
-            Add-Content Q:\docs\a.txt -NoNewline '-more'
-            if ((Get-Content Q:\docs\a.txt -Raw) -ne 'hello lightfs-more') { throw "append roundtrip" }
-
-            # [4.4b] truncate of a dirty chunk STRADDLING the new EOF:
-            # write 8KB (one chunk, no flush), then SetLength to 4096. The
-            # adapter must trim the chunk to its pre-EOF prefix - leaving
-            # it whole would re-extend the file to 8192 on close.
-            $f = [IO.File]::Open('Q:\docs\straddle.bin', 'Create', 'Write')
-            $sbuf = New-Object byte[] 8192
-            for ($i = 0; $i -lt 8192; $i++) { $sbuf[$i] = $i % 256 }
-            $f.Write($sbuf, 0, 8192)
-            $f.SetLength(4096)
-            $f.Flush($true)
-            $f.Close()
-            $fi = Get-Item 'Q:\docs\straddle.bin'
-            if ($fi.Length -ne 4096) { throw "straddle: length $($fi.Length), want 4096" }
-            $back = [IO.File]::ReadAllBytes('Q:\docs\straddle.bin')
-            for ($i = 0; $i -lt 4096; $i++) {
-              if ($back[$i] -ne ($i % 256)) { throw "straddle: byte $i is $($back[$i]), want $($i % 256)" }
-            }
-
-            # [4.5] rename through the drive
-            Move-Item Q:\docs\a.txt Q:\docs\renamed.txt
-            if ((Test-Path Q:\docs\a.txt) -or -not (Test-Path Q:\docs\renamed.txt)) { throw "rename" }
-
-            # [4.6] listing shows both entries
-            $items = @(Get-ChildItem Q:\docs)
-            if ($items.Count -lt 2) { throw "dir listing too small" }
-
-            # [4.7] delete through the drive, gone from the shell too
-            Remove-Item Q:\docs\renamed.txt
-            if (Test-Path Q:\docs\renamed.txt) { throw "delete" }
-            & $shellbin --config "$PWD\cfg.toml" @srv stat /docs/renamed.txt 2>$null | Out-Null
-            if ($LASTEXITCODE -eq 0) { throw "deleted file still visible to shell" }
-
-            "ROUNDTRIP OK"
-
-            # ---- [5] kill mount process -> drive must disappear ----
-            Stop-Process -Id $mount.Id -Force
-            $ok = $false
-            foreach ($i in 1..60) {
-              if (-not (Test-Path 'Q:\')) { $ok = $true; break }
-              Start-Sleep -Milliseconds 500
-            }
-            if (-not $ok) { throw "drive Q: still present after mount process kill" }
-            "UNMOUNT OK"
-          }
-          catch {
-            Write-Host ("EXCEPTION: " + ($_ | Out-String))
-            exit 1
+          "@ | Set-Content -Encoding ascii D:\lightfs-accept\cfg.toml
+          .\bin\lightfs.exe create-bucket --config D:\lightfs-accept\cfg.toml
+          # MinIO must outlive the suite's own server/mount children, so it
+          # is started here and reaped in the finally block below.
+          $minio = Start-Process -FilePath .\minio.exe `
+            -ArgumentList 'server','D:\minio-data','--address',':9000' -PassThru `
+            -RedirectStandardError D:\lightfs-accept\minio.err `
+            -RedirectStandardOutput D:\lightfs-accept\minio.out
+          try {
+            & .\bin\lightfs-accept.exe `
+              --lightfs .\bin\lightfs.exe `
+              --shell .\bin\lightfs-shell.exe `
+              --config D:\lightfs-accept\cfg.toml `
+              --mount-target R:
+            exit $LASTEXITCODE
           }
           finally {
-            foreach ($p in $procs) {
-              if (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) {
-                Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-              }
-            }
-            if (Test-Path mount.pid) {
-              $mp = Get-Process -Id (Get-Content mount.pid) -ErrorAction SilentlyContinue
-              if ($mp) { Stop-Process -Id $mp.Id -Force -ErrorAction SilentlyContinue }
+            if (Get-Process -Id $minio.Id -ErrorAction SilentlyContinue) {
+              Stop-Process -Id $minio.Id -Force -ErrorAction SilentlyContinue
             }
           }
-          # pwsh exits 1 when the final pipeline state is false (e.g. a
-          # suppressed cleanup error); success must be explicit.
-          exit 0
 
-      - name: Dump logs on failure
+      - name: Dump child stderr on failure
         if: failure()
         shell: pwsh
         run: |
-          foreach ($f in 'mount.err','server.err','minio.err') {
+          foreach ($f in 'D:\lightfs-accept\mount.err','D:\lightfs-accept\server.err','D:\lightfs-accept\minio.err') {
             if (Test-Path $f) { "===== $f ====="; Get-Content $f }
           }
+
+      - name: Upload acceptance log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-acceptance-log
+          path: D:\lightfs-accept\*.err
+          retention-days: 30
