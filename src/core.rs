@@ -200,32 +200,19 @@ impl Core {
         if let Some(_existing) = self.meta.get_child(parent.id, &name)? {
             return Err(Error::AlreadyExists(path.to_string()));
         }
+        // Metadata-only create: an empty file needs NO content object.
+        // Size 0 reads as empty (both read paths short-circuit on size),
+        // fsck treats a size-0 file as healthy without an object, and the
+        // first real write commit uploads the content and CASes the
+        // version - one PUT per new non-empty file instead of two (the
+        // old 0-byte placeholder was pure overhead: ~0.7ms and one object
+        // per create in the small-file storms). Crash between create and
+        // the first flush leaves exactly an empty file - the same contract
+        // observers had with the placeholder.
         let node = self
             .meta
             .create_node(parent.id, &name, NodeKind::File, mode, None)?;
-        let version_key = self.new_version_key(node.id);
-        let info = self.objects.put(&version_key, &[])?;
-        self.metrics.s3_put.fetch_add(1, Ordering::Relaxed);
-        match self
-            .meta
-            .commit_content_cas(node.id, 0, 0, node.mtime, &version_key, &info.etag)
-        {
-            Ok(()) => {}
-            Err(e) => {
-                let _ = self.objects.delete(&version_key);
-                // Race with a concurrent create of the same path: the UNIQUE
-                // constraint picked the other creator; surface as exists.
-                return Err(match e {
-                    Error::NotFound(_) => Error::AlreadyExists(path.to_string()),
-                    other => other,
-                });
-            }
-        }
         self.metrics.metadata_tx.fetch_add(1, Ordering::Relaxed);
-        let mut node = node;
-        node.version = 1;
-        node.etag = info.etag;
-        node.object_key = Some(version_key);
         Ok(node)
     }
 
@@ -636,15 +623,10 @@ mod tests {
         c.create("/a/b/f.txt", 0o644).unwrap();
         let f = c.lookup("/a/b/f.txt").unwrap();
         assert!(f.is_file());
-        assert_eq!(f.version, 1);
-        assert!(
-            f.object_key
-                .as_deref()
-                .unwrap_or_default()
-                .starts_with(&format!("objects/{}/", f.id)),
-            "object key must derive from the file id, got {:?}",
-            f.object_key
-        );
+        // Metadata-only create: a brand-new empty file sits at version 0
+        // with NO object key - the first write commit installs it.
+        assert_eq!(f.version, 0);
+        assert!(f.object_key.is_none(), "v0 file must have no object key");
         assert!(matches!(c.lookup("/a/missing"), Err(Error::NotFound(p)) if p == "/a/missing"));
         assert!(matches!(
             c.lookup("/a/b/f.txt/deeper"),
@@ -682,24 +664,24 @@ mod tests {
         c.write(&h, 0, b"hello world").unwrap();
         let node = c.commit_write(&h).unwrap();
         assert_eq!(node.size, 11);
-        assert_eq!(node.version, 2);
+        assert_eq!(node.version, 1);
 
         assert_eq!(c.read("/f", 0, 100).unwrap(), b"hello world");
         assert_eq!(c.read("/f", 6, 5).unwrap(), b"world");
         assert_eq!(c.read("/f", 100, 10).unwrap(), Vec::<u8>::new());
 
         // stale writer conflicts
-        let h1 = c.open_write("/f", Some(2)).unwrap();
+        let h1 = c.open_write("/f", Some(1)).unwrap();
         let h2 = c.open_write("/f", None).unwrap();
         c.write(&h2, 0, b"second").unwrap();
-        c.commit_write(&h2).unwrap(); // version -> 3
+        c.commit_write(&h2).unwrap(); // version -> 2
         c.write(&h1, 0, b"stale").unwrap();
         let err = c.commit_write(&h1).unwrap_err();
         assert!(matches!(
             err,
             Error::Conflict {
-                expected: 2,
-                actual: 3,
+                expected: 1,
+                actual: 2,
                 ..
             }
         ));
@@ -760,7 +742,7 @@ mod tests {
         let ra = c.commit_write(&ha).unwrap();
         let rb = c.commit_write(&hb);
         let err = rb.expect_err("second commit must conflict");
-        assert!(matches!(err, Error::Conflict { expected, actual: 3, .. } if expected == v));
+        assert!(matches!(err, Error::Conflict { expected, actual: 2, .. } if expected == v));
 
         // Winner's data is exactly what the file serves; metadata agrees.
         assert_eq!(c.read("/f", 0, 100).unwrap(), b"content from writer A");
@@ -776,10 +758,10 @@ mod tests {
         assert_eq!(live.size, ra.size as u64);
 
         // The loser's version key was cleaned up (conflict path deletes its
-        // own object). Retention keeps the WINNER's superseded history
-        // (v1 empty + v2 "version one") — 3 objects total for this node,
-        // 2 of them recorded in superseded_objects, and none of them is the
-        // loser's (its key 404s because we don't know it: assert by set).
+        // own object). The create committed NO object (metadata-only), so
+        // exactly TWO objects remain: the live winner plus the pre-race
+        // commit retained by the retention window (one superseded record),
+        // and the loser's key is gone (assert by set).
         let mut leftovers = Vec::new();
         let mut token = None;
         loop {
@@ -795,10 +777,10 @@ mod tests {
                 None => break,
             }
         }
-        assert_eq!(leftovers.len(), 3, "loser gone; winner + 2 retained");
+        assert_eq!(leftovers.len(), 2, "loser gone; no placeholder existed");
         let mut superseded = c.metadata().all_superseded().unwrap();
         superseded.sort();
-        assert_eq!(superseded.len(), 2, "{superseded:?}");
+        assert_eq!(superseded.len(), 1, "{superseded:?}");
         assert!(
             !superseded.contains(&after.object_key.clone().unwrap()),
             "live key must not be in the retained set"
@@ -927,6 +909,10 @@ mod tests {
         let c = core();
         c.mkdir("/d", 0o755).unwrap();
         c.create("/d/f", 0o644).unwrap();
+        // commit content so the retention path has an object to keep
+        let h0 = c.open_write("/d/f", None).unwrap();
+        c.write(&h0, 0, b"payload").unwrap();
+        c.commit_write(&h0).unwrap();
         let f = c.lookup("/d/f").unwrap();
         let key = f.object_key.clone().unwrap();
 
@@ -952,6 +938,10 @@ mod tests {
             0,
         );
         c.create("/f", 0o644).unwrap();
+        // commit content so there is an object to delete immediately
+        let h = c.open_write("/f", None).unwrap();
+        c.write(&h, 0, b"x").unwrap();
+        c.commit_write(&h).unwrap();
         let key = c.lookup("/f").unwrap().object_key.clone().unwrap();
         c.unlink("/f").unwrap();
         assert!(c.objects.head(&key).is_err());

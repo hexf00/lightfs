@@ -140,14 +140,10 @@ impl MetadataStore for SqliteMetadataStore {
         )
         .map_err(|e| map_constraint(e, || Error::AlreadyExists(name.to_string())))?;
         let id = tx.last_insert_rowid();
-        // Stable object key from the file id (AD-010): rename/move never
-        // touches bytes, so the key is derived from identity, not path.
-        if kind == NodeKind::File {
-            tx.execute(
-                "UPDATE nodes SET object_key = ?2 WHERE id = ?1",
-                params![id, format!("objects/{id}/data")],
-            )?;
-        }
+        // Files are created with object_key = NULL (metadata-only create):
+        // the first write commit installs the version key via CAS, and no
+        // superseded record or delete ever references a key that never
+        // existed. Rename/move never touches bytes either way (AD-010).
         let node = tx.query_row(
             &format!("SELECT {NODE_COLS} FROM nodes WHERE id = ?1"),
             params![id],
@@ -552,10 +548,8 @@ mod tests {
             let s = SqliteMetadataStore::open(&path).unwrap();
             let d = s.get_child(1, "docs").unwrap().unwrap();
             let f = s.get_child(d.id, "report").unwrap().unwrap();
-            assert_eq!(
-                f.object_key.as_deref(),
-                Some(format!("objects/{}/data", f.id).as_str())
-            );
+            // an explicit key persists verbatim (no id-rewrite anymore)
+            assert_eq!(f.object_key.as_deref(), Some("objects/7/data"));
             assert!(matches!(s.delete_node(f.id), Ok(())));
             assert_eq!(s.count_children(d.id).unwrap(), 0);
             s.delete_node(d.id).unwrap();

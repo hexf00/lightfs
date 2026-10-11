@@ -344,19 +344,20 @@ mod tests {
     fn rpc_write_conflict_detected() {
         let c = core();
         call(&c, 1, "create", json!({"path": "/f"}));
+        // metadata-only create: the empty file sits at version 0
         let (ok, _) = call(
             &c,
             2,
             "write",
-            json!({"path": "/f", "data": base64_data(b"v1"), "expected_version": 1}),
+            json!({"path": "/f", "data": base64_data(b"v1"), "expected_version": 0}),
         );
         assert!(ok);
-        // stale write: version is now 2
+        // stale write: version is now 1
         let (ok, e) = call(
             &c,
             3,
             "write",
-            json!({"path": "/f", "data": base64_data(b"v2"), "expected_version": 1, "create_if_missing": false}),
+            json!({"path": "/f", "data": base64_data(b"v2"), "expected_version": 0, "create_if_missing": false}),
         );
         assert!(!ok);
         assert_eq!(e["code"], "CONFLICT");

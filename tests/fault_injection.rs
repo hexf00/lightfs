@@ -202,7 +202,6 @@ fn upload_fails_before_start_nothing_committed() {
     let (core, _meta, _objects) = setup(faults.clone());
     core.create("/f", 0o644).unwrap();
     let before = core.lookup("/f").unwrap();
-    // arm the fault only after the create (which also PUTs an object)
     faults.fail_put.store(true, Ordering::SeqCst);
 
     let h = core.open_write("/f", None).unwrap();
@@ -213,8 +212,9 @@ fn upload_fails_before_start_nothing_committed() {
     let after = core.lookup("/f").unwrap();
     assert_eq!(after.version, before.version);
     assert_eq!(after.size, before.size);
-    // exactly the pre-existing (create-time) version key remains
-    assert_eq!(version_keys(&core, after.id).len(), 1);
+    // metadata-only create commits NO object: a failed first write leaves
+    // exactly zero version keys - nothing to clean up, nothing to confuse
+    assert_eq!(version_keys(&core, after.id).len(), 0);
 }
 
 /// 2. streaming upload fails midway: metadata untouched, no partial/orphan
@@ -241,13 +241,14 @@ fn stream_fails_midway_no_partial_object() {
     let after = core.lookup("/f").unwrap();
     assert_eq!(after.version, before.version);
     assert_eq!(after.size, before.size);
-    // exactly the create-time version key remains (no partial object added)
+    // metadata-only create commits NO object: a failed stream leaves
+    // exactly zero keys (no partial object, no placeholder)
     let remaining = objects
         .list(&format!("objects/{}/", after.id), None, 100)
         .unwrap()
         .items;
-    assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0].key, after.object_key.clone().unwrap());
+    assert_eq!(remaining.len(), 0);
+    assert!(after.object_key.is_none());
 }
 
 /// 3. upload succeeds, metadata CAS fails: the previously committed content

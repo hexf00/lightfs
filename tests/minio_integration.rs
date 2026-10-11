@@ -332,13 +332,14 @@ fn point_in_time_restore_minio() {
         );
         // Post-backup leftovers are expected and classified (not missing).
         // Node ids are reused after unlink (plain INTEGER PRIMARY KEY), so
-        // /post (id 3, reused from the deleted /zap) shows up as two STALE
-        // versions of the restored /zap rather than orphans; /keep's V2
-        // object is the third stale entry. All inert: nothing references
+        // /post's commits (id 3, reused from the deleted /zap) show up as
+        // STALE versions of the restored /zap rather than orphans. The
+        // metadata-only create adds no object of its own, so exactly the
+        // two content objects remain stale. All inert: nothing references
         // them and restored-db gc only touches recorded retained rows.
         assert_eq!(report.orphan_objects.len(), 0, "{}", report.render());
-        assert_eq!(report.stale_versions.len(), 3, "{}", report.render());
-        assert_eq!(report.retained_objects.len(), 2, "{}", report.render());
+        assert_eq!(report.stale_versions.len(), 2, "{}", report.render());
+        assert_eq!(report.retained_objects.len(), 0, "{}", report.render());
     }
     for f in [
         cfg.metadata.path.clone(),

@@ -85,6 +85,11 @@ pub fn fsck(core: &Core) -> Result<FsckReport> {
         if !node.is_file() {
             continue;
         }
+        if node.size == 0 {
+            // Contract: an empty file has no content object (create is
+            // metadata-only; the first write commit uploads content).
+            continue;
+        }
         let key = node
             .object_key
             .clone()

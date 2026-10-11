@@ -65,7 +65,7 @@ bind = "127.0.0.1:18095"
 CFGEOF
 
 "$DEPLOY_DIR/lightfs" create-bucket --config "$RUN/cfg.toml" >/dev/null
-"$DEPLOY_DIR/lightfs" server --config "$RUN/cfg.toml" >"$RUN/server.log" 2>&1 &
+LIGHTFS_METRICS=1 "$DEPLOY_DIR/lightfs" server --config "$RUN/cfg.toml" >"$RUN/server.log" 2>&1 &
 echo $! > "$RUN/server.pid"
 wait_http http://127.0.0.1:18095/health || fail "lightfs server up"
 
@@ -87,6 +87,11 @@ cleanup() {
 }
 
 dump_metrics() {
+    # the mount writes its table only when its session ends - unmount
+    # gracefully right here, then read both sides
+    fusermount3 -u "$MNT" 2>/dev/null || fusermount -u "$MNT" 2>/dev/null \
+        || umount -l "$MNT" 2>/dev/null || true
+    sleep 1
     echo "== mount-side metrics (top 15 by total) =="
     grep -v '^op ' "$RUN/mount-metrics.txt" 2>/dev/null | head -16 || echo "  (no metrics file)"
     echo "== server-side metrics (top 11 by total) =="

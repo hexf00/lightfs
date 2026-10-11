@@ -31,12 +31,28 @@ use crate::writeback::PendingWrite;
 
 const ATTR_TTL: Duration = Duration::from_secs(1);
 
+/// Paginated readdir snapshot (per ino+fh, stamped when fetched).
+type DirCacheKey = (u64, u64);
+type DirSnapshot = (Vec<(u64, FileType, String)>, std::time::Instant);
+
 pub struct FuseAdapter {
     fs: std::sync::Arc<dyn FsApi>,
     /// ino (== metadata node id) -> path within the filesystem.
     inodes: Mutex<HashMap<u64, PathBuf>>,
     /// file handle -> buffered write.
     writes: Mutex<HashMap<u64, PendingWrite>>,
+    /// path -> ino reverse index: ino_of_path used to LINEAR-SCAN the
+    /// whole inode map on every reverse lookup, growing with the number
+    /// of dirs ever visited (O(n) per getattr on a cold name).
+    paths: Mutex<HashMap<String, u64>>,
+    /// Paginated readdir snapshots: the kernel walks a large directory
+    /// through MANY readdir callbacks (one per reply buffer) and each
+    /// callback used to refetch the whole list - an ~80x amplification
+    /// (op metrics: 11.5k readdir callbacks cost 149s mount-side while
+    /// the server handled the same calls in 1.7s). offset==0 fetches a
+    /// fresh snapshot; offset>0 replays the cached one (getdents makes
+    /// no coherence promises mid-walk).
+    dir_cache: Mutex<HashMap<DirCacheKey, DirSnapshot>>,
     /// In-flight EOF per path (see writeback::PendingEof): appends derive
     /// their offset from our view of the file size, and stat coherence.
     pending: std::sync::LazyLock<crate::writeback::PendingEof>,
@@ -103,6 +119,8 @@ impl FuseAdapter {
             fs,
             inodes: Mutex::new(inodes),
             writes: Mutex::new(HashMap::new()),
+            paths: Mutex::new(HashMap::new()),
+            dir_cache: Mutex::new(HashMap::new()),
             pending: std::sync::LazyLock::new(crate::writeback::PendingEof::new),
             next_fh: AtomicU64::new(1),
             uid,
@@ -120,18 +138,22 @@ impl FuseAdapter {
     }
 
     fn ino_of_path(&self, path: &str) -> Option<u64> {
-        self.inodes
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(_, p)| p.to_string_lossy() == path)
-            .map(|(ino, _)| *ino)
+        self.paths.lock().unwrap().get(path).copied()
+    }
+
+    fn forget_path(&self, path: &str) {
+        let ino = self.paths.lock().unwrap().remove(path);
+        if let Some(ino) = ino {
+            self.inodes.lock().unwrap().remove(&ino);
+        }
     }
 
     fn remember(&self, ino: u64, parent_path: &str, name: &OsStr) {
         let mut p = PathBuf::from(parent_path);
         p.push(name);
+        let ps = p.to_string_lossy().to_string();
         self.inodes.lock().unwrap().insert(ino, p);
+        self.paths.lock().unwrap().insert(ps, ino);
     }
 
     fn child_path(parent_path: &str, name: &OsStr) -> String {
@@ -311,7 +333,7 @@ fn drained_overlay(drained: &std::collections::BTreeMap<u64, Vec<u8>>, content: 
 }
 
 impl Filesystem for FuseAdapter {
-    fn destroy(&self) {
+    fn destroy(&mut self) {
         // Unmount is the only reliable exit of the mount process - flush
         // the benchmark instrument to LIGHTFS_METRICS_FILE if configured.
         crate::metrics::dump_to_file_if_configured();
@@ -458,31 +480,55 @@ impl Filesystem for FuseAdapter {
             Ok(p) => p,
             Err(e) => return reply.error(e),
         };
-        let children = match self.fs.readdir(&path) {
-            Ok(c) => c,
-            Err(e) => return reply.error(errno(&e)),
-        };
-        let parent_ino = match path.as_str() {
-            "/" => 1,
-            _ => {
-                let parent_path = match path.rfind('/') {
-                    Some(0) | None => "/".to_string(),
-                    Some(i) => path[..i].to_string(),
+        let cache_key = (ino.0, _fh.0);
+        let entries = {
+            let mut cache = self.dir_cache.lock().unwrap();
+            // evict stale snapshots lazily (a walk outlives 30s gets a
+            // fresh list on its next offset==0 page anyway)
+            cache.retain(|_, (_, t)| t.elapsed() < std::time::Duration::from_secs(30));
+            if offset == 0 {
+                let children = match self.fs.readdir(&path) {
+                    Ok(c) => c,
+                    Err(e) => return reply.error(errno(&e)),
                 };
-                self.ino_of_path(&parent_path).unwrap_or(1)
+                let mut entries: Vec<(u64, FileType, String)> =
+                    Vec::with_capacity(children.len() + 2);
+                entries.push((ino.0, FileType::Directory, ".".to_string()));
+                let parent_ino = match path.as_str() {
+                    "/" => 1u64,
+                    _ => {
+                        let parent_path = match path.rfind('/') {
+                            Some(0) | None => "/".to_string(),
+                            Some(i) => path[..i].to_string(),
+                        };
+                        self.ino_of_path(&parent_path).unwrap_or(1)
+                    }
+                };
+                entries.push((parent_ino, FileType::Directory, "..".to_string()));
+                for c in &children {
+                    let kind = if c.is_dir() {
+                        FileType::Directory
+                    } else {
+                        FileType::RegularFile
+                    };
+                    entries.push((c.id as u64, kind, c.name.clone()));
+                }
+                cache.insert(cache_key, (entries.clone(), std::time::Instant::now()));
+                entries
+            } else {
+                match cache.get(&cache_key) {
+                    Some((entries, _)) => entries.clone(),
+                    None => {
+                        // page without a snapshot (kernel restart, cache
+                        // eviction): refetch and replay from the top is
+                        // WRONG for cookies - fail the walk instead
+                        return reply.error(errno(&Error::InvalidArgument(
+                            "readdir snapshot evicted".into(),
+                        )));
+                    }
+                }
             }
         };
-        let mut entries: Vec<(u64, FileType, String)> = Vec::new();
-        entries.push((ino.0, FileType::Directory, ".".to_string()));
-        entries.push((parent_ino, FileType::Directory, "..".to_string()));
-        for c in &children {
-            let kind = if c.is_dir() {
-                FileType::Directory
-            } else {
-                FileType::RegularFile
-            };
-            entries.push((c.id as u64, kind, c.name.clone()));
-        }
         for (i, (child_ino, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
             if reply.add(INodeNo(*child_ino), (i + 1) as u64, *kind, name.as_str()) {
                 break;
@@ -729,10 +775,7 @@ impl Filesystem for FuseAdapter {
         let path = Self::child_path(&parent_path, name);
         match self.fs.rmdir(&path) {
             Ok(()) => {
-                let victim = self.ino_of_path(&path);
-                if let Some(ino) = victim {
-                    self.inodes.lock().unwrap().remove(&ino);
-                }
+                self.forget_path(&path);
                 reply.ok()
             }
             Err(e) => reply.error(errno(&e)),
@@ -772,21 +815,25 @@ impl Filesystem for FuseAdapter {
                 } else {
                     format!("{old_path}/")
                 };
-                let updates: Vec<(u64, PathBuf)> = map
+                let mut rev = self.paths.lock().unwrap();
+                let updates: Vec<(u64, String, String)> = map
                     .iter()
                     .filter(|(_, p)| {
                         let ps = p.to_string_lossy();
                         ps == old_path || ps.starts_with(&prefix)
                     })
                     .map(|(ino, p)| {
-                        let ps = p.to_string_lossy();
-                        let rest = &ps[old_path.len()..];
-                        (*ino, PathBuf::from(format!("{new_path}{rest}")))
+                        let ps = p.to_string_lossy().to_string();
+                        let new_ps = format!("{new_path}{}", &ps[old_path.len()..]);
+                        (*ino, ps, new_ps)
                     })
                     .collect();
-                for (ino, p) in updates {
-                    map.insert(ino, p);
+                for (ino, old_ps, new_ps) in updates {
+                    rev.remove(&old_ps);
+                    map.insert(ino, PathBuf::from(&new_ps));
+                    rev.insert(new_ps, ino);
                 }
+                drop(rev);
                 reply.ok()
             }
             Err(e) => reply.error(errno(&e)),
@@ -814,6 +861,10 @@ pub fn mount(
     } else {
         fuser::SessionACL::Owner
     };
-    fuser::mount(adapter, std::path::Path::new(mountpoint), &config)
-        .map_err(|e| crate::error::Error::Config(format!("mount failed: {e}")))
+    let result = fuser::mount(adapter, std::path::Path::new(mountpoint), &config)
+        .map_err(|e| crate::error::Error::Config(format!("mount failed: {e}")));
+    // Session over (unmount or kernel abort): flush the benchmark
+    // instrument even if the destroy callback did not run.
+    crate::metrics::dump_to_file_if_configured();
+    result
 }
