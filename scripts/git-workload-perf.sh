@@ -65,12 +65,14 @@ bind = "127.0.0.1:18095"
 CFGEOF
 
 "$DEPLOY_DIR/lightfs" create-bucket --config "$RUN/cfg.toml" >/dev/null
-LIGHTFS_METRICS=1 "$DEPLOY_DIR/lightfs" server --config "$RUN/cfg.toml" >"$RUN/server.log" 2>&1 &
+# Timing runs are METRICS-OFF: the on-cost is a mutex'd registry update
+# per recorded op and attribution numbers must not tax the numbers they
+# explain. A dedicated metrics-on pass at the end collects op metrics.
+"$DEPLOY_DIR/lightfs" server --config "$RUN/cfg.toml" >"$RUN/server.log" 2>&1 &
 echo $! > "$RUN/server.pid"
 wait_http http://127.0.0.1:18095/health || fail "lightfs server up"
 
-LIGHTFS_METRICS=1 LIGHTFS_METRICS_FILE="$RUN/mount-metrics.txt" \
-    "$DEPLOY_DIR/lightfs" mount --config "$RUN/cfg.toml" "$MNT" >"$RUN/mount.log" 2>&1 &
+"$DEPLOY_DIR/lightfs" mount --config "$RUN/cfg.toml" "$MNT" >"$RUN/mount.log" 2>&1 &
 echo $! > "$RUN/mount.pid"
 for _ in $(seq 1 100); do mountpoint -q "$MNT" && break; sleep 0.2; done
 mountpoint -q "$MNT" || fail "lightfs mount up"
@@ -201,9 +203,6 @@ if [[ -n "$GIT_REPO_SRC" && -d "$DEST/.git" ]]; then
     rm -rf "$LOC/repo-local"
 fi
 
-echo "== attribution: op metrics =="
-dump_metrics
-
 if command -v npm >/dev/null 2>&1; then
     mkdir -p "$MNT/npmapp"
     printf '{"name":"app","version":"1.0.0"}\n' > "$MNT/npmapp/package.json"
@@ -234,5 +233,31 @@ if command -v npm >/dev/null 2>&1; then
     fi
     rm -rf "$LOC/npmapp"
 fi
+
+# Attribution pass, last because it tears the mount down: dump_metrics
+# unmounts (the mount flushes its metrics file on session destroy), so
+# everything that uses the mount must run BEFORE this point. It used to
+# sit before the npm section - which then silently wrote into the now
+# plain directory under the mountpoint, i.e. measured the LOCAL disk.
+echo "== attribution: op metrics (separate metrics-on pass) =="
+fusermount3 -u "$MNT" 2>/dev/null || fusermount -u "$MNT" 2>/dev/null || true
+sleep 1
+kill "$(cat "$RUN/server.pid")" 2>/dev/null || true
+sleep 1
+LIGHTFS_METRICS=1 "$DEPLOY_DIR/lightfs" server --config "$RUN/cfg.toml" \
+    >"$RUN/server2.log" 2>&1 &
+echo $! > "$RUN/server.pid"
+wait_http http://127.0.0.1:18095/health || fail "lightfs server up (metrics pass)"
+LIGHTFS_METRICS=1 LIGHTFS_METRICS_FILE="$RUN/mount-metrics.txt" \
+    "$DEPLOY_DIR/lightfs" mount --config "$RUN/cfg.toml" "$MNT" >"$RUN/mount2.log" 2>&1 &
+echo $! > "$RUN/mount.pid"
+for _ in $(seq 1 100); do mountpoint -q "$MNT" && break; sleep 0.2; done
+mountpoint -q "$MNT" || fail "lightfs mount up (metrics pass)"
+t0; gen_storm "$MNT"; t1 "attr: create+write+close $NFILES files (metrics on)"
+t0; find "$MNT/node_modules" -type f | wc -l >/dev/null; t1 "attr: find -type f (metrics on)"
+if [[ -n "${DEST:-}" && -d "$DEST/.git" ]]; then
+    t0; (cd "$DEST" && git status --porcelain >/dev/null); t1 "attr: git status warm (metrics on)"
+fi
+dump_metrics
 
 echo "GIT/SMALLFILE WORKLOAD PERF DONE (run dir $RUN)"

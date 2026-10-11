@@ -192,9 +192,10 @@ impl Core {
             .create_node(parent.id, &name, NodeKind::Dir, mode, None)
     }
 
-    /// Create an empty file. The empty object is written eagerly so
-    /// metadata and data plane agree from the start. Same CAS discipline as
-    /// commit_write (expected version 0 = freshly created row).
+    /// Create an empty file. The create is METADATA-ONLY: no content
+    /// object is written (version 0, no object key). See the in-body
+    /// comment for the full contract and why the old eager placeholder
+    /// object was removed.
     pub fn create(&self, path: &str, mode: u32) -> Result<Node> {
         let (parent, name) = self.parent_and_name(path)?;
         if let Some(_existing) = self.meta.get_child(parent.id, &name)? {

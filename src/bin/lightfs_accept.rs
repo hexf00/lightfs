@@ -213,6 +213,10 @@ impl Ctx {
         cmd.args(["mount", "--config"])
             .arg(&self.config)
             .arg(&self.mount_target);
+        // Short dir-snapshot TTL (fuse-only, default 30): A12 exercises the
+        // expired-snapshot path in seconds. No other test leaves a walk
+        // open anywhere near this long, so nothing else can hit it.
+        cmd.env("LIGHTFS_FUSE_DIR_SNAPSHOT_SECS", "2");
         cmd.stdout(Stdio::null()).stderr(self.child_stderr("mount"));
         self.mount = Some(cmd.spawn().expect("spawn lightfs mount"));
 
@@ -496,6 +500,78 @@ fn section_a(ctx: &Ctx, root: &Path) {
     flush_strong(&mut f, "A11 commit");
     drop(f);
     assert_bytes("A11 read-your-writes after flush", &p, &data);
+
+    // A12 readdir snapshot lifecycle: a paged directory walk that outlives
+    // the snapshot TTL must fail LOUDLY (EINVAL on the next page), never
+    // replay a silently stale list; a fresh walk afterwards must be clean
+    // and complete. The suite's mount sets LIGHTFS_FUSE_DIR_SNAPSHOT_SECS=2
+    // (fuse-only knob, default 30) so the eviction path costs seconds; the
+    // 250-char names force real pagination - 1200 of them exceed one FUSE
+    // reply buffer on every kernel this suite runs on. Raw getdents64 with
+    // a 512-byte buffer: std's ReadDir buffers a whole kernel batch in
+    // userspace, so ReadDir::next() is NOT one readdir callback and a mid
+    // -iteration sleep would land inside a buffered page, never reaching
+    // the adapter (first A12 draft tripped on exactly that).
+    #[cfg(target_os = "linux")]
+    {
+        fn getdents_page(fd: std::os::unix::io::RawFd) -> std::io::Result<usize> {
+            let mut buf = [0u8; 512]; // ~1 entry per call: every call is its own FUSE readdir
+            let n = unsafe { libc::syscall(libc::SYS_getdents64, fd, buf.as_mut_ptr(), buf.len()) };
+            if n < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(n as usize)
+            }
+        }
+
+        let dir = sm.join("a12");
+        std::fs::create_dir_all(&dir).expect("A12 mkdir");
+        let mut names: Vec<String> = Vec::with_capacity(1200);
+        for i in 0..1200 {
+            // lexicographic == numeric order (4-digit suffix), so the vec
+            // stays sorted for the membership check below
+            let n = format!("a12-{i:04}-{}", "x".repeat(240));
+            std::fs::write(dir.join(&n), b"").expect("A12 create");
+            names.push(n);
+        }
+        let cpath = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+        assert!(fd >= 0, "A12: open dir fd");
+        // page 1 (offset==0): builds the snapshot
+        assert!(
+            getdents_page(fd).expect("A12: first page read") > 0,
+            "A12: first page must list entries"
+        );
+        // page 2 (offset>0): snapshot still fresh, paged reads work
+        assert!(
+            getdents_page(fd).expect("A12: second page read") > 0,
+            "A12: second page must list entries"
+        );
+        std::thread::sleep(Duration::from_secs(3)); // > snapshot TTL (2s)
+        // next page: snapshot gone - EINVAL, never a stale list
+        let err = getdents_page(fd).expect_err("A12: expired snapshot must fail");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EINVAL),
+            "A12: expired snapshot must fail with EINVAL, got {err}"
+        );
+        unsafe { libc::close(fd) }; // releasedir drops the dead snapshot
+
+        // fresh walk: complete listing, nothing stale, nothing missing
+        let mut count = 0usize;
+        for e in std::fs::read_dir(&dir).expect("A12 reopen dir") {
+            let e = e.expect("A12: fresh walk entry");
+            assert!(
+                names
+                    .binary_search(&e.file_name().to_string_lossy().to_string())
+                    .is_ok(),
+                "A12: unexpected entry {:?}",
+                e.file_name()
+            );
+            count += 1;
+        }
+        assert_eq!(count, 1200, "A12: fresh walk must list every entry");
+    }
 }
 
 fn section_b(ctx: &mut Ctx, root: &Path) {

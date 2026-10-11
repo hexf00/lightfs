@@ -53,6 +53,11 @@ pub struct FuseAdapter {
     /// fresh snapshot; offset>0 replays the cached one (getdents makes
     /// no coherence promises mid-walk).
     dir_cache: Mutex<HashMap<DirCacheKey, DirSnapshot>>,
+    /// How long a readdir snapshot stays reusable for offset>0 pages.
+    /// A walk that outlives it fails its next page with EINVAL rather
+    /// than replaying a silently stale list; LIGHTFS_FUSE_DIR_SNAPSHOT_SECS
+    /// overrides (A12 exercises eviction with a short TTL).
+    dir_snapshot_ttl: std::time::Duration,
     /// In-flight EOF per path (see writeback::PendingEof): appends derive
     /// their offset from our view of the file size, and stat coherence.
     pending: std::sync::LazyLock<crate::writeback::PendingEof>,
@@ -115,12 +120,23 @@ impl FuseAdapter {
         // SAFETY: plain uid/gid queries; no invariants beyond Linux's own.
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
+        // Snapshot lifetime for paged readdir. Default 30s covers any
+        // interactive walk by a wide margin; the env knob exists so the
+        // slow-pagination regression (acceptance A12) can exercise the
+        // eviction path in seconds instead of half a minute.
+        let dir_snapshot_ttl = std::time::Duration::from_secs(
+            std::env::var("LIGHTFS_FUSE_DIR_SNAPSHOT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(30),
+        );
         Self {
             fs,
             inodes: Mutex::new(inodes),
             writes: Mutex::new(HashMap::new()),
             paths: Mutex::new(HashMap::new()),
             dir_cache: Mutex::new(HashMap::new()),
+            dir_snapshot_ttl,
             pending: std::sync::LazyLock::new(crate::writeback::PendingEof::new),
             next_fh: AtomicU64::new(1),
             uid,
@@ -483,9 +499,9 @@ impl Filesystem for FuseAdapter {
         let cache_key = (ino.0, _fh.0);
         let entries = {
             let mut cache = self.dir_cache.lock().unwrap();
-            // evict stale snapshots lazily (a walk outlives 30s gets a
-            // fresh list on its next offset==0 page anyway)
-            cache.retain(|_, (_, t)| t.elapsed() < std::time::Duration::from_secs(30));
+            // evict stale snapshots lazily (a walk that outlives the TTL
+            // gets a fresh list on its next offset==0 page anyway)
+            cache.retain(|_, (_, t)| t.elapsed() < self.dir_snapshot_ttl);
             if offset == 0 {
                 let children = match self.fs.readdir(&path) {
                     Ok(c) => c,
@@ -534,6 +550,22 @@ impl Filesystem for FuseAdapter {
                 break;
             }
         }
+        reply.ok();
+    }
+
+    fn releasedir(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        // Drop this handle's snapshot immediately: the lazy 30s eviction
+        // in readdir only runs on the next readdir call, so a closed
+        // handle's snapshot (potentially thousands of entries) would
+        // otherwise linger for up to the full TTL.
+        self.dir_cache.lock().unwrap().remove(&(ino.0, fh.0));
         reply.ok();
     }
 
