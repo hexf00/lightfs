@@ -10,6 +10,12 @@ source ./scripts/lib.sh
 
 export PATH="$HOME/.cargo/bin:$PATH"
 
+# Start MinIO BEFORE the unit-test step: when LIGHTFS_TEST_MINIO=1 is
+# preset in the environment (as the CI workflow does), plain `cargo test`
+# runs the MinIO integration tests too, so the backend must be up by then.
+# Idempotent: skips itself if a healthy MinIO already answers.
+start_minio
+
 echo "[ci 1/4] formatting + lints (release-quality gates)"
 cargo fmt --check
 cargo clippy --all-targets --quiet -- -D warnings
@@ -21,9 +27,6 @@ echo "[ci 3/4] dependency gate"
 bash scripts/check-no-tokio.sh
 
 echo "[ci 4/4] MinIO integration tests (required; must not be skipped)"
-# start_minio exits non-zero if MinIO cannot be started, so a missing
-# backend can never turn the integration job green.
-start_minio
 LIGHTFS_TEST_MINIO=1 LIGHTFS_S3_ENDPOINT="${LIGHTFS_S3_ENDPOINT:-http://127.0.0.1:9000}" \
   LIGHTFS_S3_BUCKET="${LIGHTFS_S3_BUCKET:-lightfs-test}" \
   cargo test --quiet

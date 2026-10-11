@@ -1064,10 +1064,15 @@ mod minio_tests {
     }
 
     fn cross_check(backend: &dyn ObjectStore) {
-        // Make reruns idempotent: clear anything left over under phase1/.
+        // Make reruns idempotent: clear anything left over under this
+        // test's own sub-prefix. It must NOT touch phase1/ as a whole:
+        // sibling MinIO tests (range-len, presign, ...) own keys directly
+        // under phase1/ and cargo runs test threads in parallel - a wide
+        // clear here deletes their objects mid-test ("object missing"
+        // flake seen on fast machines / fresh MinIO).
         let mut token = None;
         loop {
-            let page = backend.list("phase1/", token.as_deref(), 1000).unwrap();
+            let page = backend.list("phase1/sem/", token.as_deref(), 1000).unwrap();
             for item in &page.items {
                 backend.delete(&item.key).unwrap();
             }
@@ -1077,36 +1082,40 @@ mod minio_tests {
             }
         }
 
-        let info = backend.put("phase1/hello", b"hello world").unwrap();
+        let info = backend.put("phase1/sem/hello", b"hello world").unwrap();
         assert_eq!(info.size, 11);
         assert!(!info.etag.is_empty());
 
-        let got = backend.get("phase1/hello", None).unwrap();
+        let got = backend.get("phase1/sem/hello", None).unwrap();
         assert_eq!(got.data, b"hello world");
 
         let part = backend
-            .get("phase1/hello", Some(Range { start: 6, len: 5 }))
+            .get("phase1/sem/hello", Some(Range { start: 6, len: 5 }))
             .unwrap();
         assert_eq!(part.data, b"world");
         assert_eq!(part.offset, 6);
 
-        let head = backend.head("phase1/hello").unwrap();
+        let head = backend.head("phase1/sem/hello").unwrap();
         assert_eq!(head.size, 11);
         assert_eq!(head.etag, info.etag);
 
         // overwrite
-        let info2 = backend.put("phase1/hello", b"bye").unwrap();
+        let info2 = backend.put("phase1/sem/hello", b"bye").unwrap();
         assert_ne!(info.etag, info2.etag);
-        assert_eq!(backend.get("phase1/hello", None).unwrap().data, b"bye");
+        assert_eq!(backend.get("phase1/sem/hello", None).unwrap().data, b"bye");
 
         // list with pagination
         for i in 0..5 {
-            backend.put(&format!("phase1/list/{i:02}"), b"x").unwrap();
+            backend
+                .put(&format!("phase1/sem/list/{i:02}"), b"x")
+                .unwrap();
         }
         let mut all = Vec::new();
         let mut token = None;
         loop {
-            let page = backend.list("phase1/list/", token.as_deref(), 2).unwrap();
+            let page = backend
+                .list("phase1/sem/list/", token.as_deref(), 2)
+                .unwrap();
             all.extend(page.items.iter().map(|i| i.key.clone()));
             match page.next_token {
                 Some(t) => token = Some(t),
@@ -1118,12 +1127,12 @@ mod minio_tests {
         sorted.sort();
         assert_eq!(all, sorted);
 
-        backend.delete("phase1/hello").unwrap();
+        backend.delete("phase1/sem/hello").unwrap();
         assert!(matches!(
-            backend.head("phase1/hello"),
+            backend.head("phase1/sem/hello"),
             Err(Error::ObjectMissing(_))
         ));
-        backend.delete("phase1/hello").unwrap(); // idempotent
+        backend.delete("phase1/sem/hello").unwrap(); // idempotent
     }
 
     #[test]

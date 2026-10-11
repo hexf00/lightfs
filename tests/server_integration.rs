@@ -117,8 +117,9 @@ fn server_health_and_protocol() {
     // getattr alias
     let (ok, r) = srv.rpc("getattr", json!({"path": "/shared/data"}));
     assert!(ok);
-    // create_if_missing commits an empty object (v1), then write commits content (v2)
-    assert_eq!(r["version"], 2);
+    // create_if_missing is metadata-only (v0, no object commit - B-1),
+    // then this write is the first content commit (v1)
+    assert_eq!(r["version"], 1);
     // structured error
     let (ok, _) = srv.rpc("unlink", json!({"path": "/shared/data"}));
     assert!(ok);
