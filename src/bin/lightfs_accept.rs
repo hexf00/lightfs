@@ -572,6 +572,106 @@ fn section_a(ctx: &Ctx, root: &Path) {
         }
         assert_eq!(count, 1200, "A12: fresh walk must list every entry");
     }
+
+    // A13 readdirplus lookup cache: post-listing lookups are served from
+    // the listing snapshot (attr_ttl bounded). Regression: cross-client
+    // mutations must converge within the TTL, local ones immediately.
+    // The mount runs with the default LIGHTFS_FUSE_ATTR_TTL_SECS=1, so
+    // every convergence bound below is TTL + generous slack.
+    if ctx.sections_want("a") && cfg!(unix) {
+        println!("  A13 readdirplus lookup cache (cross-client bounds)");
+        let dir = root.join("a13");
+        std::fs::create_dir_all(&dir).expect("A13 mkdir");
+        std::fs::write(dir.join("a13-one"), b"1").expect("A13 seed one");
+        std::fs::write(dir.join("a13-two"), b"2").expect("A13 seed two");
+        // seed the lookup cache with a listing
+        let listed: Vec<String> = std::fs::read_dir(&dir)
+            .expect("A13 listing")
+            .map(|e| {
+                e.expect("A13 entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        assert!(listed.contains(&"a13-one".to_string()));
+
+        // remote CREATE of an unlisted name: fresh (never-cached) lookup
+        // must see it immediately - negative lookups are not cached
+        rpc_post(
+            &ctx.rpc_url(),
+            "write",
+            r#"{"path":"/a13/a13-remote","data":"cg=="}"#,
+        );
+        let t0 = Instant::now();
+        loop {
+            if dir.join("a13-remote").exists() {
+                break;
+            }
+            assert!(
+                t0.elapsed() < Duration::from_millis(2500),
+                "A13: remote create visible within attr_ttl+slack, took {:?}",
+                t0.elapsed()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            t0.elapsed() < Duration::from_millis(2500),
+            "A13: remote create must converge quickly, took {:?}",
+            t0.elapsed()
+        );
+
+        // remote DELETE of a LISTED file: the lookup cache knows it as
+        // existing; the deletion must surface within attr_ttl + slack
+        rpc_post(&ctx.rpc_url(), "unlink", r#"{"path":"/a13/a13-two"}"#);
+        let t0 = Instant::now();
+        loop {
+            if !dir.join("a13-two").exists() {
+                break;
+            }
+            assert!(
+                t0.elapsed() < Duration::from_millis(2500),
+                "A13: remote delete of a listed file must converge within attr_ttl+slack, took {:?}",
+                t0.elapsed()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // LOCAL create: mutation drops the cache, visibility is immediate
+        std::fs::write(dir.join("a13-local"), b"3").expect("A13 local create");
+        assert!(
+            dir.join("a13-local").exists(),
+            "A13: local create must be visible immediately"
+        );
+        // LOCAL delete of a listed file: immediate, no stale existence
+        std::fs::remove_file(dir.join("a13-one")).expect("A13 local delete");
+        assert!(
+            !dir.join("a13-one").exists(),
+            "A13: local delete must be visible immediately"
+        );
+        println!("    OK A13 readdirplus bounds (create/delete converge, local immediate)");
+    }
+}
+
+/// Minimal raw-HTTP RPC used by A13 to act as a second (out-of-band)
+/// client while the mount under test stays connected.
+fn rpc_post(server_url: &str, method: &str, params: &str) {
+    use std::io::{Read, Write};
+    let addr = server_url.trim_start_matches("http://");
+    let mut s = std::net::TcpStream::connect(addr).expect("A13 rpc connect");
+    let body = format!("{{\"id\":1,\"method\":\"{method}\",\"params\":{params}}}");
+    let req = format!(
+        "POST /rpc HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    s.write_all(req.as_bytes()).expect("A13 rpc write");
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).expect("A13 rpc read");
+    assert!(
+        resp.contains("\"ok\":true"),
+        "A13 rpc {method} failed: {resp}"
+    );
 }
 
 fn section_b(ctx: &mut Ctx, root: &Path) {
@@ -900,6 +1000,11 @@ impl Ctx {
     fn sections_want(&self, s: &str) -> bool {
         // main owns the section list; kept on Ctx via the constructor above
         self.section_list.iter().any(|x| x == s)
+    }
+
+    /// Base URL of the running server (A13 second-client RPC).
+    fn rpc_url(&self) -> String {
+        self.server_url.clone()
     }
 }
 

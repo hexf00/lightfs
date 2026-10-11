@@ -77,6 +77,14 @@ pub struct FuseAdapter {
     /// 0 = off). See DirentCache docs - C1 experiment knob.
     dirent_cache: Mutex<DirentCache>,
     dirent_ttl: Duration,
+    /// readdirplus-style lookup cache: full path -> node, seeded by every
+    /// fresh directory listing (the listing already carries each child's
+    /// metadata, so the lookup storm git sends right after a readdir is
+    /// served without an RPC per file). Freshness is bounded by the SAME
+    /// attr_ttl the kernel cache gets, and any local namespace mutation
+    /// drops it entirely - so self-writes stay POSIX-visible and only
+    /// cross-client changes can be observed up to attr_ttl late.
+    attr_cache: Mutex<HashMap<String, (Node, std::time::Instant)>>,
     /// In-flight EOF per path (see writeback::PendingEof): appends derive
     /// their offset from our view of the file size, and stat coherence.
     pending: std::sync::LazyLock<crate::writeback::PendingEof>,
@@ -155,6 +163,7 @@ impl FuseAdapter {
             attr_ttl: Duration::from_secs(secs_env("LIGHTFS_FUSE_ATTR_TTL_SECS", 1)),
             dirent_cache: Mutex::new(HashMap::new()),
             dirent_ttl: Duration::from_secs(secs_env("LIGHTFS_FUSE_DIRENT_CACHE_SECS", 0)),
+            attr_cache: Mutex::new(HashMap::new()),
             pending: std::sync::LazyLock::new(crate::writeback::PendingEof::new),
             next_fh: AtomicU64::new(1),
             uid,
@@ -207,6 +216,24 @@ impl FuseAdapter {
     fn dirent_invalidate(&self) {
         if self.dirent_ttl > Duration::ZERO {
             self.dirent_cache.lock().unwrap().clear();
+        }
+        // The lookup cache is cheap enough to drop unconditionally: a
+        // mutation means the next lookups must go to the server.
+        self.attr_cache.lock().unwrap().clear();
+    }
+
+    /// Seed the lookup cache from a fresh listing (both the RPC fetch and
+    /// a dirent-cache hit carry per-child metadata).
+    fn seed_attrs(&self, dir_path: &str, children: &[Node]) {
+        let now = std::time::Instant::now();
+        let mut cache = self.attr_cache.lock().unwrap();
+        for c in children {
+            let p = if dir_path == "/" {
+                format!("/{}", c.name)
+            } else {
+                format!("{dir_path}/{}", c.name)
+            };
+            cache.insert(p, (c.clone(), now));
         }
     }
 
@@ -383,6 +410,13 @@ impl FuseAdapter {
                     e
                 };
                 self.pending.rebase(&path, end);
+                // The commit produced the freshest possible node: refresh
+                // the readdirplus cache so the next stat does not pay an
+                // RPC (and never sees the pre-write size).
+                self.attr_cache
+                    .lock()
+                    .unwrap()
+                    .insert(path.clone(), (committed_node, std::time::Instant::now()));
                 Ok(())
             }
             Err(e) => Err(fail(e, Some(node_now.version))),
@@ -415,9 +449,34 @@ impl Filesystem for FuseAdapter {
             Err(e) => return reply.error(e),
         };
         let path = Self::child_path(&parent_path, name);
+        // readdirplus: a fresh listing already told us this child's
+        // metadata; serve the kernel's lookup storm without one RPC per
+        // file. Same freshness bound as the kernel attr cache; local
+        // mutations drop the whole cache (see dirent_invalidate).
+        let cached = self
+            .attr_cache
+            .lock()
+            .unwrap()
+            .get(&path)
+            .filter(|(_, t)| t.elapsed() < self.attr_ttl)
+            .map(|(n, _)| n.clone());
+        if let Some(node) = cached {
+            crate::metrics::observe("fuse.lookup.cache_hit", Duration::ZERO);
+            self.remember(node.id as u64, &parent_path, name);
+            reply.entry(
+                &self.attr_ttl,
+                &attr_for(&node, self.uid, self.gid),
+                fuser::Generation(0),
+            );
+            return;
+        }
         match self.fs.lookup(&path) {
             Ok(node) => {
                 self.remember(node.id as u64, &parent_path, name);
+                self.attr_cache
+                    .lock()
+                    .unwrap()
+                    .insert(path, (node.clone(), std::time::Instant::now()));
                 reply.entry(
                     &self.attr_ttl,
                     &attr_for(&node, self.uid, self.gid),
@@ -434,20 +493,45 @@ impl Filesystem for FuseAdapter {
             Ok(p) => p,
             Err(e) => return reply.error(e),
         };
-        match self.fs.lookup(&path) {
-            Ok(node) => {
-                let mut attr = attr_for(&node, self.uid, self.gid);
-                let in_flight = self.pending.get(&path);
-                if in_flight > node.size as u64 {
-                    // Write-back model: report the in-flight EOF like the
-                    // kernel page cache reports dirty size. Windows appends
-                    // derive offsets from this; stat coherence expects it.
-                    attr.size = in_flight;
+        // Same readdirplus cache as lookup (git's stat loop lands here
+        // once the kernel dentry cache is warm). The in-flight fixup
+        // below keeps dirty writes coherent; a completed write refreshes
+        // the entry itself (see commit_write), and namespace mutations
+        // drop the whole cache.
+        let node = {
+            let cached = self
+                .attr_cache
+                .lock()
+                .unwrap()
+                .get(&path)
+                .filter(|(_, t)| t.elapsed() < self.attr_ttl)
+                .map(|(n, _)| n.clone());
+            match cached {
+                Some(n) => {
+                    crate::metrics::observe("fuse.getattr.cache_hit", Duration::ZERO);
+                    n
                 }
-                reply.attr(&self.attr_ttl, &attr)
+                None => match self.fs.lookup(&path) {
+                    Ok(n) => {
+                        self.attr_cache
+                            .lock()
+                            .unwrap()
+                            .insert(path.clone(), (n.clone(), std::time::Instant::now()));
+                        n
+                    }
+                    Err(e) => return reply.error(errno(&e)),
+                },
             }
-            Err(e) => reply.error(errno(&e)),
+        };
+        let mut attr = attr_for(&node, self.uid, self.gid);
+        let in_flight = self.pending.get(&path);
+        if in_flight > node.size as u64 {
+            // Write-back model: report the in-flight EOF like the
+            // kernel page cache reports dirty size. Windows appends
+            // derive offsets from this; stat coherence expects it.
+            attr.size = in_flight;
         }
+        reply.attr(&self.attr_ttl, &attr)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -531,7 +615,13 @@ impl Filesystem for FuseAdapter {
                 .as_secs() as i64,
         });
         match self.fs.setattr(&path, mode, mtime_secs) {
-            Ok(node) => reply.attr(&self.attr_ttl, &attr_for(&node, self.uid, self.gid)),
+            Ok(node) => {
+                self.attr_cache
+                    .lock()
+                    .unwrap()
+                    .insert(path.clone(), (node.clone(), std::time::Instant::now()));
+                reply.attr(&self.attr_ttl, &attr_for(&node, self.uid, self.gid))
+            }
             Err(e) => reply.error(errno(&e)),
         }
     }
@@ -596,6 +686,10 @@ impl Filesystem for FuseAdapter {
                         c
                     }
                 };
+                // The listing carries each child's metadata: seed the
+                // lookup cache so the upcoming per-file lookups stay
+                // client-side (readdirplus).
+                self.seed_attrs(&path, &children);
                 let build_t0 = std::time::Instant::now();
                 let entries = self.build_dir_entries(ino.0, &path, &children);
                 cache.insert(cache_key, (entries.clone(), std::time::Instant::now()));
