@@ -180,11 +180,12 @@ jobs:
               $b = New-Object byte[] ($sz)
               (New-Object Random 42).NextBytes($b)
               [IO.File]::WriteAllBytes("$PWD\expect.bin", $b)
-              [IO.File]::Copy("$PWD\expect.bin", 'Q:\docs\rand.bin')
+              $dst = "Q:\docs\rand-$($sz).bin"
+              [IO.File]::Copy("$PWD\expect.bin", $dst)
               $h1 = (Get-FileHash "$PWD\expect.bin" -Algorithm SHA256).Hash
-              $h2 = (Get-FileHash 'Q:\docs\rand.bin' -Algorithm SHA256).Hash
+              $h2 = (Get-FileHash $dst -Algorithm SHA256).Hash
               if ($h1 -ne $h2) {
-                $got = [IO.File]::ReadAllBytes('Q:\docs\rand.bin')
+                $got = [IO.File]::ReadAllBytes($dst)
                 "DIAG: size want=$($b.Length) got=$($got.Length)"
                 $block = 64KB
                 $bad = -1
