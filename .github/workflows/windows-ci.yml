@@ -236,7 +236,8 @@ jobs:
 
             # [4.3] shell client sees the same namespace (server mode)
             $seen = & $shellbin --config "$PWD\cfg.toml" @srv ls /docs
-            if (-not ($seen -match 'rand.bin')) { throw "shell ls misses rand.bin: $seen" }
+            if (-not ($seen -match 'rand-5242880')) { throw "shell ls misses the 5MB file: $seen" }
+            if (-not ($seen -match 'flushed')) { throw "shell ls misses the flushed file: $seen" }
             $cat = (& $shellbin --config "$PWD\cfg.toml" @srv cat /docs/a.txt) -join ""
             if ($cat -ne 'hello lightfs') { throw "shell cat mismatch: '$cat'" }
 
