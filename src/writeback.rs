@@ -158,6 +158,39 @@ impl ChunkMap {
 
     /// Overlay non-overlapping chunks onto the file's current committed
     /// content (zero-filling gaps), producing the commit payload.
+    /// Overlay the chunks intersecting `buf` (which starts at file offset
+    /// `read_offset`). Read-your-writes for the same mount: POSIX requires
+    /// a read (or mmap fault) after write(2) to return the written bytes
+    /// even before flush. Found missing when git verified a pack file via
+    /// mmap mid-write - reads served committed-only and the tail vanished.
+    pub fn overlay_range(&self, buf: &mut [u8], read_offset: u64) {
+        if buf.is_empty() {
+            return;
+        }
+        let end = read_offset + buf.len() as u64;
+        for (&off, data) in &self.0 {
+            if off >= end {
+                break;
+            }
+            let chunk_end = off + data.len() as u64;
+            if chunk_end <= read_offset {
+                continue;
+            }
+            let src = if read_offset > off {
+                (read_offset - off) as usize
+            } else {
+                0
+            };
+            let dst = if off > read_offset {
+                (off - read_offset) as usize
+            } else {
+                0
+            };
+            let n = (data.len() - src).min(buf.len() - dst);
+            buf[dst..dst + n].copy_from_slice(&data[src..src + n]);
+        }
+    }
+
     /// End offset of the highest chunk (chunks are non-overlapping and the
     /// map is sorted by offset). Adapters use this to publish the in-flight
     /// EOF to getattr while a write session is open.
@@ -181,6 +214,77 @@ impl ChunkMap {
 }
 
 /// Per-handle write-back session.
+/// In-flight EOF per path, published to getattr while a write session is
+/// open. Two consumers: (1) appends - Windows' FUSE layer derives the
+/// WriteToEndOfFile offset from our getattr, and in the write-back model
+/// the committed size only advances at flush, so two appends between
+/// flushes would fold onto one offset; (2) stat coherence - POSIX expects
+/// fstat to reflect written bytes. Reports max(committed, in-flight), the
+/// same thing the Linux page cache does for dirty writes.
+///
+/// Lock discipline: methods only ever take this struct's own mutex - safe
+/// to call while holding an adapter's session-map lock. Callers that must
+/// inspect their session map (for remaining chunk ends) do so FIRST and
+/// pass the result in.
+#[derive(Default)]
+pub struct PendingEof {
+    map: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+}
+
+impl PendingEof {
+    pub fn new() -> Self {
+        Self {
+            map: Default::default(),
+        }
+    }
+
+    /// Raise the in-flight EOF to `end` (a write landed at [end-len, end)).
+    pub fn advance(&self, path: &str, end: u64) {
+        let mut m = self.map.lock().unwrap();
+        let e = m.entry(path.to_string()).or_insert(end);
+        if *e < end {
+            *e = end;
+        }
+    }
+
+    pub fn get(&self, path: &str) -> u64 {
+        self.map.lock().unwrap().get(path).copied().unwrap_or(0)
+    }
+
+    /// After a commit: the committed size plus remaining open-session
+    /// chunks defines the visible EOF. Never LOWERS an entry: a concurrent
+    /// write may have advanced it after the caller inspected its sessions.
+    pub fn rebase(&self, path: &str, end: u64) {
+        let mut m = self.map.lock().unwrap();
+        match m.get_mut(path) {
+            Some(e) => {
+                if end > *e {
+                    *e = end;
+                }
+            }
+            None => {
+                m.insert(path.to_string(), end);
+            }
+        }
+    }
+
+    /// After a session went away (release): unlike rebase this may LOWER
+    /// the value - a failed final commit must not leave a phantom in-flight
+    /// EOF (readers would see a zero hole). `end == 0` removes the entry.
+    pub fn recompute(&self, path: &str, end: u64) {
+        let mut m = self.map.lock().unwrap();
+        if end == 0 {
+            m.remove(path);
+        } else {
+            m.insert(path.to_string(), end);
+        }
+    }
+
+    pub fn drop_path(&self, path: &str) {
+        self.map.lock().unwrap().remove(path);
+    }
+}
+
 pub struct PendingWrite {
     pub path: String,
     /// Version captured when write intent started; the CAS anchor.
@@ -373,6 +477,50 @@ mod tests {
         s.chunks.restore_under(&drained);
         let got = content_after(&s.chunks, b"");
         assert_eq!(got, b"newOLDOLD");
+    }
+
+    #[test]
+    fn overlay_range_serves_window_and_partial_head() {
+        let mut c = ChunkMap::new();
+        c.insert(0, vec![b'A'; 10]); // [0, 10)
+        c.insert(20, vec![b'B'; 10]); // [20, 30)
+        c.insert(100, vec![b'C'; 5]); // [100, 105)
+        // window fully inside a gap: untouched
+        let mut buf = vec![0u8; 5];
+        c.overlay_range(&mut buf, 12);
+        assert_eq!(buf, vec![0u8; 5]);
+        // window spanning chunk 1 and the gap+chunk 2
+        let mut buf = vec![0u8; 25]; // [5, 30)
+        c.overlay_range(&mut buf, 5);
+        assert_eq!(&buf[..5], &[b'A'; 5]);
+        assert_eq!(&buf[5..15], &[0u8; 10]);
+        assert_eq!(&buf[15..25], &[b'B'; 10]);
+        // window starting mid-chunk
+        let mut buf = vec![0u8; 3];
+        c.overlay_range(&mut buf, 23);
+        assert_eq!(buf, vec![b'B', b'B', b'B']);
+        // empty window: no-op
+        let mut buf: Vec<u8> = Vec::new();
+        c.overlay_range(&mut buf, 0);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn pending_eof_semantics() {
+        let p = PendingEof::new();
+        assert_eq!(p.get("/f"), 0);
+        p.advance("/f", 10);
+        p.advance("/f", 4); // never lowers
+        assert_eq!(p.get("/f"), 10);
+        p.rebase("/f", 8); // never lowers
+        assert_eq!(p.get("/f"), 10);
+        p.recompute("/f", 12); // may lower/raise explicitly
+        assert_eq!(p.get("/f"), 12);
+        p.recompute("/f", 0); // removes
+        assert_eq!(p.get("/f"), 0);
+        p.advance("/f", 7);
+        p.drop_path("/f");
+        assert_eq!(p.get("/f"), 0);
     }
 
     #[test]

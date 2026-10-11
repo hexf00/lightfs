@@ -15,9 +15,17 @@ DEPLOY_DIR="${DEPLOY_DIR:-/tmp/lightfs-accept}"
 RUN="/tmp/lightfs-gitperf-$$"
 MNT="$RUN/mnt"
 LOC="$RUN/local"
-FILES="${FILES:-1000}"     # git repo file count
+FILES="${FILES:-1000}"     # synthetic git repo file count
 NFILES="${NFILES:-3000}"   # small-file storm size
-NPM_TIMEOUT="${NPM_TIMEOUT:-420}"
+NPM_TIMEOUT="${NPM_TIMEOUT:-600}"
+# Real-world inputs: GIT_REPO_SRC is any git URL/path cloned straight onto
+# the mount (GIT_PROXY only wraps http(s) clones; local traffic never sees
+# it). NPM_PACKAGES is the npm dependency tree to install on the mount.
+GIT_REPO_SRC="${GIT_REPO_SRC:-}"
+GIT_REPO_MIRROR="${GIT_REPO_MIRROR:-}"
+GIT_PROXY="${GIT_PROXY:-}"
+GIT_CLONE_ARGS="${GIT_CLONE_ARGS:---depth 1}"
+NPM_PACKAGES="${NPM_PACKAGES:-express}"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 for bin in lightfs lightfs-shell minio; do
@@ -78,6 +86,7 @@ trap cleanup EXIT
 export GIT_AUTHOR_NAME=perf GIT_AUTHOR_EMAIL=perf@local
 export GIT_COMMITTER_NAME=perf GIT_COMMITTER_EMAIL=perf@local
 
+run_synthetic_git() {
 echo "== seed: git repo with $FILES files (on local disk) =="
 SEED="/tmp/gitperf-seed-$$"
 t0
@@ -93,7 +102,7 @@ git -C "$SEED" add -A
 git -C "$SEED" commit -qm seed
 t1 "seed repo ready (local disk)"
 
-echo "== git workload on the LightFS mount =="
+echo "== git workload (synthetic $FILES-file repo) on the LightFS mount =="
 t0; git clone -q "file://$SEED" "$MNT/repo"; t1 "git clone -> mount"
 t0; (cd "$MNT/repo" && git status --porcelain >/dev/null); t1 "git status (clean tree)"
 echo delta >> "$MNT/repo/src/dir1/f1.txt"
@@ -103,6 +112,48 @@ t0; cat "$MNT/repo/src/dir2/"*.txt > /dev/null; t1 "read 100 small files"
 t0; (cd "$MNT/repo" && git add -A); t1 "git add -A (100 modified)"
 t0; (cd "$MNT/repo" && git commit -qm delta); t1 "git commit (100 blobs)"
 t0; rm -rf "$MNT/repo"; t1 "rm -rf repo (unlink storm, $((FILES+40)) files)"
+}
+
+if [[ -z "$GIT_REPO_SRC" ]]; then
+    run_synthetic_git
+fi
+
+echo "== real git repo on the LightFS mount =="
+if [[ -n "$GIT_REPO_SRC" ]]; then
+    DEST="$MNT/repo-real"
+    t0
+    # network clones flake (proxies drop packs mid-transfer); that is not
+    # what this benchmark measures, so retry the fetch a few times
+    for attempt in 1 2 3; do
+        rm -rf "$DEST"
+        if [[ -n "$GIT_PROXY" ]]; then
+            git -c http.proxy="$GIT_PROXY" clone -q $GIT_CLONE_ARGS "$GIT_REPO_SRC" "$DEST" 2>"$RUN/clone.err" && break
+        else
+            git clone -q $GIT_CLONE_ARGS "$GIT_REPO_SRC" "$DEST" 2>"$RUN/clone.err" && break
+        fi
+        [[ $attempt -eq 3 ]] && break
+        sleep 2
+    done
+    if [[ ! -d "$DEST/.git" && -n "$GIT_REPO_MIRROR" ]]; then
+        echo "  direct clone failed, falling back to mirror: $GIT_REPO_MIRROR"
+        rm -rf "$DEST"
+        git clone -q $GIT_CLONE_ARGS "$GIT_REPO_MIRROR" "$DEST" \
+            2>>"$RUN/clone.err"
+    fi
+    [[ -d "$DEST/.git" ]] || fail "real-repo clone failed (see $RUN/clone.err)"
+    t1 "git clone real repo -> mount"
+    echo "  worktree files: $(git -C "$DEST" ls-files | wc -l), pack: $(git -C "$DEST" count-objects -v | grep '^size-pack' | awk '{print $2}') KB"
+    t0; (cd "$DEST" && git status --porcelain >/dev/null); t1 "git status (first run on fresh clone)"
+    t0; (cd "$DEST" && git status --porcelain >/dev/null); t1 "git status (warm)"
+    t0; (cd "$DEST" && git log --oneline | head -5 >/dev/null); t1 "git log"
+    (cd "$DEST" && git ls-files '*.js' | head -50 | while read -r f; do
+        echo delta >> "$f"
+    done)
+    t0; (cd "$DEST" && git add -A); t1 "git add -A (50 modified files)"
+    t0; (cd "$DEST" && git commit -qm delta); t1 "git commit"
+else
+    echo "  skipped (GIT_REPO_SRC not set)"
+fi
 
 echo "== small-file storm, node_modules shape ($NFILES x 2KB, 200 pkgs) =="
 gen_storm() {
@@ -129,13 +180,13 @@ if command -v npm >/dev/null 2>&1; then
     mkdir -p "$MNT/npmapp"
     printf '{"name":"app","version":"1.0.0"}\n' > "$MNT/npmapp/package.json"
     t0
-    if (cd "$MNT/npmapp" && timeout "$NPM_TIMEOUT" npm install express \
+    if (cd "$MNT/npmapp" && timeout "$NPM_TIMEOUT" npm install $NPM_PACKAGES \
         --registry=https://registry.npmmirror.com --no-audit --no-fund \
         --loglevel=error >/dev/null 2>&1); then
-        t1 "npm install express (mount)"
+        t1 "npm install $NPM_PACKAGES (mount)"
         echo "  packages installed: $(find "$MNT/npmapp/node_modules" -maxdepth 1 -mindepth 1 | wc -l), files: $(find "$MNT/npmapp/node_modules" -type f | wc -l)"
     else
-        echo "  npm install did not finish in ${NPM_TIMEOUT}s (registry/time) - skipped"
+        echo "  npm install $NPM_PACKAGES did not finish in ${NPM_TIMEOUT}s (registry/time) - skipped"
     fi
 else
     echo "  npm not installed - skipped"

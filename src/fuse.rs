@@ -37,6 +37,9 @@ pub struct FuseAdapter {
     inodes: Mutex<HashMap<u64, PathBuf>>,
     /// file handle -> buffered write.
     writes: Mutex<HashMap<u64, PendingWrite>>,
+    /// In-flight EOF per path (see writeback::PendingEof): appends derive
+    /// their offset from our view of the file size, and stat coherence.
+    pending: std::sync::LazyLock<crate::writeback::PendingEof>,
     next_fh: AtomicU64,
     uid: u32,
     gid: u32,
@@ -100,6 +103,7 @@ impl FuseAdapter {
             fs,
             inodes: Mutex::new(inodes),
             writes: Mutex::new(HashMap::new()),
+            pending: std::sync::LazyLock::new(crate::writeback::PendingEof::new),
             next_fh: AtomicU64::new(1),
             uid,
             gid,
@@ -137,6 +141,44 @@ impl FuseAdapter {
         } else {
             format!("{parent_path}/{name}")
         }
+    }
+
+    /// Max over the committed size and the chunk ends of every open
+    /// session for `path`. Callers must NOT hold the writes lock.
+    fn visible_eof(&self, path: &str, committed_size: u64) -> u64 {
+        let writes = self.writes.lock().unwrap();
+        let mut end = committed_size;
+        for st in writes.values() {
+            if st.path == path {
+                end = end.max(st.chunks.max_end());
+            }
+        }
+        end
+    }
+
+    /// fs.read with same-mount write-back coherence: POSIX requires a read
+    /// (or mmap fault) after write(2) to return the written bytes even
+    /// before flush. The kernel page cache usually serves those reads, but
+    /// any attribute refresh / page eviction sends it HERE - and committed-
+    /// only reads truncated files (git pack verification hit exactly that).
+    fn read_with_session(&self, path: &str, offset: u64, size: u64) -> Result<Vec<u8>, Error> {
+        let mut data = self.fs.read(path, offset, size)?;
+        let in_flight = self.pending.get(path);
+        let want = if in_flight > offset {
+            ((in_flight - offset) as usize).min(size as usize)
+        } else {
+            0
+        };
+        if want > data.len() {
+            data.resize(want, 0);
+        }
+        let writes = self.writes.lock().unwrap();
+        for st in writes.values() {
+            if st.path == path {
+                st.chunks.overlay_range(&mut data, offset);
+            }
+        }
+        Ok(data)
     }
 
     fn start_write(&self, path: &str) -> Result<u64, Error> {
@@ -228,14 +270,28 @@ impl FuseAdapter {
         }
         match session.commit() {
             Ok(committed_node) => {
-                let mut writes = self.writes.lock().unwrap();
-                if let Some(state) = writes.get_mut(&fh) {
-                    // chunks stay drained; a fresh kernel write starts a
-                    // new batch - but if one ALREADY arrived during the
-                    // commit, the session is NOT done (next flush commits
-                    // it against the re-based version).
-                    state.note_commit_success(committed_node.version);
-                }
+                let end = {
+                    let mut writes = self.writes.lock().unwrap();
+                    if let Some(state) = writes.get_mut(&fh) {
+                        // chunks stay drained; a fresh kernel write starts a
+                        // new batch - but if one ALREADY arrived during the
+                        // commit, the session is NOT done (next flush commits
+                        // it against the re-based version).
+                        state.note_commit_success(committed_node.version);
+                    }
+                    // Inline scan: visible_eof would re-lock `writes` (a
+                    // std Mutex is not reentrant) and deadlock this very
+                    // flush - the exact bug fixed on the Windows adapter
+                    // first; do not "simplify" this back into the helper.
+                    let mut e = committed_node.size as u64;
+                    for st in writes.values() {
+                        if st.path == path {
+                            e = e.max(st.chunks.max_end());
+                        }
+                    }
+                    e
+                };
+                self.pending.rebase(&path, end);
                 Ok(())
             }
             Err(e) => Err(fail(e, Some(node_now.version))),
@@ -280,7 +336,17 @@ impl Filesystem for FuseAdapter {
             Err(e) => return reply.error(e),
         };
         match self.fs.lookup(&path) {
-            Ok(node) => reply.attr(&ATTR_TTL, &attr_for(&node, self.uid, self.gid)),
+            Ok(node) => {
+                let mut attr = attr_for(&node, self.uid, self.gid);
+                let in_flight = self.pending.get(&path);
+                if in_flight > node.size as u64 {
+                    // Write-back model: report the in-flight EOF like the
+                    // kernel page cache reports dirty size. Windows appends
+                    // derive offsets from this; stat coherence expects it.
+                    attr.size = in_flight;
+                }
+                reply.attr(&ATTR_TTL, &attr)
+            }
             Err(e) => reply.error(errno(&e)),
         }
     }
@@ -348,6 +414,8 @@ impl Filesystem for FuseAdapter {
                             st.chunks.trim_truncate(new_size);
                         }
                     }
+                    // the committed size is authoritative from now on
+                    self.pending.drop_path(&path);
                 }
                 Err(e) => return reply.error(errno(&e)),
             }
@@ -461,6 +529,7 @@ impl Filesystem for FuseAdapter {
             Ok((node, fh))
         }) {
             Ok((node, fh)) => {
+                self.pending.drop_path(&path);
                 self.remember(node.id as u64, &parent_path, name);
                 reply.created(
                     &ATTR_TTL,
@@ -505,7 +574,7 @@ impl Filesystem for FuseAdapter {
             Ok(p) => p,
             Err(e) => return reply.error(e),
         };
-        match self.fs.read(&path, offset, size as u64) {
+        match self.read_with_session(&path, offset, size as u64) {
             Ok(data) => reply.data(&data),
             Err(e) => reply.error(errno(&e)),
         }
@@ -539,6 +608,8 @@ impl Filesystem for FuseAdapter {
             state.committed = false;
         }
         state.chunks.insert(offset, data.to_vec());
+        self.pending
+            .advance(&state.path, offset + data.len() as u64);
         reply.written(data.len() as u32);
     }
 
@@ -584,6 +655,12 @@ impl Filesystem for FuseAdapter {
             );
         }
         self.writes.lock().unwrap().remove(&fh.0);
+        if let Some(path) = path {
+            // recompute from remaining sessions: a failed final commit must
+            // not leave a phantom in-flight EOF (readers would see a hole)
+            let end = self.visible_eof(&path, 0);
+            self.pending.recompute(&path, end);
+        }
         reply.ok();
     }
 
@@ -617,6 +694,7 @@ impl Filesystem for FuseAdapter {
                 if let Some(ino) = victim {
                     self.inodes.lock().unwrap().remove(&ino);
                 }
+                self.pending.drop_path(&path);
                 reply.ok()
             }
             Err(e) => reply.error(errno(&e)),
@@ -663,6 +741,8 @@ impl Filesystem for FuseAdapter {
         let new_path = Self::child_path(&new_parent, newname);
         match self.fs.rename(&old_path, &new_path) {
             Ok(()) => {
+                self.pending.drop_path(&old_path);
+                self.pending.drop_path(&new_path);
                 // Repoint cached paths of the moved subtree (only entries the
                 // kernel has looked up are in the map).
                 let mut map = self.inodes.lock().unwrap();

@@ -21,6 +21,8 @@ base64 = "0.22"
 # fuser builds only where FUSE exists (Linux); mounting needs /dev/fuse at runtime.
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = { version = "0.18", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [[bin]]

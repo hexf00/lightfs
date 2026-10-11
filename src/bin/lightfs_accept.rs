@@ -470,6 +470,32 @@ fn section_a(ctx: &Ctx, root: &Path) {
         &p,
         b"first write content\n",
     );
+
+    // A11 read-your-writes BEFORE flush: POSIX requires a read (or mmap
+    // fault) after write(2) to return the written bytes even while the
+    // data is still in the write-back session. Found missing when git
+    // verified a pack file mid-write: a committed-only read truncated the
+    // file. POSIX_FADV_DONTNEED evicts the kernel's clean pages so the
+    // read-back REALLY reaches the adapter instead of the page cache.
+    let p = sm.join("a11.bin");
+    let data = pattern(1_572_864, 21); // 1.5MB - many write-back chunks
+    let mut f = open_create(&p);
+    let mut off = 0usize;
+    for chunk in data.chunks(4096) {
+        write_at(&mut f, off as u64, chunk);
+        off += chunk.len();
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use std::os::unix::io::AsRawFd;
+        if libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) != 0 {
+            eprintln!("A11: posix_fadvise failed, page cache may mask the check");
+        }
+    }
+    assert_bytes("A11 read-your-writes before flush", &p, &data);
+    flush_strong(&mut f, "A11 commit");
+    drop(f);
+    assert_bytes("A11 read-your-writes after flush", &p, &data);
 }
 
 fn section_b(ctx: &mut Ctx, root: &Path) {
