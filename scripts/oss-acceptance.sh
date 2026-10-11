@@ -32,8 +32,17 @@ SKIP_PERF="${LIGHTFS_OSS_SKIP_PERF:-0}"
 # still 2 full parts + tail, enough to validate the multipart protocol.
 LARGE_MB="${LIGHTFS_OSS_MULTIPART_MB:-64}"
 
-export PATH="$HOME/.cargo/bin:$PATH"
-cargo build --release -q --bin lightfs --bin lightfs-bench
+# SKIP_BUILD=1: resource-constrained targets (e.g. a 2C/1.7G VPS with no
+# toolchain) run against prebuilt binaries placed in target/release/.
+if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
+    for bin in lightfs lightfs-bench; do
+        [[ -x "./target/release/$bin" ]] || { echo "ERROR: SKIP_BUILD=1 but ./target/release/$bin missing" >&2; exit 1; }
+    done
+    echo "SKIP_BUILD=1: using prebuilt binaries"
+else
+    export PATH="$HOME/.cargo/bin:$PATH"
+    cargo build --release -q --bin lightfs --bin lightfs-bench
+fi
 
 RUN="/tmp/lightfs-oss-$$-$(date +%s)"
 mkdir -p "$RUN"

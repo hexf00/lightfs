@@ -158,6 +158,18 @@ impl Ctx {
         Stdio::from(f)
     }
 
+    /// True while the kernel still lists a mount at `target` (Linux).
+    /// Reads /proc/self/mounts - unlike mountpoint(1) this does not lie
+    /// about dead mounts.
+    fn unix_mounted(target: &str) -> bool {
+        match std::fs::read_to_string("/proc/self/mounts") {
+            Ok(mtab) => mtab
+                .lines()
+                .any(|l| l.split_whitespace().nth(1) == Some(target)),
+            Err(_) => false,
+        }
+    }
+
     fn start_server(&mut self) {
         let mut cmd = Command::new(&self.lightfs);
         cmd.args(["server", "--config"]).arg(&self.config);
@@ -184,6 +196,19 @@ impl Ctx {
     /// BEFORE the mount, so "path exists" proves nothing - verify with
     /// mountpoint(1); on Windows a drive letter only exists once mounted.
     fn start_mount(&mut self) {
+        let root = PathBuf::from(&self.mount_target);
+        // A mount still listed for the target is a stale (possibly DEAD)
+        // leftover: mounting over it stacks and fails weirdly on old
+        // kernels (seen on CentOS 7 / 3.10: fresh conn dies with
+        // ENOTCONN, leaving another corpse). Detect via /proc/mounts -
+        // mountpoint(1) LIES on dead mounts (exit 0 with "Transport
+        // endpoint is not connected").
+        if cfg!(unix) && Self::unix_mounted(&self.mount_target) {
+            panic!(
+                "mount target {} already has a mount listed - a stale mount was not cleaned up",
+                self.mount_target
+            );
+        }
         let mut cmd = Command::new(&self.lightfs);
         cmd.args(["mount", "--config"])
             .arg(&self.config)
@@ -191,15 +216,9 @@ impl Ctx {
         cmd.stdout(Stdio::null()).stderr(self.child_stderr("mount"));
         self.mount = Some(cmd.spawn().expect("spawn lightfs mount"));
 
-        let root = PathBuf::from(&self.mount_target);
         for _ in 0..120 {
             let appeared = if cfg!(unix) {
-                Command::new("mountpoint")
-                    .arg("-q")
-                    .arg(&root)
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false)
+                Self::unix_mounted(&self.mount_target)
             } else {
                 root.exists()
             };
@@ -219,23 +238,59 @@ impl Ctx {
         panic!("mount target {} never appeared", self.mount_target);
     }
 
-    fn kill_mount(&mut self) {
+    /// Kill the mount daemon. Does NOT unmount: an unmount while fds may
+    /// still pin the fs degrades to lazy detachment (see unmount_target).
+    fn kill_mount_only(&mut self) {
         if let Some(c) = self.mount.as_mut() {
             let _ = c.kill();
             let _ = c.wait();
         }
         self.mount = None;
-        // Linux: the kernel keeps a dead mount at the path - detach it so
-        // the next mount does not stack. Windows: the kernel unmounts a
-        // drive when its process dies; wait for the letter to vanish.
+    }
+
+    /// Kill daemon AND unmount, for paths that hold no open files on the
+    /// mount (C2 server-crash restart, suite teardown).
+    fn kill_mount(&mut self) {
+        self.kill_mount_only();
+        self.unmount_target();
+    }
+
+    /// Detach the mount at mount_target and WAIT until it is really gone.
+    /// Linux: fusermount(1) is the setuid helper that MOUNTED the fs, so
+    /// it may unmount it; umount(8) often is NOT permitted for a plain
+    /// user (seen on CentOS 7: "Operation not permitted" even with -l).
+    /// -z is fusermount's lazy variant - only reachable when fds still pin
+    /// the fs; lazy detachment leaves the entry listed until the last
+    /// reference dies, which is why callers should close theirs first.
+    /// Windows: the kernel unmounts a drive when its process dies; wait
+    /// for the letter to vanish.
+    fn unmount_target(&self) {
         if cfg!(unix) {
-            for um in [["fusermount3", "-u"], ["umount", "-l"]] {
+            for um in [
+                ["fusermount3", "-u"],
+                ["fusermount", "-u"],
+                ["fusermount3", "-z"],
+                ["fusermount", "-z"],
+                ["umount", "-l"],
+            ] {
                 let _ = Command::new(um[0])
                     .args([um[1], &self.mount_target])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status();
             }
+            // Truth source is /proc/mounts: mountpoint(1) reports success
+            // on DEAD mounts ("Transport endpoint is not connected").
+            for _ in 0..40 {
+                if !Self::unix_mounted(&self.mount_target) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            panic!(
+                "mount target {} still listed after unmount attempts",
+                self.mount_target
+            );
         } else {
             let root = PathBuf::from(&self.mount_target);
             for _ in 0..60 {
@@ -528,12 +583,17 @@ fn section_c(ctx: &mut Ctx, root: &Path) {
     // file and commit the data before the mount dies.
     let mut stale = open_create(&p);
     write_at(&mut stale, 0, &pattern(65536, 16));
-    ctx.kill_mount();
-    ctx.start_mount();
-    println!("MOUNTED (after C1 crash)");
-    // The stale fd points at the dead mount; close errors are expected.
+    ctx.kill_mount_only();
+    // The daemon is dead, so close(2)/fsync here CANNOT commit anything
+    // (the chunks lived in the killed process). Close BEFORE unmounting:
+    // an open fd pins the dead fuse mount - fusermount -u gets EBUSY and
+    // even the lazy variants leave the entry listed (seen on CentOS 7),
+    // and mounting over that corpse fails with ENOTCONN on kernel 3.10.
     let _ = stale.sync_all();
     drop(stale);
+    ctx.unmount_target();
+    ctx.start_mount();
+    println!("MOUNTED (after C1 crash)");
     let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(u64::MAX);
     if len != 0 {
         panic!("C1: unflushed file length {len} after crash, want 0 (empty placeholder)");
