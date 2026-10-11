@@ -113,7 +113,6 @@ jobs:
           [cache.data]
           enabled = false
           "@ | Set-Content -Encoding ascii D:\lightfs-accept\cfg.toml
-          .\bin\lightfs.exe create-bucket --config D:\lightfs-accept\cfg.toml
           # MinIO must outlive the suite's own server/mount children, so it
           # is started here and reaped in the finally block below.
           $minio = Start-Process -FilePath .\minio.exe `
@@ -133,6 +132,7 @@ jobs:
             Get-Content D:\lightfs-accept\minio.err -ErrorAction SilentlyContinue
             throw "MinIO did not become healthy"
           }
+          .\bin\lightfs.exe create-bucket --config D:\lightfs-accept\cfg.toml
           try {
             & .\bin\lightfs-accept.exe `
               --lightfs .\bin\lightfs.exe `
