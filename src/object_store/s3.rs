@@ -1205,15 +1205,31 @@ mod minio_tests {
         let payload = b"presigned poc payload";
         s3.put("phase1/presign", payload).unwrap();
         let url = s3.presign_get("phase1/presign", 300).unwrap();
-        // Plain HTTP client, no Authorization header at all:
+        // Plain HTTP client, no Authorization header at all. A transient
+        // non-200 (observed once on CI: NoSuchKey right after PUT on a busy
+        // runner) is retried briefly; the PURPOSE here is signature
+        // correctness, not MinIO durability.
         let agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .build()
             .new_agent();
-        let mut resp = agent.get(&url).call().unwrap();
-        assert_eq!(resp.status().as_u16(), 200, "presigned fetch must succeed");
-        let body = resp.body_mut().read_to_vec().unwrap();
-        assert_eq!(body, payload);
+        let mut body = None;
+        for attempt in 0..10 {
+            let mut resp = agent.get(&url).call().unwrap();
+            if resp.status().as_u16() == 200 {
+                body = Some(resp.body_mut().read_to_vec().unwrap());
+                break;
+            }
+            assert_ne!(resp.status().as_u16(), 403, "valid signature rejected");
+            if attempt == 9 {
+                panic!(
+                    "presigned fetch must succeed (status {})",
+                    resp.status().as_u16()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        assert_eq!(body.unwrap(), payload);
         s3.delete("phase1/presign").unwrap();
         // tampered signature must be rejected
         let bad_url = format!("{}X", &url[..url.len() - 1]);
