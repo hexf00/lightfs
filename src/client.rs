@@ -162,6 +162,7 @@ impl Client {
     }
 
     fn call(&self, method: &str, params: Value) -> Result<Value> {
+        let _g = crate::metrics::scope("client.rpc");
         let body = json!({"id": 1, "method": method, "params": params}).to_string();
         let mut resp = self
             .agent
@@ -214,9 +215,11 @@ impl Client {
         if let Some(v) = expected_version {
             builder = builder.header("X-LightFS-Expected-Version", v.to_string());
         }
-        let mut resp = builder
-            .send(data)
-            .map_err(|e| Error::Io(format!("data/write transport: {e}")))?;
+        let mut resp = crate::metrics::time("client.data.write", || {
+            builder
+                .send(data)
+                .map_err(|e| Error::Io(format!("data/write transport: {e}")))
+        })?;
         let status = resp.status().as_u16();
         let text = resp
             .body_mut()
@@ -357,16 +360,17 @@ impl FsApi for Client {
 
     fn read(&self, path: &str, offset: u64, size: u64) -> Result<Vec<u8>> {
         // Binary data endpoint: raw bytes in the response body, no base64.
-        let mut resp = self
-            .agent
-            .post(format!("{}/data/read", self.url))
-            .header("Content-Type", "application/json")
-            .send(
-                json!({"path": path, "offset": offset, "size": size})
-                    .to_string()
-                    .as_bytes(),
-            )
-            .map_err(|e| Error::Io(format!("data/read transport: {e}")))?;
+        let mut resp = crate::metrics::time("client.data.read", || {
+            self.agent
+                .post(format!("{}/data/read", self.url))
+                .header("Content-Type", "application/json")
+                .send(
+                    json!({"path": path, "offset": offset, "size": size})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .map_err(|e| Error::Io(format!("data/read transport: {e}")))
+        })?;
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
             let text = resp
@@ -465,16 +469,17 @@ impl Client {
         offset: u64,
         size: u64,
     ) -> Result<(Box<dyn std::io::Read + Send>, u64)> {
-        let mut resp = self
-            .agent
-            .post(format!("{}/data/read", self.url))
-            .header("Content-Type", "application/json")
-            .send(
-                json!({"path": path, "offset": offset, "size": size})
-                    .to_string()
-                    .as_bytes(),
-            )
-            .map_err(|e| Error::Io(format!("data/read transport: {e}")))?;
+        let mut resp = crate::metrics::time("client.data.read", || {
+            self.agent
+                .post(format!("{}/data/read", self.url))
+                .header("Content-Type", "application/json")
+                .send(
+                    json!({"path": path, "offset": offset, "size": size})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .map_err(|e| Error::Io(format!("data/read transport: {e}")))
+        })?;
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
             let text = resp

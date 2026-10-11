@@ -113,10 +113,12 @@ fn p_opt_u32(params: &Value, key: &str) -> Option<u32> {
 
 /// Dispatch one parsed request against the server's Core.
 pub fn dispatch(core: &Core, req: &RpcRequest) -> RpcResponse {
-    match handle(core, &req.method, &req.params) {
-        Ok(v) => RpcResponse::Ok(v),
-        Err(e) => RpcResponse::Err(e),
-    }
+    crate::metrics::time(&format!("srv.rpc.{}", req.method), || {
+        match handle(core, &req.method, &req.params) {
+            Ok(v) => RpcResponse::Ok(v),
+            Err(e) => RpcResponse::Err(e),
+        }
+    })
 }
 
 fn handle(core: &Core, method: &str, params: &Value) -> Result<Value> {

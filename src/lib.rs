@@ -17,6 +17,7 @@ pub mod fuse;
 pub mod winfsp;
 
 pub mod metadata;
+pub mod metrics;
 pub mod object_store;
 pub mod rpc;
 pub mod server;

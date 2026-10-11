@@ -450,6 +450,7 @@ impl S3ObjectStore {
 
 impl ObjectStore for S3ObjectStore {
     fn put(&self, key: &str, data: &[u8]) -> Result<ObjectInfo> {
+        let _g = crate::metrics::scope("s3.put");
         // Same key + same content on retry: idempotent.
         with_retry(|| {
             let (url, headers) = self.signed("PUT", Some(key), "", data);
@@ -474,6 +475,7 @@ impl ObjectStore for S3ObjectStore {
     }
 
     fn get(&self, key: &str, range: Option<Range>) -> Result<ObjectData> {
+        let _g = crate::metrics::scope("s3.get");
         // GET is read-only: retrying cannot change server state.
         with_retry(|| {
             let (url, headers) = self.signed("GET", Some(key), "", b"");
@@ -525,10 +527,12 @@ impl ObjectStore for S3ObjectStore {
     }
 
     fn get_stream(&self, key: &str, range: Option<Range>) -> Result<(Box<dyn Read + Send>, u64)> {
+        let _g = crate::metrics::scope("s3.get_stream");
         S3ObjectStore::get_stream(self, key, range)
     }
 
     fn put_stream(&self, key: &str, reader: &mut dyn Read, len: u64) -> Result<ObjectInfo> {
+        let _g = crate::metrics::scope("s3.put_stream");
         // S3 multipart upload: every part is an ordinary Content-Length'd
         // PUT, so bytes stream in bounded 8 MiB buffers (plain chunked
         // unsigned PUTs are rejected by S3/MinIO with 411).
@@ -651,6 +655,7 @@ impl ObjectStore for S3ObjectStore {
     }
 
     fn head(&self, key: &str) -> Result<ObjectInfo> {
+        let _g = crate::metrics::scope("s3.head");
         with_retry(|| {
             let (url, headers) = self.signed("HEAD", Some(key), "", b"");
             let resp = self
@@ -676,6 +681,7 @@ impl ObjectStore for S3ObjectStore {
     }
 
     fn delete(&self, key: &str) -> Result<()> {
+        let _g = crate::metrics::scope("s3.delete");
         // S3 DELETE is idempotent by spec (204 whether or not the key
         // existed), so a retried delete cannot resurrect or duplicate.
         with_retry(|| {

@@ -69,17 +69,28 @@ CFGEOF
 echo $! > "$RUN/server.pid"
 wait_http http://127.0.0.1:18095/health || fail "lightfs server up"
 
-"$DEPLOY_DIR/lightfs" mount --config "$RUN/cfg.toml" "$MNT" >"$RUN/mount.log" 2>&1 &
+LIGHTFS_METRICS=1 LIGHTFS_METRICS_FILE="$RUN/mount-metrics.txt" \
+    "$DEPLOY_DIR/lightfs" mount --config "$RUN/cfg.toml" "$MNT" >"$RUN/mount.log" 2>&1 &
 echo $! > "$RUN/mount.pid"
 for _ in $(seq 1 100); do mountpoint -q "$MNT" && break; sleep 0.2; done
 mountpoint -q "$MNT" || fail "lightfs mount up"
 
 cleanup() {
-    kill -9 "$(cat "$RUN/mount.pid")" 2>/dev/null || true
-    kill -9 "$(cat "$RUN/server.pid")" 2>/dev/null || true
+    # graceful unmount FIRST: the mount process flushes its metrics file
+    # in the FUSE destroy callback; kill -9 would lose it
     fusermount3 -u "$MNT" 2>/dev/null || fusermount -u "$MNT" 2>/dev/null \
         || umount -l "$MNT" 2>/dev/null || true
+    sleep 0.5
+    kill -9 "$(cat "$RUN/mount.pid")" 2>/dev/null || true
+    kill -9 "$(cat "$RUN/server.pid")" 2>/dev/null || true
     kill -9 "$(cat "$RUN/minio.pid")" 2>/dev/null || true
+}
+
+dump_metrics() {
+    echo "== mount-side metrics (top 15 by total) =="
+    grep -v '^op ' "$RUN/mount-metrics.txt" 2>/dev/null | head -16 || echo "  (no metrics file)"
+    echo "== server-side metrics (top 11 by total) =="
+    curl -s --noproxy '*' http://127.0.0.1:18095/metrics 2>/dev/null | grep -v '^op ' | head -12 || true
 }
 trap cleanup EXIT
 
@@ -170,13 +181,24 @@ for i in range(n):
 PY
 }
 t0; gen_storm "$MNT"; t1 "create+write+close $NFILES files (mount)"
-t0; find "$MNT/node_modules" -type f | wc -l >/dev/null; t1 "find (readdir+stat scan, mount)"
+t0; find "$MNT/node_modules" -type f | wc -l >/dev/null; t1 "find -type f (recursive enumeration, mount)"
 t0; rm -rf "$MNT/node_modules"; t1 "rm -rf storm (mount)"
 t0; gen_storm "$LOC"; t1 "create+write+close $NFILES files (local disk)"
 t0; find "$LOC/node_modules" -type f | wc -l >/dev/null; t1 "find (local disk)"
 t0; rm -rf "$LOC/node_modules"; t1 "rm -rf storm (local disk)"
 
 echo "== optional: real npm install on the mount =="
+if [[ -n "$GIT_REPO_SRC" && -d "$DEST/.git" ]]; then
+    echo "== control: same real repo on the LOCAL DISK =="
+    t0; rm -rf "$LOC/repo-local"; git clone -q "$GIT_REPO_SRC" "$LOC/repo-local" 2>/dev/null || git clone -q "$DEST" "$LOC/repo-local"; t1 "git clone -> local disk"
+    t0; (cd "$LOC/repo-local" && git status --porcelain >/dev/null); t1 "git status (local disk)"
+    t0; (cd "$LOC/repo-local" && git status --porcelain >/dev/null); t1 "git status warm (local disk)"
+    rm -rf "$LOC/repo-local"
+fi
+
+echo "== attribution: op metrics =="
+dump_metrics
+
 if command -v npm >/dev/null 2>&1; then
     mkdir -p "$MNT/npmapp"
     printf '{"name":"app","version":"1.0.0"}\n' > "$MNT/npmapp/package.json"
@@ -191,6 +213,21 @@ if command -v npm >/dev/null 2>&1; then
     fi
 else
     echo "  npm not installed - skipped"
+fi
+# same install on the LOCAL disk: separates registry/network time from
+# filesystem time (same network, same package tree)
+if command -v npm >/dev/null 2>&1; then
+    mkdir -p "$LOC/npmapp"
+    printf '{"name":"app","version":"1.0.0"}\n' > "$LOC/npmapp/package.json"
+    t0
+    if (cd "$LOC/npmapp" && timeout "$NPM_TIMEOUT" npm install $NPM_PACKAGES \
+        --registry=https://registry.npmmirror.com --no-audit --no-fund \
+        --loglevel=error >/dev/null 2>&1); then
+        t1 "npm install $NPM_PACKAGES (local disk, same network)"
+    else
+        echo "  npm install $NPM_PACKAGES (local disk) did not finish either"
+    fi
+    rm -rf "$LOC/npmapp"
 fi
 
 echo "GIT/SMALLFILE WORKLOAD PERF DONE (run dir $RUN)"

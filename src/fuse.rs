@@ -311,7 +311,14 @@ fn drained_overlay(drained: &std::collections::BTreeMap<u64, Vec<u8>>, content: 
 }
 
 impl Filesystem for FuseAdapter {
+    fn destroy(&self) {
+        // Unmount is the only reliable exit of the mount process - flush
+        // the benchmark instrument to LIGHTFS_METRICS_FILE if configured.
+        crate::metrics::dump_to_file_if_configured();
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let _g = crate::metrics::scope("fuse.lookup");
         let parent_path = match self.path_of(parent) {
             Ok(p) => p,
             Err(e) => return reply.error(e),
@@ -331,6 +338,7 @@ impl Filesystem for FuseAdapter {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        let _g = crate::metrics::scope("fuse.getattr");
         let path = match self.path_of(ino) {
             Ok(p) => p,
             Err(e) => return reply.error(e),
@@ -371,6 +379,7 @@ impl Filesystem for FuseAdapter {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        let _g = crate::metrics::scope("fuse.setattr");
         let path = match self.path_of(ino) {
             Ok(p) => p,
             Err(e) => return reply.error(e),
@@ -444,6 +453,7 @@ impl Filesystem for FuseAdapter {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        let _g = crate::metrics::scope("fuse.readdir");
         let path = match self.path_of(ino) {
             Ok(p) => p,
             Err(e) => return reply.error(e),
@@ -490,6 +500,7 @@ impl Filesystem for FuseAdapter {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        let _g = crate::metrics::scope("fuse.mkdir");
         let parent_path = match self.path_of(parent) {
             Ok(p) => p,
             Err(e) => return reply.error(e),
@@ -518,6 +529,7 @@ impl Filesystem for FuseAdapter {
         _flags: i32,
         reply: ReplyCreate,
     ) {
+        let _g = crate::metrics::scope("fuse.create");
         let _ = umask;
         let parent_path = match self.path_of(parent) {
             Ok(p) => p,
@@ -544,6 +556,7 @@ impl Filesystem for FuseAdapter {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let _g = crate::metrics::scope("fuse.open");
         let write_intent = flags.acc_mode() != fuser::OpenAccMode::O_RDONLY;
         if write_intent {
             let path = match self.path_of(ino) {
@@ -570,6 +583,7 @@ impl Filesystem for FuseAdapter {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        let _g = crate::metrics::scope("fuse.read");
         let path = match self.path_of(ino) {
             Ok(p) => p,
             Err(e) => return reply.error(e),
@@ -592,6 +606,7 @@ impl Filesystem for FuseAdapter {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        let _g = crate::metrics::scope("fuse.write");
         let mut writes = self.writes.lock().unwrap();
         let Some(state) = writes.get_mut(&fh.0) else {
             return reply.error(Errno::EIO);
@@ -621,6 +636,7 @@ impl Filesystem for FuseAdapter {
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
+        let _g = crate::metrics::scope("fuse.flush");
         match self.commit_write(fh.0) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),
@@ -637,6 +653,7 @@ impl Filesystem for FuseAdapter {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        let _g = crate::metrics::scope("fuse.release");
         // Anything flush did not commit commits here (best effort). The
         // kernel ignores release's return value, so a failed final commit
         // is only observable in this log - flush()/fsync() are the paths
@@ -672,6 +689,7 @@ impl Filesystem for FuseAdapter {
         datasync: bool,
         reply: ReplyEmpty,
     ) {
+        let _g = crate::metrics::scope("fuse.fsync");
         // Our commit writes content AND bumps the metadata version in one
         // atomic CAS, so datasync and full fsync both reduce to committing
         // the session's pending chunks. Errors propagate to fsync(2).
@@ -683,6 +701,7 @@ impl Filesystem for FuseAdapter {
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let _g = crate::metrics::scope("fuse.unlink");
         let parent_path = match self.path_of(parent) {
             Ok(p) => p,
             Err(e) => return reply.error(e),
@@ -702,6 +721,7 @@ impl Filesystem for FuseAdapter {
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let _g = crate::metrics::scope("fuse.rmdir");
         let parent_path = match self.path_of(parent) {
             Ok(p) => p,
             Err(e) => return reply.error(e),
@@ -729,6 +749,7 @@ impl Filesystem for FuseAdapter {
         _flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
+        let _g = crate::metrics::scope("fuse.rename");
         let old_parent = match self.path_of(parent) {
             Ok(p) => p,
             Err(e) => return reply.error(e),
@@ -779,6 +800,7 @@ pub fn mount(
     mountpoint: &str,
     allow_other: bool,
 ) -> crate::error::Result<()> {
+    crate::metrics::init_from_env();
     let adapter = FuseAdapter::new(fs);
     // fuser 0.18: Config is non_exhaustive (mutate the default), and
     // allow_other moved from a mount option into SessionACL.

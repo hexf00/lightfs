@@ -67,6 +67,7 @@ pub fn serve(engine: Engine, bind: &str) -> Result<()> {
 
 /// Run the accept loop on an existing server (tests can bind port 0 first).
 pub fn serve_on(server: tiny_http::Server, engine: Engine) -> Result<()> {
+    crate::metrics::init_from_env();
     let server = Arc::new(server);
     let core = engine.core.clone();
     let workers = worker_count();
@@ -95,7 +96,12 @@ fn handle_request(mut req: tiny_http::Request, core: &Core) {
             let resp = tiny_http::Response::from_string("ok\n");
             let _ = req.respond(resp);
         }
+        tiny_http::Method::Get if url == "/metrics" => {
+            let resp = tiny_http::Response::from_string(crate::metrics::dump());
+            let _ = req.respond(resp);
+        }
         tiny_http::Method::Post if url == "/rpc" => {
+            let _g = crate::metrics::scope("srv.rpc.total");
             let mut body = Vec::new();
             let too_large = req
                 .as_reader()
@@ -122,6 +128,7 @@ fn handle_request(mut req: tiny_http::Request, core: &Core) {
         // Binary data endpoints: file bytes travel raw (no base64, no JSON
         // envelope around the payload). Metadata stays on /rpc.
         tiny_http::Method::Post if url == "/data/read" => {
+            let _g = crate::metrics::scope("srv.data.read");
             let mut body = Vec::new();
             let too_large = req
                 .as_reader()
@@ -173,6 +180,8 @@ fn handle_request(mut req: tiny_http::Request, core: &Core) {
             }
         }
         tiny_http::Method::Post if url == "/data/write" => {
+            let _g = crate::metrics::scope("srv.data.write");
+
             let path = req
                 .headers()
                 .iter()
