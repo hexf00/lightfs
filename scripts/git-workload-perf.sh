@@ -32,8 +32,20 @@ for bin in lightfs lightfs-shell minio; do
     [[ -x "$DEPLOY_DIR/$bin" ]] || fail "$bin missing at $DEPLOY_DIR"
 done
 
-t0() { T0=$(date +%s%N); }
-t1() { echo "  $1: $(( ($(date +%s%N) - T0) / 1000000 )) ms"; }
+# Wall-clock via bash's builtin EPOCHREALTIME (bash >= 5): busybox date
+# (alpine) does not support +%N and silently degrades every interval to
+# "0 ms" - which is exactly what one full container run did before this
+# fix. macOS bash 3.2 lacks EPOCHREALTIME; falls back to whole seconds.
+t0() { T0="${EPOCHREALTIME:-$(date +%s)}"; }
+t1() {
+    local end="${EPOCHREALTIME:-$(date +%s)}" ms
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then
+        ms=$(awk -v a="$end" -v b="$T0" 'BEGIN{printf "%.0f", (a-b)*1000}')
+    else
+        ms=$(( (end - T0) * 1000 ))
+    fi
+    echo "  $1: ${ms} ms"
+}
 wait_http() {
     for _ in $(seq 1 100); do
         curl -s --noproxy '*' -m 1 -o /dev/null "$1" && return 0
