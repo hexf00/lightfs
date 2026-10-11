@@ -146,9 +146,10 @@ if [[ -n "$GIT_REPO_SRC" ]]; then
     t0; (cd "$DEST" && git status --porcelain >/dev/null); t1 "git status (first run on fresh clone)"
     t0; (cd "$DEST" && git status --porcelain >/dev/null); t1 "git status (warm)"
     t0; (cd "$DEST" && git log --oneline | head -5 >/dev/null); t1 "git log"
-    (cd "$DEST" && git ls-files '*.js' | head -50 | while read -r f; do
-        echo delta >> "$f"
-    done)
+    # head -50 closes the pipe early; under pipefail that SIGPIPEs
+    # git ls-files and set -e would kill the script (known shell trap)
+    (cd "$DEST" && git ls-files '*.js' | head -50 > "$RUN/js50.txt" || true)
+    while read -r f; do echo delta >> "$DEST/$f"; done < "$RUN/js50.txt"
     t0; (cd "$DEST" && git add -A); t1 "git add -A (50 modified files)"
     t0; (cd "$DEST" && git commit -qm delta); t1 "git commit"
 else
