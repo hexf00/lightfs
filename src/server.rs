@@ -59,8 +59,31 @@ fn sweep_stale_staging() {
 
 pub fn serve(engine: Engine, bind: &str) -> Result<()> {
     sweep_stale_staging();
-    let server = tiny_http::Server::http(bind)
+    let listener = std::net::TcpListener::bind(bind)
         .map_err(|e| Error::Config(format!("cannot bind {bind}: {e}")))?;
+    // Accepted sockets inherit TCP_NODELAY on Linux. Without it tiny_http's
+    // multi-write responses hit the Nagle x delayed-ACK stall: one ~40ms
+    // freeze per response whose tail is not a full segment (the readdir
+    // 41ms signature). macOS does not inherit it; dev hosts are not the
+    // latency-sensitive target.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let one: libc::c_int = 1;
+        // SAFETY: plain setsockopt on a live listener fd with a valid
+        // c_int pointer; failure is perf-only, so the result is ignored.
+        unsafe {
+            libc::setsockopt(
+                listener.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_NODELAY,
+                &one as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+    let server = tiny_http::Server::from_listener(listener, None)
+        .map_err(|e| Error::Config(format!("cannot serve {bind}: {e}")))?;
     eprintln!("lightfs server listening on {bind}");
     serve_on(server, engine)
 }
@@ -89,15 +112,23 @@ pub fn serve_on(server: tiny_http::Server, engine: Engine) -> Result<()> {
     Ok(())
 }
 
+// tiny_http switches to chunked transfer above 32KiB: each chunk starts with
+// a tiny size line, which Nagle holds until the peer's delayed ACK fires
+// (~40ms) — one stall per large response (the readdir 41ms signature).
+// Identity + Content-Length writes full segments and skips the stall.
+fn unchunked<R: std::io::Read>(resp: tiny_http::Response<R>) -> tiny_http::Response<R> {
+    resp.with_chunked_threshold(usize::MAX)
+}
+
 fn handle_request(mut req: tiny_http::Request, core: &Core) {
     let url = req.url().split('?').next().unwrap_or("/").to_string();
     match req.method() {
         tiny_http::Method::Get if url == "/health" => {
-            let resp = tiny_http::Response::from_string("ok\n");
+            let resp = unchunked(tiny_http::Response::from_string("ok\n"));
             let _ = req.respond(resp);
         }
         tiny_http::Method::Get if url == "/metrics" => {
-            let resp = tiny_http::Response::from_string(crate::metrics::dump());
+            let resp = unchunked(tiny_http::Response::from_string(crate::metrics::dump()));
             let _ = req.respond(resp);
         }
         tiny_http::Method::Post if url == "/rpc" => {
@@ -122,7 +153,7 @@ fn handle_request(mut req: tiny_http::Request, core: &Core) {
             let header =
                 tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
                     .unwrap();
-            let resp = tiny_http::Response::from_string(json).with_header(header);
+            let resp = unchunked(tiny_http::Response::from_string(json)).with_header(header);
             let _ = req.respond(resp);
         }
         // Binary data endpoints: file bytes travel raw (no base64, no JSON
@@ -167,13 +198,13 @@ fn handle_request(mut req: tiny_http::Request, core: &Core) {
                         len.to_string().as_bytes(),
                     )
                     .unwrap();
-                    let resp = tiny_http::Response::new(
+                    let resp = unchunked(tiny_http::Response::new(
                         tiny_http::StatusCode(200),
                         vec![header, len_header],
                         reader,
                         Some(len as usize),
                         None,
-                    );
+                    ));
                     let _ = req.respond(resp);
                 }
                 Err(e) => respond_error(req, &e),
@@ -317,13 +348,16 @@ fn handle_request(mut req: tiny_http::Request, core: &Core) {
                         &b"application/json"[..],
                     )
                     .unwrap();
-                    let _ = req.respond(tiny_http::Response::from_string(json).with_header(header));
+                    let _ = req.respond(unchunked(
+                        tiny_http::Response::from_string(json).with_header(header),
+                    ));
                 }
                 Err(e) => respond_error(req, &e),
             }
         }
         _ => {
-            let resp = tiny_http::Response::from_string("not found\n").with_status_code(404);
+            let resp =
+                unchunked(tiny_http::Response::from_string("not found\n")).with_status_code(404);
             let _ = req.respond(resp);
         }
     }
@@ -343,9 +377,11 @@ fn respond_error(req: tiny_http::Request, e: &Error) {
     };
     let header =
         tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
-    let resp = tiny_http::Response::from_string(body)
-        .with_status_code(status)
-        .with_header(header);
+    let resp = unchunked(
+        tiny_http::Response::from_string(body)
+            .with_status_code(status)
+            .with_header(header),
+    );
     let _ = req.respond(resp);
 }
 

@@ -162,35 +162,46 @@ impl Client {
     }
 
     fn call(&self, method: &str, params: Value) -> Result<Value> {
-        let _g = crate::metrics::scope("client.rpc");
-        let body = json!({"id": 1, "method": method, "params": params}).to_string();
-        let mut resp = self
-            .agent
-            .post(format!("{}/rpc", self.url))
-            .header("Content-Type", "application/json")
-            .send(body.as_bytes())
-            .map_err(|e| Error::Io(format!("rpc transport: {e}")))?;
-        let status = resp.status().as_u16();
-        let text = resp
-            .body_mut()
-            .with_config()
-            .limit(MAX_RESPONSE_BODY)
-            .read_to_string()
-            .map_err(|e| Error::Io(e.to_string()))?;
-        if status != 200 {
-            return Err(Error::Io(format!("rpc http {status}")));
-        }
-        let env: RpcEnvelope =
-            serde_json::from_str(&text).map_err(|e| Error::Io(format!("rpc json: {e}")))?;
-        if env.ok {
-            Ok(env.result)
-        } else {
-            let e = env.error.unwrap_or(RpcErrorWire {
-                code: "IO".into(),
-                message: "unknown server error".into(),
-            });
-            Err(wire_to_error(&e))
-        }
+        let slow_t0 = std::time::Instant::now();
+        // Per-method client-side timing (the aggregate "client.rpc" row of
+        // a dump is the sum of these): transport + serialization + response
+        // processing as seen by the caller, one attribution level above the
+        // server's own srv.rpc.<method> rows.
+        let out = crate::metrics::time_with_name(
+            || format!("client.rpc.{method}"),
+            || {
+                let body = json!({"id": 1, "method": method, "params": params}).to_string();
+                let mut resp = self
+                    .agent
+                    .post(format!("{}/rpc", self.url))
+                    .header("Content-Type", "application/json")
+                    .send(body.as_bytes())
+                    .map_err(|e| Error::Io(format!("rpc transport: {e}")))?;
+                let status = resp.status().as_u16();
+                let text = resp
+                    .body_mut()
+                    .with_config()
+                    .limit(MAX_RESPONSE_BODY)
+                    .read_to_string()
+                    .map_err(|e| Error::Io(e.to_string()))?;
+                if status != 200 {
+                    return Err(Error::Io(format!("rpc http {status}")));
+                }
+                let env: RpcEnvelope =
+                    serde_json::from_str(&text).map_err(|e| Error::Io(format!("rpc json: {e}")))?;
+                if env.ok {
+                    Ok(env.result)
+                } else {
+                    let e = env.error.unwrap_or(RpcErrorWire {
+                        code: "IO".into(),
+                        message: "unknown server error".into(),
+                    });
+                    Err(wire_to_error(&e))
+                }
+            },
+        );
+        slowlog(method, &params, slow_t0.elapsed());
+        out
     }
 
     fn write_node(
@@ -542,5 +553,54 @@ impl Client {
         let node = node_from_json(&v)?;
         self.after_mutation(path);
         Ok(node)
+    }
+}
+
+/// Slow-RPC log (diagnosis instrument, opt-in): when LIGHTFS_RPC_SLOWLOG
+/// names a file, calls slower than LIGHTFS_RPC_SLOWLOG_MS (default 10)
+/// append `<unix_us> <thread> <ms> <method> <path-hint>`. Exists because
+/// aggregate histograms cannot answer WHERE in wall-clock time the slow
+/// calls cluster and what the other FUSE callback threads are doing at
+/// that moment.
+fn slowlog(method: &str, params: &Value, elapsed: std::time::Duration) {
+    static CFG: std::sync::LazyLock<Option<(std::path::PathBuf, u64)>> =
+        std::sync::LazyLock::new(|| {
+            let path = std::env::var("LIGHTFS_RPC_SLOWLOG").ok()?;
+            let ms: u64 = std::env::var("LIGHTFS_RPC_SLOWLOG_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10);
+            Some((std::path::PathBuf::from(path), ms))
+        });
+    let Some((path, threshold_ms)) = CFG.as_ref() else {
+        return;
+    };
+    if elapsed.as_millis() < u128::from(*threshold_ms) {
+        return;
+    }
+    let path_hint = params
+        .get("path")
+        .and_then(|p| p.as_str())
+        .unwrap_or("")
+        .to_string();
+    let us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            f,
+            "{} {:?} {} {} {}",
+            us,
+            std::thread::current().id(),
+            elapsed.as_millis(),
+            method,
+            path_hint
+        );
     }
 }

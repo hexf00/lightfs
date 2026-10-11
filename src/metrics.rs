@@ -88,6 +88,25 @@ fn record(op: &str, elapsed: Duration) {
     }
 }
 
+/// Record an already-measured duration (sub-phase instrumentation inside
+/// a larger scope; no-op when disabled). Static op name.
+pub fn observe(op: &'static str, elapsed: Duration) {
+    record(op, elapsed);
+}
+
+/// Like `time` but builds the op name lazily so disabled runs pay no
+/// allocation (dynamic names: `client.rpc.<method>`).
+pub fn time_with_name<F, T>(make_op: impl FnOnce() -> String, f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    if !enabled() {
+        return f();
+    }
+    let op = make_op();
+    time(&op, f)
+}
+
 /// RAII timer: `let _g = metrics::scope("fuse.getattr");` - binds the
 /// guard to the enclosing scope (do NOT write `let _ =`, which drops
 /// immediately and records nothing).

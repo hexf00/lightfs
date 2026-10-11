@@ -29,11 +29,23 @@ use crate::error::Error;
 use crate::metadata::Node;
 use crate::writeback::PendingWrite;
 
-const ATTR_TTL: Duration = Duration::from_secs(1);
-
 /// Paginated readdir snapshot (per ino+fh, stamped when fetched).
 type DirCacheKey = (u64, u64);
 type DirSnapshot = (Vec<(u64, FileType, String)>, std::time::Instant);
+
+/// Cached full listing for a directory (offset==0 refetch suppression).
+/// EXPERIMENT-ONLY (C1 TTL sweep): default OFF. Entries are dropped on
+/// any LOCAL namespace mutation (create/mkdir/unlink/rmdir/rename), so
+/// own writes stay POSIX-visible and only CROSS-client changes age out
+/// with the TTL - that aging window is exactly what the sweep measures.
+type DirentCache = HashMap<String, (Vec<Node>, std::time::Instant)>;
+
+fn secs_env(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
 
 pub struct FuseAdapter {
     fs: std::sync::Arc<dyn FsApi>,
@@ -58,6 +70,13 @@ pub struct FuseAdapter {
     /// than replaying a silently stale list; LIGHTFS_FUSE_DIR_SNAPSHOT_SECS
     /// overrides (A12 exercises eviction with a short TTL).
     dir_snapshot_ttl: std::time::Duration,
+    /// How long lookup/attr replies may be cached by the kernel
+    /// (LIGHTFS_FUSE_ATTR_TTL_SECS, default 1; 0 = ask every time).
+    attr_ttl: Duration,
+    /// Cross-walk listing cache (LIGHTFS_FUSE_DIRENT_CACHE_SECS, default
+    /// 0 = off). See DirentCache docs - C1 experiment knob.
+    dirent_cache: Mutex<DirentCache>,
+    dirent_ttl: Duration,
     /// In-flight EOF per path (see writeback::PendingEof): appends derive
     /// their offset from our view of the file size, and stat coherence.
     pending: std::sync::LazyLock<crate::writeback::PendingEof>,
@@ -124,12 +143,8 @@ impl FuseAdapter {
         // interactive walk by a wide margin; the env knob exists so the
         // slow-pagination regression (acceptance A12) can exercise the
         // eviction path in seconds instead of half a minute.
-        let dir_snapshot_ttl = std::time::Duration::from_secs(
-            std::env::var("LIGHTFS_FUSE_DIR_SNAPSHOT_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(30),
-        );
+        let dir_snapshot_ttl =
+            std::time::Duration::from_secs(secs_env("LIGHTFS_FUSE_DIR_SNAPSHOT_SECS", 30));
         Self {
             fs,
             inodes: Mutex::new(inodes),
@@ -137,6 +152,9 @@ impl FuseAdapter {
             paths: Mutex::new(HashMap::new()),
             dir_cache: Mutex::new(HashMap::new()),
             dir_snapshot_ttl,
+            attr_ttl: Duration::from_secs(secs_env("LIGHTFS_FUSE_ATTR_TTL_SECS", 1)),
+            dirent_cache: Mutex::new(HashMap::new()),
+            dirent_ttl: Duration::from_secs(secs_env("LIGHTFS_FUSE_DIRENT_CACHE_SECS", 0)),
             pending: std::sync::LazyLock::new(crate::writeback::PendingEof::new),
             next_fh: AtomicU64::new(1),
             uid,
@@ -155,6 +173,41 @@ impl FuseAdapter {
 
     fn ino_of_path(&self, path: &str) -> Option<u64> {
         self.paths.lock().unwrap().get(path).copied()
+    }
+
+    /// "." / ".." plus one entry per child, the reply-loop shape shared by
+    /// fresh fetches and dirent-cache hits.
+    fn build_dir_entries(
+        &self,
+        dir_ino: u64,
+        path: &str,
+        children: &[Node],
+    ) -> Vec<(u64, FileType, String)> {
+        let mut entries: Vec<(u64, FileType, String)> = Vec::with_capacity(children.len() + 2);
+        entries.push((dir_ino, FileType::Directory, ".".to_string()));
+        let parent_ino = match path.rfind('/') {
+            Some(0) | None => 1u64,
+            Some(i) => self.ino_of_path(&path[..i]).unwrap_or(1),
+        };
+        entries.push((parent_ino, FileType::Directory, "..".to_string()));
+        for c in children {
+            let kind = if c.is_dir() {
+                FileType::Directory
+            } else {
+                FileType::RegularFile
+            };
+            entries.push((c.id as u64, kind, c.name.clone()));
+        }
+        entries
+    }
+
+    /// Drop every cached listing: any LOCAL namespace mutation invalidates
+    /// (own writes must be immediately visible), so the dirent cache can
+    /// only delay CROSS-client changes by at most the TTL.
+    fn dirent_invalidate(&self) {
+        if self.dirent_ttl > Duration::ZERO {
+            self.dirent_cache.lock().unwrap().clear();
+        }
     }
 
     fn forget_path(&self, path: &str) {
@@ -366,7 +419,7 @@ impl Filesystem for FuseAdapter {
             Ok(node) => {
                 self.remember(node.id as u64, &parent_path, name);
                 reply.entry(
-                    &ATTR_TTL,
+                    &self.attr_ttl,
                     &attr_for(&node, self.uid, self.gid),
                     fuser::Generation(0),
                 );
@@ -391,7 +444,7 @@ impl Filesystem for FuseAdapter {
                     // derive offsets from this; stat coherence expects it.
                     attr.size = in_flight;
                 }
-                reply.attr(&ATTR_TTL, &attr)
+                reply.attr(&self.attr_ttl, &attr)
             }
             Err(e) => reply.error(errno(&e)),
         }
@@ -478,7 +531,7 @@ impl Filesystem for FuseAdapter {
                 .as_secs() as i64,
         });
         match self.fs.setattr(&path, mode, mtime_secs) {
-            Ok(node) => reply.attr(&ATTR_TTL, &attr_for(&node, self.uid, self.gid)),
+            Ok(node) => reply.attr(&self.attr_ttl, &attr_for(&node, self.uid, self.gid)),
             Err(e) => reply.error(errno(&e)),
         }
     }
@@ -497,43 +550,65 @@ impl Filesystem for FuseAdapter {
             Err(e) => return reply.error(e),
         };
         let cache_key = (ino.0, _fh.0);
+        // Sub-phase accounting (closes the time ledger inside this
+        // callback): lock wait, offset==0 fetch (client RPC + client-side
+        // processing), snapshot assembly, offset>0 replay. Any residual
+        // between the fuse.readdir total and these rows is kernel-side
+        // queueing before the callback runs.
         let entries = {
+            let lock_t0 = std::time::Instant::now();
             let mut cache = self.dir_cache.lock().unwrap();
+            crate::metrics::observe("fuse.readdir.lock", lock_t0.elapsed());
             // evict stale snapshots lazily (a walk that outlives the TTL
             // gets a fresh list on its next offset==0 page anyway)
             cache.retain(|_, (_, t)| t.elapsed() < self.dir_snapshot_ttl);
             if offset == 0 {
-                let children = match self.fs.readdir(&path) {
-                    Ok(c) => c,
-                    Err(e) => return reply.error(errno(&e)),
+                // C1 experiment knob: TTL>0 suppresses offset==0 refetches
+                // across walks (default 0 = fetch every time). Stale
+                // entries age out here; LOCAL mutations drop everything
+                // (see dirent_invalidate), so only CROSS-client changes
+                // can be observed late.
+                let cached = if self.dirent_ttl > Duration::ZERO {
+                    let mut listing = self.dirent_cache.lock().unwrap();
+                    listing.retain(|_, (_, t)| t.elapsed() < self.dirent_ttl);
+                    listing.get(&path).map(|(c, _)| {
+                        crate::metrics::observe("fuse.readdir.dirent_hit", Duration::ZERO);
+                        c.clone()
+                    })
+                } else {
+                    None
                 };
-                let mut entries: Vec<(u64, FileType, String)> =
-                    Vec::with_capacity(children.len() + 2);
-                entries.push((ino.0, FileType::Directory, ".".to_string()));
-                let parent_ino = match path.as_str() {
-                    "/" => 1u64,
-                    _ => {
-                        let parent_path = match path.rfind('/') {
-                            Some(0) | None => "/".to_string(),
-                            Some(i) => path[..i].to_string(),
+                let children = match cached {
+                    Some(c) => c,
+                    None => {
+                        let fetch_t0 = std::time::Instant::now();
+                        let c = match self.fs.readdir(&path) {
+                            Ok(c) => c,
+                            Err(e) => return reply.error(errno(&e)),
                         };
-                        self.ino_of_path(&parent_path).unwrap_or(1)
+                        crate::metrics::observe("fuse.readdir.fetch", fetch_t0.elapsed());
+                        if self.dirent_ttl > Duration::ZERO {
+                            self.dirent_cache
+                                .lock()
+                                .unwrap()
+                                .insert(path.clone(), (c.clone(), std::time::Instant::now()));
+                        }
+                        c
                     }
                 };
-                entries.push((parent_ino, FileType::Directory, "..".to_string()));
-                for c in &children {
-                    let kind = if c.is_dir() {
-                        FileType::Directory
-                    } else {
-                        FileType::RegularFile
-                    };
-                    entries.push((c.id as u64, kind, c.name.clone()));
-                }
+                let build_t0 = std::time::Instant::now();
+                let entries = self.build_dir_entries(ino.0, &path, &children);
                 cache.insert(cache_key, (entries.clone(), std::time::Instant::now()));
+                crate::metrics::observe("fuse.readdir.build", build_t0.elapsed());
                 entries
             } else {
+                let replay_t0 = std::time::Instant::now();
                 match cache.get(&cache_key) {
-                    Some((entries, _)) => entries.clone(),
+                    Some((entries, _)) => {
+                        let out = entries.clone();
+                        crate::metrics::observe("fuse.readdir.replay", replay_t0.elapsed());
+                        out
+                    }
                     None => {
                         // page without a snapshot (kernel restart, cache
                         // eviction): refetch and replay from the top is
@@ -586,9 +661,10 @@ impl Filesystem for FuseAdapter {
         let path = Self::child_path(&parent_path, name);
         match self.fs.mkdir(&path, mode & 0o7777) {
             Ok(node) => {
+                self.dirent_invalidate();
                 self.remember(node.id as u64, &parent_path, name);
                 reply.entry(
-                    &ATTR_TTL,
+                    &self.attr_ttl,
                     &attr_for(&node, self.uid, self.gid),
                     fuser::Generation(0),
                 );
@@ -619,10 +695,11 @@ impl Filesystem for FuseAdapter {
             Ok((node, fh))
         }) {
             Ok((node, fh)) => {
+                self.dirent_invalidate();
                 self.pending.drop_path(&path);
                 self.remember(node.id as u64, &parent_path, name);
                 reply.created(
-                    &ATTR_TTL,
+                    &self.attr_ttl,
                     &attr_for(&node, self.uid, self.gid),
                     fuser::Generation(0),
                     fuser::FileHandle(fh),
@@ -787,6 +864,7 @@ impl Filesystem for FuseAdapter {
         let path = Self::child_path(&parent_path, name);
         match self.fs.unlink(&path) {
             Ok(()) => {
+                self.dirent_invalidate();
                 let victim = self.ino_of_path(&path);
                 if let Some(ino) = victim {
                     self.inodes.lock().unwrap().remove(&ino);
@@ -807,6 +885,7 @@ impl Filesystem for FuseAdapter {
         let path = Self::child_path(&parent_path, name);
         match self.fs.rmdir(&path) {
             Ok(()) => {
+                self.dirent_invalidate();
                 self.forget_path(&path);
                 reply.ok()
             }
@@ -837,6 +916,7 @@ impl Filesystem for FuseAdapter {
         let new_path = Self::child_path(&new_parent, newname);
         match self.fs.rename(&old_path, &new_path) {
             Ok(()) => {
+                self.dirent_invalidate();
                 self.pending.drop_path(&old_path);
                 self.pending.drop_path(&new_path);
                 // Repoint cached paths of the moved subtree (only entries the
@@ -893,6 +973,18 @@ pub fn mount(
     } else {
         fuser::SessionACL::Owner
     };
+    // fuser defaults to n_threads=1: a SINGLE callback thread serves every
+    // request, so the whole filesystem serializes at one in-flight op -
+    // K parallel writers measured a flat 101 ops/s regardless of K (each
+    // close/flush costs ~9ms of S3 PUT; one thread caps at ~1/9ms).
+    // Scale the callback pool with the machine; the adapter is Sync (all
+    // mutable state sits behind Mutexes).
+    config.n_threads = Some(
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(2, 16),
+    );
     let result = fuser::mount(adapter, std::path::Path::new(mountpoint), &config)
         .map_err(|e| crate::error::Error::Config(format!("mount failed: {e}")));
     // Session over (unmount or kernel abort): flush the benchmark
