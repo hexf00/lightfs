@@ -271,10 +271,24 @@ jobs:
             if (-not $ok) { throw "drive Q: still present after mount process kill" }
             "UNMOUNT OK"
           }
-          finally {
-            foreach ($p in $procs) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
-            if (Test-Path mount.pid) { Stop-Process -Id (Get-Content mount.pid) -Force -ErrorAction SilentlyContinue }
+          catch {
+            Write-Host ("EXCEPTION: " + ($_ | Out-String))
+            exit 1
           }
+          finally {
+            foreach ($p in $procs) {
+              if (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) {
+                Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+              }
+            }
+            if (Test-Path mount.pid) {
+              $mp = Get-Process -Id (Get-Content mount.pid) -ErrorAction SilentlyContinue
+              if ($mp) { Stop-Process -Id $mp.Id -Force -ErrorAction SilentlyContinue }
+            }
+          }
+          # pwsh exits 1 when the final pipeline state is false (e.g. a
+          # suppressed cleanup error); success must be explicit.
+          exit 0
 
       - name: Dump logs on failure
         if: failure()
