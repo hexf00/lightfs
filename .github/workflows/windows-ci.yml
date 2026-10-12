@@ -134,12 +134,14 @@ jobs:
           }
           .\bin\lightfs.exe create-bucket --config D:\lightfs-accept\cfg.toml
           try {
-            & .\bin\lightfs-accept.exe `
-              --lightfs .\bin\lightfs.exe `
-              --shell .\bin\lightfs-shell.exe `
-              --config D:\lightfs-accept\cfg.toml `
-              --mount-target R: `
-              --section a --section b --section c --section w
+            # --section takes ONE comma-separated list (each flag REPLACES the
+            # set, it does not accumulate). cmd-level redirection keeps the
+            # suite output on disk even when the step log itself is not
+            # readable: the failure dump step republishes its tail as error
+            # annotations, which the checks API serves anonymously.
+            cmd /c ".\bin\lightfs-accept.exe --lightfs .\bin\lightfs.exe --shell .\bin\lightfs-shell.exe --config D:\lightfs-accept\cfg.toml --mount-target R: --section a,b,c,w > D:\lightfs-accept\accept.out 2>&1"
+            Write-Output "lightfs-accept exit code: $LASTEXITCODE"
+            Get-Content D:\lightfs-accept\accept.out -Tail 15 -ErrorAction SilentlyContinue
             exit $LASTEXITCODE
           }
           finally {
@@ -155,6 +157,21 @@ jobs:
           foreach ($f in 'D:\lightfs-accept\mount.err','D:\lightfs-accept\server.err','D:\lightfs-accept\minio.err') {
             if (Test-Path $f) { "===== $f ====="; Get-Content $f }
           }
+          # Republish tails as error annotations: the checks API serves them
+          # anonymously, unlike step logs / artifacts (both need auth).
+          function Emit([string]$name, [string]$path, [int]$tail) {
+            if (-not (Test-Path $path)) { Write-Output "::error file=$name::(missing)"; return }
+            $lines = @(Get-Content $path -Tail $tail -ErrorAction SilentlyContinue |
+              ForEach-Object { $_ -replace '%', '%25' })
+            if ($lines.Count -eq 0) { Write-Output "::error file=$name::(empty)"; return }
+            $body = $lines -join '%0A'
+            if ($body.Length -gt 3000) { $body = '...' + $body.Substring($body.Length - 3000) }
+            Write-Output "::error file=$name::$body"
+          }
+          Emit 'accept.out' 'D:\lightfs-accept\accept.out' 60
+          Emit 'mount.err' 'D:\lightfs-accept\mount.err' 30
+          Emit 'server.err' 'D:\lightfs-accept\server.err' 30
+          Emit 'minio.err' 'D:\lightfs-accept\minio.err' 15
 
       - name: Upload acceptance log
         if: always()
