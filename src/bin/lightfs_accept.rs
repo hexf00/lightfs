@@ -578,7 +578,9 @@ fn section_a(ctx: &Ctx, root: &Path) {
     // mutations must converge within the TTL, local ones immediately.
     // The mount runs with the default LIGHTFS_FUSE_ATTR_TTL_SECS=1, so
     // every convergence bound below is TTL + generous slack.
-    if ctx.sections_want("a") && cfg!(unix) {
+    // adapter-only: the cross-client side needs the second RPC client,
+    // which --selftest (no server) does not have.
+    if ctx.adapter && ctx.sections_want("a") && cfg!(unix) {
         println!("  A13 readdirplus lookup cache (cross-client bounds)");
         let dir = root.join("a13");
         std::fs::create_dir_all(&dir).expect("A13 mkdir");
@@ -758,19 +760,43 @@ fn section_a(ctx: &Ctx, root: &Path) {
         let e = symlink("real.txt", dir.join("real.txt")).unwrap_err();
         assert_eq!(e.raw_os_error(), Some(libc::EEXIST));
 
-        // dot-dot above the mount root stays INSIDE the mount: /../x
-        // resolves to <mount>/x, so it dangles instead of escaping
-        symlink("/../escaped-the-mount", dir.join("esc")).expect("A14 esc link");
+        // Absolute-target semantics (review decision E1-F1a, NFS-style):
+        // under a real FUSE mount the KERNEL resolves absolute link targets
+        // against the CALLING PROCESS root - they can and do land OUTSIDE
+        // the LightFS mount. The Core/RPC path instead clamps at the
+        // virtual root (chroot). Both sides are asserted here against a
+        // marker this test creates and removes, never against host state.
+        let marker_host =
+            std::env::temp_dir().join(format!("lightfs-a14-marker-{}", std::process::id()));
+        std::fs::write(&marker_host, b"HOST-MARKER").expect("A14 host marker");
+        symlink(&marker_host, dir.join("abs-host")).expect("A14 abs-host link");
         assert_eq!(
-            std::fs::read_link(dir.join("esc"))
-                .unwrap()
-                .to_string_lossy(),
-            "/../escaped-the-mount"
+            std::fs::read_link(dir.join("abs-host")).unwrap(),
+            marker_host,
+            "readlink must return the stored target verbatim"
         );
-        assert!(
-            std::fs::metadata(dir.join("esc")).is_err(),
-            ".. above the mount root must not reach the host filesystem"
+        // kernel-side resolution reaches the host file: the selected
+        // semantics, asserted on purpose
+        assert_eq!(
+            std::fs::read(dir.join("abs-host")).unwrap(),
+            b"HOST-MARKER",
+            "FUSE resolves absolute targets against the caller root (NFS-style)"
         );
+        // Core/RPC-side resolution clamps at the virtual root: the same
+        // link read through the RPC client must NOT reach the host file
+        // (adapter-only: --selftest has no server to ask)
+        if ctx.adapter {
+            let (ok, body) = rpc_call(
+                &ctx.rpc_url(),
+                "read",
+                "{\"path\":\"/a14/abs-host\",\"offset\":0,\"size\":64}",
+            );
+            assert!(
+                !ok && body.contains("NOT_FOUND"),
+                "Core/RPC must clamp absolute targets at the virtual root, got ok={ok} {body}"
+            );
+        }
+        let _ = std::fs::remove_file(&marker_host);
 
         // same name file+link coexistence: distinct inodes, distinct kinds
         symlink("real.txt", dir.join("twin")).expect("A14 twin link");
@@ -781,27 +807,119 @@ fn section_a(ctx: &Ctx, root: &Path) {
 
         println!("    OK A14 symlinks (all 10 behaviors)");
     }
+
+    // A15 symlink + double-rename + open-fd read observation (E1 finding 3).
+    // A single unexplained anomaly (a 5-byte read where 4 were written) was
+    // observed once in manual testing and never reproduced. This case pins
+    // the EXACT original operation order and fails LOUDLY on the first
+    // mismatch - no retries, no tolerance - with a diagnostics dump written
+    // into the workdir. Limited rounds run in the gate; the longer sweep
+    // lives behind the "stress" section (see stress_a15 below).
+    #[cfg(unix)]
+    if ctx.adapter && ctx.sections_want("a") {
+        println!("  A15 symlink+rename+fd observation (10 rounds)");
+        run_a15_rounds(ctx, root, 10, "A15");
+    }
 }
 
-/// Minimal raw-HTTP RPC used by A13 to act as a second (out-of-band)
-/// client while the mount under test stays connected.
-fn rpc_post(server_url: &str, method: &str, params: &str) {
+/// A15 rounds: the observation case from E1 finding 3, repeated. Strict
+/// byte+length assertions; the first mismatch appends diagnostics to the
+/// workdir and panics - a retry loop here would be masking, not testing.
+#[cfg(unix)]
+fn run_a15_rounds(ctx: &Ctx, root: &Path, rounds: usize, label: &str) {
+    let dir = root.join("a15");
+    std::fs::create_dir_all(&dir).expect("A15 mkdir");
+    let data = b"Race";
+    let data_b64 = "UmFjZQ==";
+    for i in 0..rounds {
+        let tag = format!("{i}");
+        let link = dir.join(format!("l{tag}"));
+        let link2 = dir.join(format!("l2-{tag}"));
+        let file = dir.join(format!("t{tag}"));
+        let file2 = dir.join(format!("t2-{tag}"));
+
+        rpc_post(
+            &ctx.rpc_url(),
+            "write",
+            &format!("{{\"path\":\"/a15/t{tag}\",\"data\":\"{data_b64}\"}}"),
+        );
+        rpc_post(
+            &ctx.rpc_url(),
+            "symlink",
+            &format!("{{\"path\":\"/a15/l{tag}\",\"target\":\"t{tag}\"}}"),
+        );
+        // The original reproduction order: open THROUGH the link, rename
+        // the link, rename the target, then read from the still-open fd.
+        let cpath = std::ffi::CString::new(link.to_str().unwrap()).unwrap();
+        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY) };
+        assert!(fd >= 0, "{label} iter {i}: open via link failed");
+        let msg = format!("{label} iter {i}: link rename");
+        std::fs::rename(&link, &link2).expect(&msg);
+        let msg = format!("{label} iter {i}: target rename");
+        std::fs::rename(&file, &file2).expect(&msg);
+        let mut buf = [0u8; 100];
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        unsafe { libc::close(fd) };
+        let got = &buf[..n.max(0) as usize];
+        if n != data.len() as isize || got != data {
+            let diag = format!(
+                "{label} MISMATCH iter {i}: expected {:?} (4 bytes), read n={n} bytes {:?}\n\
+                 dir state: l={:?} l2={:?} t={:?} t2={:?}\n",
+                data,
+                got,
+                std::fs::read_link(&link).is_ok(),
+                std::fs::read_link(&link2).is_ok(),
+                file.exists(),
+                file2.exists(),
+            );
+            let diag_path = ctx.workdir.join(format!("{label}-mismatch.log"));
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&diag_path)
+                .and_then(|mut f| f.write_all(diag.as_bytes()))
+                .ok();
+            eprintln!("{diag}diagnostics appended to {}", diag_path.display());
+            let p = diag_path.display();
+            panic!("{label} iter {i}: fd read returned wrong bytes - see {p}");
+        }
+        // cleanup for the next round
+        let _ = std::fs::remove_file(&link2);
+        let _ = std::fs::remove_file(&file2);
+    }
+    println!("    OK {label} ({rounds} rounds, all byte-exact)");
+}
+
+/// Long repetition entry for the A15 observation case: run with
+/// `lightfs-accept --sections stress ...` against a real mount.
+#[cfg(unix)]
+fn stress_a15(ctx: &Ctx, root: &Path) {
+    println!("--- stress: A15 observation x200 ---");
+    run_a15_rounds(ctx, root, 200, "STRESS-A15");
+}
+
+/// Minimal raw-HTTP RPC used by A13/A14/A15 to act as a second (out-of-band)
+/// client while the mount under test stays connected. Returns
+/// (ok, full response text) so callers can assert on failures too.
+fn rpc_call(server_url: &str, method: &str, params: &str) -> (bool, String) {
     use std::io::{Read, Write};
     let addr = server_url.trim_start_matches("http://");
-    let mut s = std::net::TcpStream::connect(addr).expect("A13 rpc connect");
+    let mut s = std::net::TcpStream::connect(addr).expect("rpc connect");
     let body = format!("{{\"id\":1,\"method\":\"{method}\",\"params\":{params}}}");
     let req = format!(
         "POST /rpc HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );
-    s.write_all(req.as_bytes()).expect("A13 rpc write");
+    s.write_all(req.as_bytes()).expect("rpc write");
     let mut resp = String::new();
-    s.read_to_string(&mut resp).expect("A13 rpc read");
-    assert!(
-        resp.contains("\"ok\":true"),
-        "A13 rpc {method} failed: {resp}"
-    );
+    s.read_to_string(&mut resp).expect("rpc read");
+    (resp.contains("\"ok\":true"), resp)
+}
+
+fn rpc_post(server_url: &str, method: &str, params: &str) {
+    let (ok, resp) = rpc_call(server_url, method, params);
+    assert!(ok, "rpc {method} failed: {resp}");
 }
 
 fn section_b(ctx: &mut Ctx, root: &Path) {
@@ -1117,6 +1235,10 @@ fn main() {
     }
     if ctx.sections_want("c") {
         section_c(&mut ctx, &root);
+    }
+    #[cfg(unix)]
+    if ctx.sections_want("stress") {
+        stress_a15(&ctx, &root);
     }
 
     println!(
