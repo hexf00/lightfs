@@ -1585,6 +1585,54 @@ fn section_w(ctx: &Ctx, root: &Path) {
     );
     println!("  OK   W8 out-of-band link nodes observed and recorded (see INFO lines)");
 
+    // W9 rmdir: empty / nonexistent / non-empty / nested chain, plus the
+    // post-delete namespace state. Win32 error translation differs from
+    // POSIX errno, so exact codes are RECORDED; success/failure and
+    // namespace consistency are asserted. The one file seed goes through
+    // the strong path (plain close defers its commit on Windows).
+    let e9 = dir.join("w9-empty");
+    std::fs::create_dir(&e9).expect("W9 mkdir empty target");
+    std::fs::remove_dir(&e9).expect("W9 rmdir empty dir");
+    assert!(!e9.exists(), "W9: removed empty dir must be gone");
+    println!("  OK   W9 rmdir empty dir succeeds, name gone");
+    match std::fs::remove_dir(dir.join("w9-never-existed")) {
+        Err(e) => println!(
+            "  INFO W9 rmdir nonexistent -> {} (raw={:?})",
+            e,
+            e.raw_os_error()
+        ),
+        Ok(()) => panic!("W9: rmdir of a nonexistent dir must fail"),
+    }
+    let ne = dir.join("w9-nonempty");
+    std::fs::create_dir(&ne).expect("W9 mkdir nonempty target");
+    write_strong(&ne.join("child.txt"), b"keep", "W9 seed");
+    match std::fs::remove_dir(&ne) {
+        Err(e) => println!(
+            "  INFO W9 rmdir non-empty -> {} (raw={:?})",
+            e,
+            e.raw_os_error()
+        ),
+        Ok(()) => panic!("W9: rmdir of a non-empty dir must fail"),
+    }
+    assert!(
+        std::fs::read(ne.join("child.txt")).as_deref() == Ok(b"keep".as_slice()),
+        "W9: refused rmdir must keep the child intact"
+    );
+    std::fs::remove_file(ne.join("child.txt")).expect("W9 rm child");
+    std::fs::remove_dir(&ne).expect("W9 rmdir after emptying");
+    println!("  OK   W9 rmdir non-empty refused; emptied dir then removes");
+    let na = dir.join("w9-n");
+    std::fs::create_dir_all(na.join("b").join("c")).expect("W9 mkdir nested");
+    std::fs::remove_dir(na.join("b").join("c")).expect("W9 rmdir c");
+    std::fs::remove_dir(na.join("b")).expect("W9 rmdir b");
+    std::fs::remove_dir(&na).expect("W9 rmdir a");
+    let names = dir_names(&dir);
+    assert!(
+        !names.iter().any(|n| n.starts_with("w9-")),
+        "W9: every w9 name must be gone after the nested teardown, got {names:?}"
+    );
+    println!("  OK   W9 nested chain (a/b/c) tears down leaf-first, namespace clean");
+
     println!("    OK W: Windows semantics section complete");
 }
 
