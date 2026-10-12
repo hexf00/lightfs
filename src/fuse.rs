@@ -360,6 +360,16 @@ impl FuseAdapter {
             if state.committed {
                 return Ok(());
             }
+            if state.orphaned {
+                // The name died while the handle was open (unlink, or the
+                // rename that overwrote it). POSIX: writes into the
+                // disembodied inode succeed but go nowhere - drop the
+                // batch, succeed, and never look the name up again (it
+                // may already belong to a different file).
+                state.chunks.drain();
+                state.committed = true;
+                return Ok(());
+            }
             let drained = state.chunks.drain();
             if drained.is_empty() {
                 // A write-intent open that never wrote: commit nothing, or
@@ -924,6 +934,16 @@ impl Filesystem for FuseAdapter {
         // `echo x > f` in bash closes the redirect fd before the child
         // writes, so a committed session may receive further writes — re-arm
         // it by re-reading the current version (post-flush-commit).
+        // The orphaned check MUST come first: a committed+orphaned session
+        // carries a blanked path, and that lookup would turn into a
+        // spurious ENOENT for a write POSIX says must succeed.
+        if state.orphaned {
+            // Disembodied inode (unlinked / renamed over): accept the
+            // write and drop it - POSIX unlink semantics for open fds.
+            // Buffering it would leak into `pending` for a name that no
+            // longer exists (or worse, one a new file now owns).
+            return reply.written(data.len() as u32);
+        }
         if state.committed {
             match self.fs.lookup(&state.path) {
                 Ok(node) => state.expected_version = node.version,
@@ -984,7 +1004,10 @@ impl Filesystem for FuseAdapter {
             .lock()
             .unwrap()
             .get(&fh.0)
-            .map(|st| st.path.clone());
+            .map(|st| st.path.clone())
+            // orphaned sessions carry a blank path: nothing left to
+            // recompute, and the name may belong to a different file now
+            .filter(|p| !p.is_empty());
         if let Err(e) = self.commit_write(fh.0) {
             eprintln!(
                 "lightfs-fuse: WARNING release: final commit FAILED for fh={} ({}): {e} - data not persisted",
@@ -1034,6 +1057,20 @@ impl Filesystem for FuseAdapter {
                 let victim = self.ino_of_path(&path);
                 if let Some(ino) = victim {
                     self.inodes.lock().unwrap().remove(&ino);
+                }
+                // A handle opened before the unlink must not resurrect the
+                // name at commit time: orphan its session (batch drops,
+                // close(2) succeeds - POSIX unlink semantics for open fds).
+                // `path` is blanked so path-scanning helpers cannot alias
+                // a new file created under the recycled name.
+                {
+                    let mut writes = self.writes.lock().unwrap();
+                    for st in writes.values_mut() {
+                        if st.path == path {
+                            st.orphaned = true;
+                            st.path.clear();
+                        }
+                    }
                 }
                 self.pending.drop_path(&path);
                 reply.ok()
@@ -1085,6 +1122,32 @@ impl Filesystem for FuseAdapter {
                 self.dirent_invalidate();
                 self.pending.drop_path(&old_path);
                 self.pending.drop_path(&new_path);
+                // Open write handles ride along: repoint their paths so
+                // the commit looks the file up under its CURRENT name
+                // (rename_node only moves parent/name - the CAS anchor
+                // version is untouched). A handle on an overwritten
+                // destination just lost its inode's last name: orphan it
+                // (batch drops, close succeeds) so it can neither error
+                // the close nor alias the incoming file under the
+                // recycled name. rename(a, a) is a no-op - never orphan
+                // or repoint the mover itself.
+                if new_path != old_path {
+                    let mut writes = self.writes.lock().unwrap();
+                    for st in writes.values_mut() {
+                        if st.path == new_path {
+                            st.orphaned = true;
+                            st.path.clear();
+                        }
+                    }
+                    let prefix = format!("{old_path}/");
+                    for st in writes.values_mut() {
+                        if st.path == old_path {
+                            st.path = new_path.clone();
+                        } else if st.path.starts_with(&prefix) {
+                            st.path = format!("{new_path}{}", &st.path[old_path.len()..]);
+                        }
+                    }
+                }
                 // Repoint cached paths of the moved subtree (only entries the
                 // kernel has looked up are in the map).
                 let mut map = self.inodes.lock().unwrap();

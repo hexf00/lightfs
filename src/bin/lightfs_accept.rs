@@ -1142,6 +1142,179 @@ fn section_c(ctx: &mut Ctx, root: &Path) {
         println!("  OK  C3b shell client sees the same namespace");
     }
 
+    // C6 rename/unlink with open write handles (J1). A handle must keep
+    // writing to the SAME inode the kernel renamed, committing under the
+    // CURRENT name (rename moves parent/name only - the CAS anchor version
+    // is untouched); a handle whose name died (unlink, or the rename that
+    // overwrote it) must close cleanly and must never resurrect or alias
+    // a recycled name.
+    #[cfg(unix)]
+    if ctx.adapter && ctx.sections_want("c") {
+        println!("  C6 rename/unlink with open write handles");
+        let d = root.join("c6");
+        let d2 = root.join("c6d2");
+        std::fs::create_dir_all(&d).expect("C6 mkdir");
+        std::fs::create_dir_all(&d2).expect("C6 mkdir d2");
+
+        // a) same-dir rename, keep writing, strong fsync: the commit must
+        //    look the inode up under the NEW name and succeed there.
+        let want_a = b"AAAA-j1-same-dir+after-rename";
+        let fa = d.join("a.txt");
+        let mut h = open_create(&fa);
+        write_at(&mut h, 0, b"AAAA-j1-same-dir");
+        std::fs::rename(&fa, d.join("a2.txt")).expect("C6a: rename with open write handle failed");
+        write_at(&mut h, 16, b"+after-rename");
+        flush_strong(&mut h, "C6a fsync after rename");
+        drop(h);
+        if fa.exists() {
+            panic!("C6a: old name still present after rename");
+        }
+        assert_bytes(
+            "C6a renamed-handle content under new name",
+            &d.join("a2.txt"),
+            want_a,
+        );
+
+        // b) cross-directory rename, same contract.
+        let want_b = b"BBBB-j1-cross-dir+tail";
+        let fb = d.join("b.txt");
+        let mut h = open_create(&fb);
+        write_at(&mut h, 0, b"BBBB-j1-cross-dir");
+        std::fs::rename(&fb, d2.join("b2.txt")).expect("C6b: cross-dir rename failed");
+        write_at(&mut h, 17, b"+tail");
+        flush_strong(&mut h, "C6b fsync after cross-dir rename");
+        drop(h);
+        if fb.exists() {
+            panic!("C6b: old name still present after cross-dir rename");
+        }
+        assert_bytes(
+            "C6b cross-dir renamed-handle content",
+            &d2.join("b2.txt"),
+            want_b,
+        );
+
+        // c) plain close after rename (no fsync): commit rides close's
+        //    flush on Linux (synchronous) and the async close path on
+        //    Windows - assert the SHARED contract: eventual visibility.
+        let fc = d.join("plain.txt");
+        {
+            let mut h = open_create(&fc);
+            write_at(&mut h, 0, b"PLAIN-j1-close-after-rename");
+            std::fs::rename(&fc, d.join("plain2.txt")).expect("C6c rename failed");
+        } // plain close
+        let t0 = Instant::now();
+        loop {
+            if std::fs::read(d.join("plain2.txt")).ok().as_deref()
+                == Some(b"PLAIN-j1-close-after-rename".as_slice())
+            {
+                break;
+            }
+            if t0.elapsed() > Duration::from_secs(10) {
+                panic!("C6c: close-after-rename data not visible within 10s");
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        if fc.exists() {
+            panic!("C6c: old name reappeared");
+        }
+
+        // d) rename OVER an open destination: the overwritten handle lost
+        //    its inode's last name - it must close cleanly and its
+        //    buffered data must NOT land in (or alias) the recycled name.
+        let ft = d.join("ovr-target.txt");
+        let fsrc = d.join("ovr-src.txt");
+        let mut ht = open_create(&ft);
+        write_at(&mut ht, 0, b"TARGET-OLD+stray-into-dead-inode");
+        let mut hs = open_create(&fsrc);
+        write_at(&mut hs, 0, b"SRC-NEW-DATA");
+        std::fs::rename(&fsrc, &ft).expect("C6d: rename over open destination failed");
+        drop(hs); // commits SRC-NEW-DATA under ovr-target.txt
+        write_at(&mut ht, 11, b"-STRAY"); // disembodied inode: accepted, dropped
+        drop(ht); // must close cleanly (commit is a no-op drop)
+        let t0 = Instant::now();
+        loop {
+            if std::fs::read(&ft).ok().as_deref() == Some(b"SRC-NEW-DATA".as_slice()) {
+                break;
+            }
+            if t0.elapsed() > Duration::from_secs(10) {
+                panic!("C6d: moved content not visible under recycled name within 10s");
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        // Give a WRONGLY-routed stray commit time to surface before judging.
+        std::thread::sleep(Duration::from_millis(300));
+        let got = std::fs::read(&ft).unwrap_or_default();
+        if got != b"SRC-NEW-DATA" {
+            panic!("C6d: overwritten handle's data leaked into the recycled name: {got:?}");
+        }
+
+        // e) unlink with an open write handle: writes keep succeeding
+        //    (POSIX), close(2) returns 0, the name must stay gone.
+        let fe = d.join("gone.txt");
+        let path_c = std::ffi::CString::new(fe.to_str().unwrap()).unwrap();
+        let fd = unsafe {
+            libc::open(
+                path_c.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                0o644,
+            )
+        };
+        assert!(fd >= 0, "C6e: open failed");
+        let w = b"NEVER-COMMITTED-j1";
+        let n = unsafe { libc::pwrite(fd, w.as_ptr() as *const libc::c_void, w.len(), 0) };
+        assert_eq!(n, w.len() as isize, "C6e: pwrite failed");
+        std::fs::remove_file(&fe).expect("C6e: unlink failed");
+        let w2 = b"-still-open";
+        let n = unsafe {
+            libc::pwrite(
+                fd,
+                w2.as_ptr() as *const libc::c_void,
+                w2.len(),
+                w.len() as i64,
+            )
+        };
+        assert_eq!(
+            n,
+            w2.len() as isize,
+            "C6e: write to unlinked handle must succeed (POSIX)"
+        );
+        let rc = unsafe { libc::close(fd) };
+        assert_eq!(
+            rc, 0,
+            "C6e: close after unlink must succeed (POSIX open-fd semantics)"
+        );
+        if fe.exists() {
+            panic!("C6e: unlinked name resurrected by the open handle's commit");
+        }
+
+        // f) existing error semantics survive: file->dir and dir->file
+        //    renames still fail.
+        std::fs::create_dir(d.join("adir")).expect("C6f mkdir");
+        if std::fs::rename(d.join("a2.txt"), d.join("adir")).is_ok() {
+            panic!("C6f: rename file onto directory must fail");
+        }
+        if std::fs::rename(d.join("adir"), d.join("a2.txt")).is_ok() {
+            panic!("C6f: rename directory onto file must fail");
+        }
+
+        // g) unmount + remount: every C6 outcome survives restart byte-exact.
+        ctx.kill_mount();
+        ctx.start_mount();
+        println!("MOUNTED (after C6 restart)");
+        assert_bytes("C6g a2.txt after remount", &d.join("a2.txt"), want_a);
+        assert_bytes("C6g b2.txt after remount", &d2.join("b2.txt"), want_b);
+        assert_bytes(
+            "C6g plain2.txt after remount",
+            &d.join("plain2.txt"),
+            b"PLAIN-j1-close-after-rename",
+        );
+        assert_bytes("C6g ovr-target.txt after remount", &ft, b"SRC-NEW-DATA");
+        if fe.exists() {
+            panic!("C6g: unlinked name appeared after remount");
+        }
+        println!("  OK  C6 rename/unlink with open write handles (a-g)");
+    }
+
     // C4 clean shutdown: the drive must disappear with the mount process.
     ctx.kill_mount();
     println!("  OK  C4 unmount on process death");

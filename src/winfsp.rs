@@ -422,6 +422,16 @@ fn commit_write(fh: u64) -> Result<(), Error> {
         if sess.committed {
             return Ok(());
         }
+        if sess.orphaned {
+            // The name died while the handle was open (unlink, or the
+            // rename that overwrote it). POSIX: writes into the
+            // disembodied inode succeed but go nowhere - drop the batch,
+            // succeed, and never look the name up again (it may already
+            // belong to a different file). Mirrors fuse.rs::commit_write.
+            sess.chunks.drain();
+            sess.committed = true;
+            return Ok(());
+        }
         let drained = sess.chunks.drain();
         if drained.is_empty() {
             sess.committed = true;
@@ -652,6 +662,13 @@ unsafe extern "system" fn cb_write(
         let Some(sess) = writes.get_mut(&fh) else {
             return -EIO;
         };
+        if sess.orphaned {
+            // Disembodied inode (unlinked / renamed over): accept the
+            // write and drop it - POSIX unlink semantics for open fds.
+            // MUST run before the committed re-arm below: the blanked
+            // session path would turn that lookup into a spurious ENOENT.
+            return size as c_int;
+        }
         if sess.committed {
             // New writes after a flush (Windows may flush and keep the handle
             // open): re-arm against the current committed version.
@@ -802,6 +819,19 @@ unsafe extern "system" fn cb_unlink(path: *const c_char) -> c_int {
         };
         match state().unlink(path) {
             Ok(()) => {
+                // A handle opened before the unlink must not resurrect the
+                // name at commit time: orphan its session (batch drops,
+                // close succeeds - POSIX unlink semantics for open fds).
+                // Mirrors fuse.rs::unlink.
+                {
+                    let mut writes = WRITES.lock().unwrap();
+                    for sess in writes.values_mut() {
+                        if sess.path == path {
+                            sess.orphaned = true;
+                            sess.path.clear();
+                        }
+                    }
+                }
                 PENDING.drop_path(path);
                 0
             }
@@ -831,6 +861,27 @@ unsafe extern "system" fn cb_rename(old: *const c_char, new: *const c_char) -> c
         };
         match state().rename(old, new) {
             Ok(()) => {
+                // Open write handles ride along: repoint their paths so the
+                // commit looks the file up under its CURRENT name; a handle
+                // on an overwritten destination just lost its inode's last
+                // name - orphan it. Mirrors fuse.rs::rename.
+                if new != old {
+                    let mut writes = WRITES.lock().unwrap();
+                    for sess in writes.values_mut() {
+                        if sess.path == new {
+                            sess.orphaned = true;
+                            sess.path.clear();
+                        }
+                    }
+                    let prefix = format!("{old}/");
+                    for sess in writes.values_mut() {
+                        if sess.path == old {
+                            sess.path = new.to_string();
+                        } else if sess.path.starts_with(&prefix) {
+                            sess.path = format!("{new}{}", &sess.path[old.len()..]);
+                        }
+                    }
+                }
                 PENDING.drop_path(old);
                 PENDING.drop_path(new);
                 0

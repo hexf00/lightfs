@@ -292,6 +292,14 @@ pub struct PendingWrite {
     pub chunks: ChunkMap,
     /// True once a commit succeeded AND no newer chunks arrived after it.
     pub committed: bool,
+    /// The name this session was opened under no longer exists (the file
+    /// was unlinked, or renamed over). POSIX semantics for such a
+    /// disembodied inode: writes still succeed but go nowhere, and the
+    /// commit must NOT look the name up again - it may have been recycled
+    /// by a brand-new file. `path` is blanked together with this flag so
+    /// every path-matching scan (overlay, visible_eof, recompute) can
+    /// never alias the new file.
+    pub orphaned: bool,
 }
 
 impl PendingWrite {
@@ -301,6 +309,7 @@ impl PendingWrite {
             expected_version,
             chunks: ChunkMap::new(),
             committed: false,
+            orphaned: false,
         }
     }
 
