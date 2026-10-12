@@ -61,7 +61,10 @@ fn main() {
                     break;
                 }
                 let payload = payload_for(seq, size);
-                let path = format!("/{prefix}/{seq:06}");
+                // Flat root-level path: write_stream's create needs an
+                // existing parent, and the probe does not create directories
+                // (root always exists).
+                let path = format!("/{prefix}-{seq:06}");
                 let t = Instant::now();
                 match client.write_from_reader(
                     &path,
