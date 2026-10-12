@@ -1119,6 +1119,32 @@ impl Filesystem for FuseAdapter {
     }
 }
 
+/// FUSE callback pool size. LIGHTFS_FUSE_THREADS overrides; unset keeps the
+/// historical default (available_parallelism, clamped to 2..=16 — fuser
+/// defaults to a single callback thread, which serializes the whole mount at
+/// one in-flight op). Unlike LIGHTFS_SERVER_WORKERS, an invalid explicit
+/// value is a hard error: silently falling back would make a measured
+/// concurrency knob lie about what ran.
+fn callback_threads() -> crate::error::Result<usize> {
+    let Ok(v) = std::env::var("LIGHTFS_FUSE_THREADS") else {
+        return Ok(std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(2, 16));
+    };
+    let n: usize = v.trim().parse().map_err(|_| {
+        Error::Config(format!(
+            "LIGHTFS_FUSE_THREADS: invalid value {v:?} (expected integer 2-16)"
+        ))
+    })?;
+    if !(2..=16).contains(&n) {
+        return Err(Error::Config(format!(
+            "LIGHTFS_FUSE_THREADS: {n} out of range (supported: 2-16)"
+        )));
+    }
+    Ok(n)
+}
+
 /// Mount entry point: `lightfs mount [--config PATH] [--allow-other] MOUNTPOINT`.
 pub fn mount(
     fs: std::sync::Arc<dyn FsApi>,
@@ -1139,18 +1165,9 @@ pub fn mount(
     } else {
         fuser::SessionACL::Owner
     };
-    // fuser defaults to n_threads=1: a SINGLE callback thread serves every
-    // request, so the whole filesystem serializes at one in-flight op -
-    // K parallel writers measured a flat 101 ops/s regardless of K (each
-    // close/flush costs ~9ms of S3 PUT; one thread caps at ~1/9ms).
-    // Scale the callback pool with the machine; the adapter is Sync (all
-    // mutable state sits behind Mutexes).
-    config.n_threads = Some(
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .clamp(2, 16),
-    );
+    // Scale the callback pool (see callback_threads); the adapter is Sync
+    // (all mutable state sits behind Mutexes).
+    config.n_threads = Some(callback_threads()?);
     let result = fuser::mount(adapter, std::path::Path::new(mountpoint), &config)
         .map_err(|e| crate::error::Error::Config(format!("mount failed: {e}")));
     // Session over (unmount or kernel abort): flush the benchmark
