@@ -75,6 +75,18 @@ fn part_budget() -> PartBudget {
         .clone()
 }
 
+/// Objects at or below this size take the plain single-PUT path instead of
+/// the multipart lifecycle. Aligned with the 8 MiB part size: the small
+/// buffer then never exceeds one multipart part buffer, so taking one
+/// permit from the same budget keeps the aggregate memory bound identical.
+const SMALL_PUT_MAX: u64 = 8 * 1024 * 1024;
+
+/// `len` is known up front for every put_stream call (the caller commits a
+/// complete object), so the branch is exact - no probing, no fallback.
+fn small_object(len: u64) -> bool {
+    len <= SMALL_PUT_MAX
+}
+
 impl PartBudget {
     /// Block until `n` permits are free, then take them. `n` must not exceed
     /// the total budget (callers cap batch size to the budget first).
@@ -533,6 +545,32 @@ impl ObjectStore for S3ObjectStore {
 
     fn put_stream(&self, key: &str, reader: &mut dyn Read, len: u64) -> Result<ObjectInfo> {
         let _g = crate::metrics::scope("s3.put_stream");
+        // Small objects: one plain Content-Length PUT instead of the full
+        // multipart lifecycle (init + part + complete = three sequential
+        // round trips per commit). E4-A measured that lifecycle at ~7.8ms
+        // per 2 KiB object against a 0.92ms raw single-PUT floor on the
+        // same MinIO, so every small-file commit paid it three times over.
+        // The buffer is exactly `len` bytes and holds one part-budget
+        // permit for the upload, matching how multipart buffers hold
+        // theirs - aggregate memory bound unchanged. CAS-failure cleanup
+        // and immutability semantics live in the caller (core write paths)
+        // and are untouched: this only changes HOW the object is uploaded.
+        if small_object(len) {
+            let wait_secs = std::env::var("LIGHTFS_S3_PART_WAIT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(30);
+            let permit = part_budget().acquire_timeout(1, wait_secs).map_err(|_| {
+                Error::Storage(format!(
+                    "multipart buffer budget busy: no permit within {wait_secs}s (a slow upload may be holding parts)"
+                ))
+            })?;
+            let mut buf = vec![0u8; len as usize];
+            reader.read_exact(&mut buf)?;
+            let info = self.put(key, &buf);
+            drop(permit); // free only after the upload, like multipart buffers
+            return info;
+        }
         // S3 multipart upload: every part is an ordinary Content-Length'd
         // PUT, so bytes stream in bounded 8 MiB buffers (plain chunked
         // unsigned PUTs are rejected by S3/MinIO with 411).
@@ -1002,6 +1040,17 @@ mod tests {
         });
         assert!(r.is_err());
         assert_eq!(calls, 1);
+    }
+
+    /// Single-PUT / multipart split: zero-byte and exactly-at-threshold
+    /// objects take the plain PUT, anything larger streams via multipart.
+    #[test]
+    fn small_object_boundary() {
+        assert!(small_object(0));
+        assert!(small_object(2048));
+        assert!(small_object(8 * 1024 * 1024));
+        assert!(!small_object(8 * 1024 * 1024 + 1));
+        assert!(!small_object(u64::MAX));
     }
 
     /// Budget semaphore: capacity, blocking, timeout, RAII release.
