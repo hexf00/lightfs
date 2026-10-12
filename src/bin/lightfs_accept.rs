@@ -1315,6 +1315,122 @@ fn section_c(ctx: &mut Ctx, root: &Path) {
         println!("  OK  C6 rename/unlink with open write handles (a-g)");
     }
 
+    // C7 detached-handle semantics, two-handle and read-path coverage (J-R1).
+    // Locks the CURRENT contract where it is intentional and correct; the
+    // read-path gaps are recorded, NOT asserted, until review picks a fix:
+    //  - unlink: a detached handle's read returns ENOENT (POSIX would keep
+    //    the bytes readable until the last close - candidate fix R-b);
+    //  - rename over an open target: the stale handle's read aliases the
+    //    NEW file's bytes (data-crossing defect - candidate fix R-a). The
+    //    write side is already safe (orphaned session drops, no cross-write).
+    #[cfg(unix)]
+    if ctx.adapter && ctx.sections_want("c") {
+        println!("  C7 detached-handle read/write semantics");
+        let d = root.join("c7");
+        std::fs::create_dir_all(&d).expect("C7 mkdir");
+
+        // a) unlink with two open handles: the surviving handle must neither
+        //    resurrect the name nor block later handles; close stays clean.
+        let fe = d.join("two-handles.txt");
+        let mut h1 = open_create(&fe);
+        write_at(&mut h1, 0, b"AAA-H1-UNCOMMITTED");
+        let h2 = std::fs::File::open(&fe).expect("C7a second independent handle");
+        std::fs::remove_file(&fe).expect("C7a unlink");
+        if fe.exists() {
+            panic!("C7a: unlinked name reappeared");
+        }
+        // Fresh open of the dead name must fail ENOENT (POSIX agrees).
+        match std::fs::File::open(&fe) {
+            Ok(_) => panic!("C7a: open of unlinked name must fail"),
+            Err(e) => {
+                if e.raw_os_error() != Some(libc::ENOENT) {
+                    panic!("C7a: open after unlink: {e}, want ENOENT");
+                }
+            }
+        }
+        // Detached-handle READ through the still-open h2: CURRENT contract
+        // is ENOENT (POSIX would serve the bytes until the last close -
+        // recorded gap, candidate fix R-b; do not weaken this assertion
+        // silently if the fix lands - flip it to the byte-exact check).
+        let mut h2r = h2;
+        let mut buf = [0u8; 64];
+        match std::io::Read::read(&mut h2r, &mut buf) {
+            Ok(_) => panic!(
+                "C7a: detached-handle read returned data - contract changed, \
+                 update this assertion to the R-b byte-exact check"
+            ),
+            Err(e) => {
+                if e.raw_os_error() != Some(libc::ENOENT) {
+                    panic!("C7a: detached-handle read: {e}, want ENOENT (R-b gap)");
+                }
+            }
+        }
+        // Writes through the still-open handle keep succeeding (POSIX) and
+        // fsync stays clean (orphaned session drops the batch).
+        write_at(&mut h1, 17, b"+H1-CONTINUES");
+        flush_strong(&mut h1, "C7a fsync on detached handle");
+        drop(h1);
+        drop(h2r); // second close after the first must also be clean
+        println!("    OK  C7a unlink: two handles, no resurrection, clean closes");
+
+        // b) rename OVER an open target: write-side isolation only (read
+        //    aliasing is the recorded R-a gap - do NOT assert reads here).
+        let fsrc = d.join("r-src.txt");
+        let ftgt = d.join("r-tgt.txt");
+        {
+            let mut f = open_create(&fsrc);
+            write_at(&mut f, 0, b"SSS-SRC-DATA");
+            flush_strong(&mut f, "C7b src seed");
+        }
+        {
+            let mut f = open_create(&ftgt);
+            write_at(&mut f, 0, b"TTT-OLD-TARGET");
+            flush_strong(&mut f, "C7b tgt seed");
+        }
+        let mut ht = open_create(&ftgt);
+        write_at(&mut ht, 13, b"+UNCOMMITTED-T2");
+        std::fs::rename(&fsrc, &ftgt).expect("C7b rename over open target");
+        write_at(&mut ht, 28, b"+STRAY"); // detached: accepted, dropped
+        flush_strong(&mut ht, "C7b fsync on overwritten handle");
+        drop(ht);
+        let t0 = Instant::now();
+        loop {
+            if std::fs::read(&ftgt).ok().as_deref() == Some(b"SSS-SRC-DATA".as_slice()) {
+                break;
+            }
+            if t0.elapsed() > Duration::from_secs(10) {
+                panic!("C7b: moved content not visible under target within 10s");
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let got = std::fs::read(&ftgt).unwrap_or_default();
+        if got != b"SSS-SRC-DATA" {
+            panic!("C7b: overwritten handle leaked data into the recycled name: {got:?}");
+        }
+        if fsrc.exists() {
+            panic!("C7b: source name still present");
+        }
+        println!("    OK  C7b rename-over-open-target: write isolation, no leak");
+
+        // c) remount: neither detached dataset nor dead names survive.
+        ctx.kill_mount();
+        ctx.start_mount();
+        println!("MOUNTED (after C7 restart)");
+        if fe.exists() {
+            panic!("C7c: unlinked name appeared after remount");
+        }
+        assert_bytes("C7c target after remount", &ftgt, b"SSS-SRC-DATA");
+        let leaked = std::fs::read_dir(&d)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains("two-handles"));
+        if leaked {
+            panic!("C7c: detached-handle file reappeared after remount");
+        }
+        println!("  OK  C7 detached-handle semantics (a-c; read gaps recorded in docs)");
+    }
+
     // C4 clean shutdown: the drive must disappear with the mount process.
     ctx.kill_mount();
     println!("  OK  C4 unmount on process death");
