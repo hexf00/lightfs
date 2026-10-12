@@ -30,7 +30,7 @@ use lightfs::config::Config;
 use lightfs::error::Result;
 use lightfs::object_store::ObjectStore;
 use lightfs::object_store::s3::{S3Config, S3ObjectStore};
-use lightfs::sigv4::{SigV4, uri_encode};
+use lightfs::sigv4::{SigV4, uri_encode, xml_extract_all};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -342,6 +342,121 @@ fn main() {
                 (du + ds).saturating_sub(cpu0.0 + cpu0.1)
             )
             .unwrap();
+        }
+        "lsb" => {
+            // Read-only ListBuckets against the REGION endpoint (no bucket in
+            // the host). Service-level GET / - used by the I0 audit to make
+            // sure no test bucket was created outside the recorded names.
+            let signer = signer_of(&s3cfg);
+            let bare = host_of(&s3cfg.endpoint);
+            let url_base = format!("{}://{}", scheme_of(&s3cfg.endpoint), bare);
+            let agent = probe_agent();
+            let url = format!("{url_base}/");
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let s = signer.sign("GET", &bare, "/", "", b"", now);
+            let mut resp = agent
+                .get(&url)
+                .header("x-amz-date", &s.amz_date)
+                .header("x-amz-content-sha256", &s.payload_hash)
+                .header("Authorization", &s.authorization)
+                .call()
+                .unwrap_or_else(|e| die(&format!("lsb transport: {e}")));
+            let status = resp.status().as_u16();
+            let body = resp
+                .body_mut()
+                .with_config()
+                .limit(64 * 1024 * 1024)
+                .read_to_string()
+                .unwrap_or_else(|e| die(&format!("lsb body: {e}")));
+            if !(200..300).contains(&status) {
+                die(&format!("lsb status {status}: {body}"));
+            }
+            for b in xml_extract_all(&body, "Name") {
+                writeln!(out, "bucket\t{b}").unwrap();
+            }
+            let all = xml_extract_all(&body, "Name").len();
+            writeln!(out, "# lsb total={all}").unwrap();
+        }
+        "ls" => {
+            // Read-only ListObjectsV2 with LastModified: the I0 audit needs
+            // object write times to attribute residue to a test window, and
+            // the runtime ListPage drops LastModified by design. One GET per
+            // page, nothing mutated.
+            let signer = signer_of(&s3cfg);
+            let host = vhost_of(&s3cfg);
+            let base = base_path_of(&s3cfg);
+            let url_base = url_base_of(&s3cfg);
+            let agent = probe_agent();
+            let mut token: Option<String> = None;
+            let mut total = 0usize;
+            loop {
+                let mut q: Vec<(String, String)> = vec![
+                    ("list-type".into(), "2".into()),
+                    ("prefix".into(), prefix.clone()),
+                    ("max-keys".into(), "1000".into()),
+                ];
+                if let Some(t) = &token {
+                    q.push(("continuation-token".into(), t.clone()));
+                }
+                q.sort();
+                let query: String = q
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", k, uri_encode(v, false)))
+                    .collect::<Vec<_>>()
+                    .join("&");
+                let path = format!("{}?{}", base, query);
+                let url = format!("{}{}", url_base, path);
+                // virtual-host style: bucket-level path is "" but S3/OSS
+                // canonicalize it to "/" in the canonical request (s3.rs
+                // bucket_url does the same).
+                let canonical_path = if base.is_empty() { "/" } else { base.as_str() };
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let s = signer.sign("GET", &host, canonical_path, &query, b"", now);
+                let mut resp = agent
+                    .get(&url)
+                    .header("x-amz-date", &s.amz_date)
+                    .header("x-amz-content-sha256", &s.payload_hash)
+                    .header("Authorization", &s.authorization)
+                    .call()
+                    .unwrap_or_else(|e| die(&format!("ls transport: {e}")));
+                let status = resp.status().as_u16();
+                let body = resp
+                    .body_mut()
+                    .with_config()
+                    .limit(64 * 1024 * 1024)
+                    .read_to_string()
+                    .unwrap_or_else(|e| die(&format!("ls body: {e}")));
+                if !(200..300).contains(&status) {
+                    die(&format!("ls status {status}: {body}"));
+                }
+                let keys = xml_extract_all(&body, "Key");
+                let sizes = xml_extract_all(&body, "Size");
+                let lms = xml_extract_all(&body, "LastModified");
+                for (i, k) in keys.iter().enumerate() {
+                    writeln!(
+                        out,
+                        "ls\t{}\t{}\t{}",
+                        k,
+                        sizes.get(i).map(|s| s.as_str()).unwrap_or("?"),
+                        lms.get(i).map(|s| s.as_str()).unwrap_or("?")
+                    )
+                    .unwrap();
+                }
+                total += keys.len();
+                token = xml_extract_all(&body, "NextContinuationToken")
+                    .into_iter()
+                    .next();
+                if token.is_none() {
+                    break;
+                }
+            }
+            writeln!(out, "# ls total={total} prefix={prefix}").unwrap();
         }
         "cleanup" => {
             // List + delete every object under --prefix, then re-list to
