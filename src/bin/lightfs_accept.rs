@@ -147,6 +147,21 @@ fn flush_strong(f: &mut std::fs::File, what: &str) {
         .unwrap_or_else(|e| panic!("{what}: strong flush failed (must be observable): {e}"));
 }
 
+/// Strong-commit a whole file from scratch. A plain close on Windows defers
+/// the commit to WinFsp's asynchronous Close callback (the B4 window,
+/// ~235ms), so any test that writes and then reads back through a NEW
+/// handle must take the FlushFileBuffers path first or it races that window
+/// (observed on real WinFsp: reopen + sync_all after a plain-close seed
+/// fails with ERROR_IO_DEVICE 1117 - the deferred commit conflicts with the
+/// version the new handle captured).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn write_strong(path: &Path, data: &[u8], what: &str) {
+    let mut f = open_create(path);
+    f.write_all(data)
+        .unwrap_or_else(|e| panic!("{what}: write failed: {e}"));
+    flush_strong(&mut f, what);
+}
+
 impl Ctx {
     fn child_stderr(&self, name: &str) -> Stdio {
         let path = self.workdir.join(format!("{name}.err"));
@@ -1308,9 +1323,10 @@ fn section_w(ctx: &Ctx, root: &Path) {
     std::fs::create_dir_all(&dir).expect("W mkdir");
 
     // W1 overwrite-in-place: reopen, overwrite a middle region, sync
-    // (FlushFileBuffers = the strong path), read back byte-exact.
+    // (FlushFileBuffers = the strong path), read back byte-exact. The seed
+    // is strong-committed too: a plain close defers its commit (B4 window).
     let p = dir.join("w1.bin");
-    std::fs::write(&p, vec![0xAAu8; 65536]).expect("W1 seed");
+    write_strong(&p, &[0xAAu8; 65536], "W1 seed");
     {
         use std::io::{Seek, SeekFrom, Write};
         let mut f = std::fs::OpenOptions::new()
@@ -1331,8 +1347,8 @@ fn section_w(ctx: &Ctx, root: &Path) {
     // whole subtree must follow.
     let a = dir.join("w2dir");
     std::fs::create_dir_all(a.join("sub")).expect("W2 mkdir");
-    std::fs::write(a.join("f.txt"), b"dir-content").expect("W2 seed");
-    std::fs::write(a.join("sub/g.txt"), b"nested").expect("W2 seed nested");
+    write_strong(&a.join("f.txt"), b"dir-content", "W2 seed");
+    write_strong(&a.join("sub/g.txt"), b"nested", "W2 seed nested");
     std::fs::rename(&a, dir.join("w2dir-moved")).expect("W2 rename dir");
     assert_eq!(
         std::fs::read(dir.join("w2dir-moved/f.txt")).unwrap(),
@@ -1360,8 +1376,8 @@ fn section_w(ctx: &Ctx, root: &Path) {
     );
 
     // W3 rename over an existing FILE replaces it (destination retired).
-    std::fs::write(dir.join("w3-old"), b"OLD").expect("W3 seed");
-    std::fs::write(dir.join("w3-new"), b"NEWDATA").expect("W3 seed");
+    write_strong(&dir.join("w3-old"), b"OLD", "W3 seed");
+    write_strong(&dir.join("w3-new"), b"NEWDATA", "W3 seed");
     std::fs::rename(dir.join("w3-new"), dir.join("w3-old")).expect("W3 rename over");
     assert_eq!(
         std::fs::read(dir.join("w3-old")).unwrap(),
@@ -1379,7 +1395,7 @@ fn section_w(ctx: &Ctx, root: &Path) {
     // content integrity are asserted; the unlink-while-open outcome is
     // RECORDED (delete-pending vs sharing violation) and only consistency
     // is asserted after close.
-    std::fs::write(dir.join("w4.txt"), b"HANDLE").expect("W4 seed");
+    write_strong(&dir.join("w4.txt"), b"HANDLE", "W4 seed");
     let f = std::fs::File::open(dir.join("w4.txt")).expect("W4 open");
     std::fs::rename(dir.join("w4.txt"), dir.join("w4-renamed")).expect("W4 rename while open");
     let del = std::fs::remove_file(dir.join("w4-renamed"));
@@ -1423,12 +1439,12 @@ fn section_w(ctx: &Ctx, root: &Path) {
     // W5 case sensitivity: the mount is case-sensitive (WinFsp
     // CaseSensitiveSearch, the design notes section 5). Opening a different
     // case must fail, and the two spellings must coexist as two nodes.
-    std::fs::write(dir.join("CaseFile.txt"), b"upper").expect("W5 seed");
+    write_strong(&dir.join("CaseFile.txt"), b"upper", "W5 seed");
     match std::fs::File::open(dir.join("casefile.txt")) {
         Err(e) => println!("  OK   W5 case-sensitive lookup ('casefile.txt' -> {})", e),
         Ok(_) => panic!("W5: mount behaved case-INSENSITIVELY - docs claim case-sensitive"),
     }
-    std::fs::write(dir.join("casefile.txt"), b"lower").expect("W5 second");
+    write_strong(&dir.join("casefile.txt"), b"lower", "W5 second");
     let names = dir_names(&dir);
     assert!(
         names.iter().any(|n| n == "CaseFile.txt") && names.iter().any(|n| n == "casefile.txt"),
@@ -1441,7 +1457,7 @@ fn section_w(ctx: &Ctx, root: &Path) {
     // read it back through cb_getattr; sub-second precision is not kept
     // (node mtime is seconds), so compare at second granularity.
     let p6 = dir.join("w6.txt");
-    std::fs::write(&p6, b"ts").expect("W6 seed");
+    write_strong(&p6, b"ts", "W6 seed");
     let stamp = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     std::fs::File::options()
         .write(true)
