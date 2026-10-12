@@ -120,7 +120,7 @@ fn main() {
             // shared: ONE agent (and thus one pooled connection) for the
             // whole arm, mirroring the runtime's process-wide agent;
             // fresh: a new agent per request = a new TCP connection each.
-            let mut pooled = probe_agent();
+            let pooled = probe_agent();
             for seq in 0..count {
                 let k = mk_key("pf", seq);
                 let path = format!("{}/{}", base, uri_encode(&k, true));
@@ -155,7 +155,7 @@ fn main() {
             let k = key.expect("get arm needs --key");
             let path = format!("{}/{}", base, uri_encode(&k, true));
             let url = format!("{}{}", url_base, path);
-            let mut pooled = probe_agent();
+            let pooled = probe_agent();
             for seq in 0..count {
                 let fresh = probe_agent();
                 let a: &ureq::Agent = if arm == "get-shared" { &pooled } else { &fresh };
