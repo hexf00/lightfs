@@ -192,6 +192,30 @@ impl Ctx {
         std::thread::sleep(Duration::from_millis(500));
     }
 
+    /// Sections C4/C5 end with the mount AND the server torn down by design
+    /// (process death = unmount; fsck wants no SQLite contention). Any
+    /// section that runs AFTER c must re-establish both. Idempotent: a w-only
+    /// run arrives here with a fresh live pair and does nothing.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn ensure_running(&mut self) {
+        if let Some(c) = self.server.as_mut() {
+            if c.try_wait().map(|s| s.is_some()).unwrap_or(false) {
+                self.server = None;
+            }
+        }
+        if self.server.is_none() {
+            self.start_server();
+        }
+        let appeared = if cfg!(unix) {
+            Self::unix_mounted(&self.mount_target)
+        } else {
+            Path::new(&self.mount_target).exists()
+        };
+        if !appeared {
+            self.start_mount();
+        }
+    }
+
     /// Mount authenticity check: on Linux the mountpoint directory exists
     /// BEFORE the mount, so "path exists" proves nothing - verify with
     /// mountpoint(1); on Windows a drive letter only exists once mounted.
@@ -1242,6 +1266,9 @@ fn main() {
     }
     #[cfg(windows)]
     if ctx.sections_want("w") {
+        // c ends with the mount and the server torn down (C4/C5); w needs
+        // both back before it can probe drive semantics.
+        ctx.ensure_running();
         section_w(&ctx, &root);
     }
 
