@@ -41,6 +41,28 @@ cp config/example.toml cfg.toml      # edit endpoint/bucket/credentials
 
 CLI: `lightfs {embedded|server|mount|fsck|backup|gc|create-bucket|version}`
 
+## Symlink semantics
+
+Symlink targets are stored verbatim and returned verbatim by `readlink`.
+Resolution differs by access path - this is a selected design, not an
+oversight:
+
+- **FUSE mount**: the Linux kernel resolves link targets exactly as it
+  does for NFS or sshfs. Absolute targets are resolved against the
+  *calling process's* root, so they can and do point outside the mount
+  point. A FUSE mount of LightFS is therefore **not** an isolation
+  boundary - do not use it as a security mechanism.
+- **RPC / embedded Core**: the server-side path walker clamps resolution
+  at the virtual root (chroot-style). Direct path arguments may not
+  contain `..` components - an independent path-validation rule that
+  applies to every RPC call. Relative targets resolve against the
+  directory containing the link.
+
+Both paths bound symlink resolution at 40 per path walk (matching the
+kernel SYMLOOP_MAX bound) and fail with an error instead of hanging on
+link loops. `rename` and `unlink` act on the link node itself and never
+follow the final path component.
+
 ## License
 
 Apache-2.0
