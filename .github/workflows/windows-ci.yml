@@ -142,6 +142,16 @@ jobs:
             cmd /c ".\bin\lightfs-accept.exe --lightfs .\bin\lightfs.exe --shell .\bin\lightfs-shell.exe --config D:\lightfs-accept\cfg.toml --mount-target R: --section a,b,c,w > D:\lightfs-accept\accept.out 2>&1"
             Write-Output "lightfs-accept exit code: $LASTEXITCODE"
             Get-Content D:\lightfs-accept\accept.out -Tail 15 -ErrorAction SilentlyContinue
+            # The W-section INFO observations (delete-pending vs sharing,
+            # reserved names, symlink stubs) are E3 capability-matrix
+            # evidence. Step logs need auth; notice annotations do not.
+            $wlines = @(Get-Content D:\lightfs-accept\accept.out -Tail 40 -ErrorAction SilentlyContinue |
+              ForEach-Object { $_ -replace '%', '%25' })
+            if ($wlines.Count -gt 0) {
+              $body = $wlines -join '%0A'
+              if ($body.Length -gt 3500) { $body = '...' + $body.Substring($body.Length - 3500) }
+              Write-Output "::notice file=accept.out::$body"
+            }
             exit $LASTEXITCODE
           }
           finally {
