@@ -113,21 +113,25 @@ fn main() {
         }
         "put-shared" | "put-fresh" => {
             let shared = arm == "put-shared";
-            let agent = || probe_agent();
             let signer = signer_of(&s3cfg);
             let host = vhost_of(&s3cfg);
             let base = base_path_of(&s3cfg);
             let url_base = url_base_of(&s3cfg);
+            // shared: ONE agent (and thus one pooled connection) for the
+            // whole arm, mirroring the runtime's process-wide agent;
+            // fresh: a new agent per request = a new TCP connection each.
+            let mut pooled = probe_agent();
             for seq in 0..count {
                 let k = mk_key("pf", seq);
                 let path = format!("{}/{}", base, uri_encode(&k, true));
                 let url = format!("{}{}", url_base, path);
-                let a = agent();
+                let fresh = probe_agent();
+                let a: &ureq::Agent = if shared { &pooled } else { &fresh };
                 let t = Instant::now();
-                let r = signed_put(&a, &signer, &host, &path, &url, &data);
+                let r = signed_put(a, &signer, &host, &path, &url, &data);
                 let ns = t.elapsed().as_nanos() as u64;
                 let status = r.unwrap_or_else(|e| die(&format!("put arm {arm} seq {seq}: {e}")));
-                drop(a);
+                drop(fresh);
                 let tag = if shared { "put-shared" } else { "put-fresh" };
                 writeln!(out, "{tag}\t{size}\t{seq}\t{ns}\t{status}").unwrap();
             }
@@ -144,7 +148,6 @@ fn main() {
             }
         }
         "get-shared" | "get-fresh" => {
-            let agent = || probe_agent();
             let signer = signer_of(&s3cfg);
             let host = vhost_of(&s3cfg);
             let base = base_path_of(&s3cfg);
@@ -152,13 +155,15 @@ fn main() {
             let k = key.expect("get arm needs --key");
             let path = format!("{}/{}", base, uri_encode(&k, true));
             let url = format!("{}{}", url_base, path);
+            let mut pooled = probe_agent();
             for seq in 0..count {
-                let a = agent();
+                let fresh = probe_agent();
+                let a: &ureq::Agent = if arm == "get-shared" { &pooled } else { &fresh };
                 let t = Instant::now();
-                let r = signed_get(&a, &signer, &host, &path, &url);
+                let r = signed_get(a, &signer, &host, &path, &url);
                 let ns = t.elapsed().as_nanos() as u64;
                 let status = r.unwrap_or_else(|e| die(&format!("get arm seq {seq}: {e}")));
-                drop(a);
+                drop(fresh);
                 let tag = if arm == "get-shared" {
                     "get-shared"
                 } else {
