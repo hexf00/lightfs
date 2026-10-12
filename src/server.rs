@@ -120,7 +120,22 @@ fn unchunked<R: std::io::Read>(resp: tiny_http::Response<R>) -> tiny_http::Respo
     resp.with_chunked_threshold(usize::MAX)
 }
 
-fn handle_request(mut req: tiny_http::Request, core: &Core) {
+fn handle_request(req: tiny_http::Request, core: &Core) {
+    // Diagnostic (Phase F): concurrently active workers, sampled once per
+    // request (each worker blocks on exactly one request at a time, so the
+    // in-flight level IS the active-worker count). Metrics-gated; behavior
+    // unchanged.
+    static RPC_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let lvl = RPC_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    crate::metrics::observe(
+        "srv.rpc.inflight",
+        std::time::Duration::from_micros(lvl as u64),
+    );
+    handle_request_inner(req, core);
+    RPC_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn handle_request_inner(mut req: tiny_http::Request, core: &Core) {
     let url = req.url().split('?').next().unwrap_or("/").to_string();
     match req.method() {
         tiny_http::Method::Get if url == "/health" => {
@@ -262,7 +277,7 @@ fn handle_request(mut req: tiny_http::Request, core: &Core) {
             // (disk, not RAM), then PUT with a real Content-Length — S3
             // rejects chunked unsigned PUTs (411). True reader-to-reader
             // streaming onto S3 needs multipart upload (documented
-            // follow-up).
+            // follow-up in docs/PERFORMANCE.md).
             let outcome = (|| -> Result<crate::metadata::Node> {
                 // Exclusive creation (atomic, no symlink/target collision),
                 // owner-only permissions: this file holds user data.

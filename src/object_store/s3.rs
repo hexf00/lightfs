@@ -359,16 +359,27 @@ impl S3ObjectStore {
         // idempotent per the S3 multipart protocol.
         with_retry(|| {
             let (url, headers) = self.signed("PUT", Some(key), &query, data);
-            let mut resp = self
-                .apply_headers(self.agent.put(&url), &headers)
-                .send(data)
-                .map_err(map_transport)?;
-            let status = resp.status().as_u16();
-            if !(200..300).contains(&status) {
-                let body = Self::read_body(&mut resp);
-                return Err(Self::map_status(status, &body, key));
-            }
-            header_str(&resp, "etag").ok_or_else(|| Error::Storage("part missing ETag".into()))
+            static PART_INFLIGHT: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let lvl = PART_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            crate::metrics::observe(
+                "s3.put.inflight",
+                std::time::Duration::from_micros(lvl as u64),
+            );
+            let r = (|| {
+                let mut resp = self
+                    .apply_headers(self.agent.put(&url), &headers)
+                    .send(data)
+                    .map_err(map_transport)?;
+                let status = resp.status().as_u16();
+                if !(200..300).contains(&status) {
+                    let body = Self::read_body(&mut resp);
+                    return Err(Self::map_status(status, &body, key));
+                }
+                header_str(&resp, "etag").ok_or_else(|| Error::Storage("part missing ETag".into()))
+            })();
+            PART_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            r
         })
     }
 
@@ -560,16 +571,29 @@ impl ObjectStore for S3ObjectStore {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(30);
+            // Diagnostic (Phase F): how long callers queue on the part budget
+            // (contention signal), and how many S3 PUTs are in flight. Both
+            // sampled via metrics::observe - no-op unless LIGHTFS_METRICS=1.
+            let wait0 = std::time::Instant::now();
             let permit = part_budget().acquire_timeout(1, wait_secs).map_err(|_| {
                 Error::Storage(format!(
                     "multipart buffer budget busy: no permit within {wait_secs}s (a slow upload may be holding parts)"
                 ))
             })?;
+            crate::metrics::observe("s3.part.wait", wait0.elapsed());
+            static PUT_INFLIGHT: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let lvl = PUT_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            crate::metrics::observe(
+                "s3.put.inflight",
+                std::time::Duration::from_micros(lvl as u64),
+            );
             let mut buf = vec![0u8; len as usize];
             reader.read_exact(&mut buf)?;
-            let info = self.put(key, &buf);
+            let out = self.put(key, &buf);
+            PUT_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             drop(permit); // free only after the upload, like multipart buffers
-            return info;
+            return out;
         }
         // S3 multipart upload: every part is an ordinary Content-Length'd
         // PUT, so bytes stream in bounded 8 MiB buffers (plain chunked
@@ -603,11 +627,13 @@ impl ObjectStore for S3ObjectStore {
                 // Acquire permits BEFORE allocating buffers: blocking here
                 // backs pressure up to the client instead of growing memory.
                 let batch = concurrency.min(budget_total);
+                let wait0 = std::time::Instant::now();
                 let permit = budget.acquire_timeout(batch, wait_secs).map_err(|_| {
                     Error::Storage(format!(
                         "multipart buffer budget busy: no permit within {wait_secs}s (a slow upload may be holding parts)"
                     ))
                 })?;
+                crate::metrics::observe("s3.part.wait", wait0.elapsed());
                 // Fill up to `batch` part buffers from the single reader.
                 let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(batch);
                 let mut last = false;

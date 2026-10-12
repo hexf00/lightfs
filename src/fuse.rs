@@ -946,7 +946,19 @@ impl Filesystem for FuseAdapter {
         reply: ReplyEmpty,
     ) {
         let _g = crate::metrics::scope("fuse.flush");
-        match self.commit_write(fh.0) {
+        // Diagnostic (Phase F): how many flushes commit concurrently, sampled
+        // once per flush as the observed level. Metrics-gated; the always-on
+        // cost is one atomic add/sub and one histogram entry when enabled.
+        static FLUSH_INFLIGHT: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let lvl = FLUSH_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        crate::metrics::observe(
+            "fuse.flush.inflight",
+            std::time::Duration::from_micros(lvl as u64),
+        );
+        let r = self.commit_write(fh.0);
+        FLUSH_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        match r {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),
         }

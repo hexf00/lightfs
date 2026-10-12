@@ -549,16 +549,32 @@ impl Client {
             builder = builder.header("X-LightFS-Expected-Version", v.to_string());
         }
         let body = ureq::SendBody::from_reader(reader);
-        let mut resp = builder
-            .send(body)
-            .map_err(|e| Error::Io(format!("data/write transport: {e}")))?;
-        let status = resp.status().as_u16();
-        let text = resp
-            .body_mut()
-            .with_config()
-            .limit(MAX_RESPONSE_BODY)
-            .read_to_string()
-            .map_err(|e| Error::Io(e.to_string()))?;
+        // Diagnostic (Phase F): the streaming write previously had no
+        // client-side timing scope; this adds the same histogram the JSON
+        // write path has, plus an in-flight level sample. Metrics-gated;
+        // behavior unchanged.
+        static WRITE_INFLIGHT: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let lvl = WRITE_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        crate::metrics::observe(
+            "client.data.write.inflight",
+            std::time::Duration::from_micros(lvl as u64),
+        );
+        let sent = crate::metrics::time("client.data.write", || -> Result<(u16, String)> {
+            let mut resp = builder
+                .send(body)
+                .map_err(|e| Error::Io(format!("data/write transport: {e}")))?;
+            let status = resp.status().as_u16();
+            let text = resp
+                .body_mut()
+                .with_config()
+                .limit(MAX_RESPONSE_BODY)
+                .read_to_string()
+                .map_err(|e| Error::Io(e.to_string()))?;
+            Ok((status, text))
+        });
+        WRITE_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let (status, text) = sent?;
         if !(200..300).contains(&status) {
             return Err(error_from_body(status, &text));
         }
