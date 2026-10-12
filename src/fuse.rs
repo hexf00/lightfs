@@ -47,12 +47,28 @@ fn secs_env(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// A nameless inode kept alive by open handles (detached semantics): the
+/// bytes live in THIS map until the last handle closes, then are reaped.
+/// `base` is the content snapshot taken at detach time (read through the
+/// name while it still exists); `chunks` hold every write from ALL
+/// surviving handles - shared per-inode, so two fds on a detached file
+/// see each other's writes, exactly like POSIX. Nothing here is ever
+/// uploaded: the name is gone and must not resurrect, fsync succeeds
+/// because the data is held (in memory, like any anonymous inode).
+struct Detached {
+    base: Vec<u8>,
+    chunks: crate::writeback::ChunkMap,
+    refs: usize,
+}
+
 pub struct FuseAdapter {
     fs: std::sync::Arc<dyn FsApi>,
     /// ino (== metadata node id) -> path within the filesystem.
     inodes: Mutex<HashMap<u64, PathBuf>>,
     /// file handle -> buffered write.
     writes: Mutex<HashMap<u64, PendingWrite>>,
+    /// ino -> detached bytes (open handles holding a dead name).
+    detached: Mutex<HashMap<u64, Detached>>,
     /// path -> ino reverse index: ino_of_path used to LINEAR-SCAN the
     /// whole inode map on every reverse lookup, growing with the number
     /// of dirs ever visited (O(n) per getattr on a cold name).
@@ -170,6 +186,7 @@ impl FuseAdapter {
             fs,
             inodes: Mutex::new(inodes),
             writes: Mutex::new(HashMap::new()),
+            detached: Mutex::new(HashMap::new()),
             paths: Mutex::new(HashMap::new()),
             dir_cache: Mutex::new(HashMap::new()),
             dir_snapshot_ttl,
@@ -333,6 +350,125 @@ impl FuseAdapter {
         Ok(fh)
     }
 
+    /// Detach every session opened on `path` to detached entry `ino`:
+    /// snapshot the base content (read through the name while it still
+    /// exists - callers MUST run this BEFORE the name dies), fold the
+    /// sessions' unflushed chunks into the shared entry, and mark the
+    /// sessions orphaned+detached. Subsequent reads/writes on those
+    /// handles are served from the detached entry until the last close.
+    fn detach_sessions(&self, path: &str, ino: u64) {
+        // Take each victim's unflushed chunks NOW: after the name dies they
+        // would never be committed, and dropping them would be exactly the
+        // silent loss K2 forbids. fh order keeps the merge deterministic
+        // (last write wins on an overlapping offset, matching fd order).
+        let mut folded: Vec<std::collections::BTreeMap<u64, Vec<u8>>> = Vec::new();
+        let victims = {
+            let mut writes = self.writes.lock().unwrap();
+            let mut fhs: Vec<u64> = writes
+                .iter()
+                .filter(|(_, st)| st.path == path && !st.orphaned)
+                .map(|(fh, _)| *fh)
+                .collect();
+            fhs.sort_unstable();
+            for fh in &fhs {
+                if let Some(st) = writes.get_mut(fh) {
+                    st.orphaned = true;
+                    st.path.clear();
+                    st.detached_ino = Some(ino);
+                    folded.push(st.chunks.drain());
+                }
+            }
+            fhs.len()
+        };
+        if victims == 0 {
+            return;
+        }
+        // Entry exists before any detached write can arrive (write callbacks
+        // lock this map); the base snapshot fills in below, outside both locks.
+        self.detached
+            .lock()
+            .unwrap()
+            .entry(ino)
+            .or_insert_with(|| Detached {
+                base: Vec::new(),
+                chunks: crate::writeback::ChunkMap::new(),
+                refs: 0,
+            });
+        let size = self.fs.lookup(path).map(|n| n.size as u64).unwrap_or(0);
+        let base = self.fs.read(path, 0, size).unwrap_or_default();
+        let mut det = self.detached.lock().unwrap();
+        if let Some(d) = det.get_mut(&ino) {
+            if d.base.is_empty() {
+                d.base = base;
+            }
+            for batch in folded {
+                for (off, data) in batch {
+                    d.chunks.insert(off, data);
+                }
+            }
+            d.refs += victims;
+        }
+    }
+
+    /// Read from a detached inode (name gone, handles alive): base snapshot
+    /// + every surviving handle's writes.
+    fn detached_read(&self, ino: u64, offset: u64, size: u64) -> Option<Vec<u8>> {
+        let det = self.detached.lock().unwrap();
+        let d = det.get(&ino)?;
+        let eof = (d.base.len() as u64).max(d.chunks.max_end());
+        let want = if eof > offset {
+            ((eof - offset) as usize).min(size as usize)
+        } else {
+            0
+        };
+        if want == 0 {
+            return Some(Vec::new());
+        }
+        let mut full = d.base.clone();
+        full.resize(eof as usize, 0);
+        d.chunks.overlay_range(&mut full, offset);
+        let from = (offset as usize).min(full.len());
+        let to = (from + want).min(full.len());
+        Some(full[from..to].to_vec())
+    }
+
+    /// Stat a detached inode: EOF = base snapshot size vs any surviving
+    /// handle's write end, whichever is larger.
+    fn detached_attr(&self, ino: INodeNo) -> Option<FileAttr> {
+        let det = self.detached.lock().unwrap();
+        let d = det.get(&ino.0)?;
+        let size = (d.base.len() as u64).max(d.chunks.max_end());
+        Some(FileAttr {
+            ino,
+            size,
+            blocks: size.div_ceil(4096),
+            atime: std::time::SystemTime::now().into(),
+            mtime: std::time::SystemTime::now().into(),
+            ctime: std::time::SystemTime::now().into(),
+            crtime: std::time::SystemTime::now().into(),
+            kind: FileType::RegularFile,
+            perm: 0o644,
+            nlink: 1,
+            uid: self.uid,
+            gid: self.gid,
+            rdev: 0,
+            blksize: 4096,
+            flags: 0,
+        })
+    }
+
+    /// Drop one reference on a detached inode; the last close reaps the
+    /// bytes (POSIX: an anonymous inode lives until its last fd closes).
+    fn release_detached(&self, ino: u64) {
+        let mut det = self.detached.lock().unwrap();
+        if let Some(d) = det.get_mut(&ino) {
+            d.refs -= 1;
+            if d.refs == 0 {
+                det.remove(&ino);
+            }
+        }
+    }
+
     /// Commit a buffered write (flush/release). Idempotent per handle.
     ///
     /// Chunk lifecycle (drain-on-commit): the pending chunks are TAKEN out
@@ -361,13 +497,11 @@ impl FuseAdapter {
                 return Ok(());
             }
             if state.orphaned {
-                // The name died while the handle was open (unlink, or the
-                // rename that overwrote it). POSIX: writes into the
-                // disembodied inode succeed but go nowhere - drop the
-                // batch, succeed, and never look the name up again (it
-                // may already belong to a different file).
-                state.chunks.drain();
-                state.committed = true;
+                // Detached: the bytes are held in the shared detached entry
+                // until the last handle closes - nothing to upload (the name
+                // is gone and must not resurrect), nothing to drop. Draining
+                // here would silently discard writes that already succeeded,
+                // which K2 forbids. Idempotent like every flush.
                 return Ok(());
             }
             let drained = state.chunks.drain();
@@ -516,7 +650,16 @@ impl Filesystem for FuseAdapter {
         let _g = crate::metrics::scope("fuse.getattr");
         let path = match self.path_of(ino) {
             Ok(p) => p,
-            Err(e) => return reply.error(e),
+            Err(e) => {
+                // Nameless inode with surviving handles (detached): the
+                // kernel revalidates attributes BEFORE a read and would
+                // short-circuit the whole I/O with ENOENT otherwise - so
+                // a detached entry must serve stat.
+                if let Some(attr) = self.detached_attr(ino) {
+                    return reply.attr(&self.attr_ttl, &attr);
+                }
+                return reply.error(e);
+            }
         };
         // Same readdirplus cache as lookup (git's stat loop lands here
         // once the kernel dentry cache is warm). The in-flight fixup
@@ -905,7 +1048,15 @@ impl Filesystem for FuseAdapter {
         let _g = crate::metrics::scope("fuse.read");
         let path = match self.path_of(ino) {
             Ok(p) => p,
-            Err(e) => return reply.error(e),
+            Err(e) => {
+                // Nameless inode with surviving handles (detached): serve
+                // the bytes we hold. Without an entry the inode is truly
+                // gone - ENOENT stands.
+                if let Some(data) = self.detached_read(ino.0, offset, size as u64) {
+                    return reply.data(&data);
+                }
+                return reply.error(e);
+            }
         };
         match self.read_with_session(&path, offset, size as u64) {
             Ok(data) => reply.data(&data),
@@ -938,11 +1089,24 @@ impl Filesystem for FuseAdapter {
         // carries a blanked path, and that lookup would turn into a
         // spurious ENOENT for a write POSIX says must succeed.
         if state.orphaned {
-            // Disembodied inode (unlinked / renamed over): accept the
-            // write and drop it - POSIX unlink semantics for open fds.
-            // Buffering it would leak into `pending` for a name that no
-            // longer exists (or worse, one a new file now owns).
-            return reply.written(data.len() as u32);
+            // Detached inode (unlinked / renamed over): writes land in the
+            // shared detached entry and STAY there until the last handle
+            // closes. Success here means the bytes are actually held -
+            // silently accepting and later dropping is exactly what K2
+            // forbids. No entry = the last close already reaped the inode.
+            match state.detached_ino {
+                Some(dino) => {
+                    let mut det = self.detached.lock().unwrap();
+                    match det.get_mut(&dino) {
+                        Some(d) => {
+                            d.chunks.insert(offset, data.to_vec());
+                            return reply.written(data.len() as u32);
+                        }
+                        None => return reply.error(Errno::EIO),
+                    }
+                }
+                None => return reply.error(Errno::EIO),
+            }
         }
         if state.committed {
             match self.fs.lookup(&state.path) {
@@ -999,15 +1163,16 @@ impl Filesystem for FuseAdapter {
         // kernel ignores release's return value, so a failed final commit
         // is only observable in this log - flush()/fsync() are the paths
         // that surface errors to applications.
-        let path = self
-            .writes
-            .lock()
-            .unwrap()
-            .get(&fh.0)
-            .map(|st| st.path.clone())
-            // orphaned sessions carry a blank path: nothing left to
-            // recompute, and the name may belong to a different file now
-            .filter(|p| !p.is_empty());
+        let (path, detached_ino) = {
+            let writes = self.writes.lock().unwrap();
+            writes
+                .get(&fh.0)
+                .map(|st| (st.path.clone(), st.detached_ino))
+                .unwrap_or((String::new(), None))
+        };
+        // orphaned sessions carry a blank path: nothing left to recompute,
+        // and the name may belong to a different file now
+        let path = if path.is_empty() { None } else { Some(path) };
         if let Err(e) = self.commit_write(fh.0) {
             eprintln!(
                 "lightfs-fuse: WARNING release: final commit FAILED for fh={} ({}): {e} - data not persisted",
@@ -1016,6 +1181,11 @@ impl Filesystem for FuseAdapter {
             );
         }
         self.writes.lock().unwrap().remove(&fh.0);
+        if let Some(dino) = detached_ino {
+            // The handle is gone: drop its reference; the LAST close reaps
+            // the detached bytes (POSIX anonymous-inode lifetime).
+            self.release_detached(dino);
+        }
         if let Some(path) = path {
             // recompute from remaining sessions: a failed final commit must
             // not leave a phantom in-flight EOF (readers would see a hole)
@@ -1051,6 +1221,11 @@ impl Filesystem for FuseAdapter {
             Err(e) => return reply.error(e),
         };
         let path = Self::child_path(&parent_path, name);
+        // Detach open handles BEFORE the name (and its object) die: the
+        // base snapshot reads through the still-live name.
+        if let Some(ino) = self.ino_of_path(&path) {
+            self.detach_sessions(&path, ino);
+        }
         match self.fs.unlink(&path) {
             Ok(()) => {
                 self.dirent_invalidate();
@@ -1117,11 +1292,25 @@ impl Filesystem for FuseAdapter {
         };
         let old_path = Self::child_path(&old_parent, name);
         let new_path = Self::child_path(&new_parent, newname);
+        // An overwritten destination loses its name with open handles
+        // possibly held: detach BEFORE the rename moves the name away
+        // (base snapshot + chunk fold happen through the live name).
+        let dest_ino = self.ino_of_path(&new_path);
+        if let Some(dino) = dest_ino {
+            self.detach_sessions(&new_path, dino);
+        }
         match self.fs.rename(&old_path, &new_path) {
             Ok(()) => {
                 self.dirent_invalidate();
                 self.pending.drop_path(&old_path);
                 self.pending.drop_path(&new_path);
+                // K1: the overwritten inode must NOT resolve to the new
+                // name any more - its stale mapping would alias reads of
+                // the incoming file (detached handles are served from the
+                // detached entry, not from path lookups).
+                if let Some(dino) = dest_ino {
+                    self.inodes.lock().unwrap().remove(&dino);
+                }
                 // Open write handles ride along: repoint their paths so
                 // the commit looks the file up under its CURRENT name
                 // (rename_node only moves parent/name - the CAS anchor

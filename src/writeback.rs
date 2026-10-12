@@ -300,6 +300,10 @@ pub struct PendingWrite {
     /// every path-matching scan (overlay, visible_eof, recompute) can
     /// never alias the new file.
     pub orphaned: bool,
+    /// For an orphaned session: the detached entry (kernel ino) now holding
+    /// this file's bytes. Writes go there and reads are served from it
+    /// until the last handle closes; None on a live (non-orphaned) session.
+    pub detached_ino: Option<u64>,
 }
 
 impl PendingWrite {
@@ -310,6 +314,7 @@ impl PendingWrite {
             chunks: ChunkMap::new(),
             committed: false,
             orphaned: false,
+            detached_ino: None,
         }
     }
 

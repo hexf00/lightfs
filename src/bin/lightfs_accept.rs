@@ -1315,26 +1315,24 @@ fn section_c(ctx: &mut Ctx, root: &Path) {
         println!("  OK  C6 rename/unlink with open write handles (a-g)");
     }
 
-    // C7 detached-handle semantics, two-handle and read-path coverage (J-R1).
-    // Locks the CURRENT contract where it is intentional and correct; the
-    // read-path gaps are recorded, NOT asserted, until review picks a fix:
-    //  - unlink: a detached handle's read returns ENOENT (POSIX would keep
-    //    the bytes readable until the last close - candidate fix R-b);
-    //  - rename over an open target: the stale handle's read aliases the
-    //    NEW file's bytes (data-crossing defect - candidate fix R-a). The
-    //    write side is already safe (orphaned session drops, no cross-write).
+    // C7 detached-handle semantics, two-handle and read-path coverage.
+    // Since K the FUSE adapter implements FULL detached semantics (K2-A):
+    // a nameless inode's bytes live in memory until the last handle closes;
+    // reads and writes on surviving handles are served and shared per-inode.
+    // (WinFsp implements K2-B instead: refused at the write boundary,
+    // ENOENT reads - those paths have no runtime assertions here.)
     #[cfg(unix)]
     if ctx.adapter && ctx.sections_want("c") {
         println!("  C7 detached-handle read/write semantics");
         let d = root.join("c7");
         std::fs::create_dir_all(&d).expect("C7 mkdir");
 
-        // a) unlink with two open handles: the surviving handle must neither
-        //    resurrect the name nor block later handles; close stays clean.
+        // a) unlink with two open handles: bytes stay readable AND shared
+        //    across the surviving handles until the last close.
         let fe = d.join("two-handles.txt");
         let mut h1 = open_create(&fe);
         write_at(&mut h1, 0, b"AAA-H1-UNCOMMITTED");
-        let h2 = std::fs::File::open(&fe).expect("C7a second independent handle");
+        let mut h2 = std::fs::File::open(&fe).expect("C7a second independent handle");
         std::fs::remove_file(&fe).expect("C7a unlink");
         if fe.exists() {
             panic!("C7a: unlinked name reappeared");
@@ -1348,33 +1346,36 @@ fn section_c(ctx: &mut Ctx, root: &Path) {
                 }
             }
         }
-        // Detached-handle READ through the still-open h2: CURRENT contract
-        // is ENOENT (POSIX would serve the bytes until the last close -
-        // recorded gap, candidate fix R-b; do not weaken this assertion
-        // silently if the fix lands - flip it to the byte-exact check).
-        let mut h2r = h2;
-        let mut buf = [0u8; 64];
-        match std::io::Read::read(&mut h2r, &mut buf) {
-            Ok(_) => panic!(
-                "C7a: detached-handle read returned data - contract changed, \
-                 update this assertion to the R-b byte-exact check"
-            ),
-            Err(e) => {
-                if e.raw_os_error() != Some(libc::ENOENT) {
-                    panic!("C7a: detached-handle read: {e}, want ENOENT (R-b gap)");
-                }
-            }
+        // Detached read through h2: the unflushed bytes survive (POSIX).
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut h2, &mut buf).expect("C7a detached read via h2");
+        if buf != b"AAA-H1-UNCOMMITTED" {
+            panic!("C7a: detached read via h2 got {buf:?}, want the h1 bytes");
         }
-        // Writes through the still-open handle keep succeeding (POSIX) and
-        // fsync stays clean (orphaned session drops the batch).
-        write_at(&mut h1, 17, b"+H1-CONTINUES");
+        // Writes through h1 keep succeeding, are really HELD, and are
+        // visible through h2 (per-inode sharing, POSIX).
+        write_at(&mut h1, 18, b"+H1-CONTINUES"); // 18 = EOF of AAA-H1-UNCOMMITTED
         flush_strong(&mut h1, "C7a fsync on detached handle");
+        buf.clear();
+        std::io::Seek::seek(&mut h2, std::io::SeekFrom::Start(0)).expect("C7a rewind h2");
+        std::io::Read::read_to_end(&mut h2, &mut buf).expect("C7a second detached read");
+        if buf != b"AAA-H1-UNCOMMITTED+H1-CONTINUES" {
+            panic!("C7a: detached read after h1 write got {buf:?} (sharing broken)");
+        }
         drop(h1);
-        drop(h2r); // second close after the first must also be clean
-        println!("    OK  C7a unlink: two handles, no resurrection, clean closes");
+        // h1 closed but h2 still open: the inode must still be alive.
+        buf.clear();
+        std::io::Seek::seek(&mut h2, std::io::SeekFrom::Start(0)).expect("C7a rewind h2 (2)");
+        std::io::Read::read_to_end(&mut h2, &mut buf).expect("C7a read after h1 close");
+        if buf != b"AAA-H1-UNCOMMITTED+H1-CONTINUES" {
+            panic!("C7a: read via h2 after h1 close got {buf:?} (reaped too early)");
+        }
+        drop(h2); // last close reaps the anonymous inode
+        println!("    OK  C7a unlink: two handles, detached bytes shared and alive");
 
-        // b) rename OVER an open target: write-side isolation only (read
-        //    aliasing is the recorded R-a gap - do NOT assert reads here).
+        // b) rename OVER an open target: the stale handle keeps reading its
+        //    OWN bytes (K1: never alias the incoming file), writes stay
+        //    isolated, and the recycled name carries only the source data.
         let fsrc = d.join("r-src.txt");
         let ftgt = d.join("r-tgt.txt");
         {
@@ -1387,33 +1388,42 @@ fn section_c(ctx: &mut Ctx, root: &Path) {
             write_at(&mut f, 0, b"TTT-OLD-TARGET");
             flush_strong(&mut f, "C7b tgt seed");
         }
-        let mut ht = open_create(&ftgt);
-        write_at(&mut ht, 13, b"+UNCOMMITTED-T2");
+        let mut ht = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&ftgt)
+            .expect("C7b open target rw (no truncate - the seed must survive)");
+        write_at(&mut ht, 14, b"+UNCOMMITTED-T2"); // 14 = EOF of TTT-OLD-TARGET
         std::fs::rename(&fsrc, &ftgt).expect("C7b rename over open target");
-        write_at(&mut ht, 28, b"+STRAY"); // detached: accepted, dropped
+        // K1 PRIMARY: the stale handle reads its own inode, not the new file.
+        std::io::Seek::seek(&mut ht, std::io::SeekFrom::Start(0)).expect("C7b rewind ht");
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut ht, &mut buf).expect("C7b stale-handle read");
+        if buf != b"TTT-OLD-TARGET+UNCOMMITTED-T2" {
+            panic!("C7b: stale handle read {buf:?} - cross-inode aliasing (K1 violation)");
+        }
+        // The recycled name reads the incoming file's bytes.
+        assert_bytes("C7b new name content", &ftgt, b"SSS-SRC-DATA");
+        // Stray writes via the stale handle stay isolated from the new file.
+        write_at(&mut ht, 29, b"+STRAY");
         flush_strong(&mut ht, "C7b fsync on overwritten handle");
+        buf.clear();
+        std::io::Seek::seek(&mut ht, std::io::SeekFrom::Start(0)).expect("C7b rewind ht (2)");
+        std::io::Read::read_to_end(&mut ht, &mut buf).expect("C7b stale read after write");
+        if buf != b"TTT-OLD-TARGET+UNCOMMITTED-T2+STRAY" {
+            panic!("C7b: stale-handle content after write got {buf:?}");
+        }
         drop(ht);
-        let t0 = Instant::now();
-        loop {
-            if std::fs::read(&ftgt).ok().as_deref() == Some(b"SSS-SRC-DATA".as_slice()) {
-                break;
-            }
-            if t0.elapsed() > Duration::from_secs(10) {
-                panic!("C7b: moved content not visible under target within 10s");
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
+        // The stray data must not leak into the recycled name.
         std::thread::sleep(Duration::from_millis(300));
-        let got = std::fs::read(&ftgt).unwrap_or_default();
-        if got != b"SSS-SRC-DATA" {
-            panic!("C7b: overwritten handle leaked data into the recycled name: {got:?}");
-        }
+        assert_bytes("C7b target after stale close", &ftgt, b"SSS-SRC-DATA");
         if fsrc.exists() {
             panic!("C7b: source name still present");
         }
-        println!("    OK  C7b rename-over-open-target: write isolation, no leak");
+        println!("    OK  C7b rename-over-open-target: own bytes, no aliasing, no leak");
 
-        // c) remount: neither detached dataset nor dead names survive.
+        // c) remount: detached bytes are memory-only (documented contract),
+        //    the recycled name keeps the source data, nothing resurrects.
         ctx.kill_mount();
         ctx.start_mount();
         println!("MOUNTED (after C7 restart)");
@@ -1421,14 +1431,7 @@ fn section_c(ctx: &mut Ctx, root: &Path) {
             panic!("C7c: unlinked name appeared after remount");
         }
         assert_bytes("C7c target after remount", &ftgt, b"SSS-SRC-DATA");
-        let leaked = std::fs::read_dir(&d)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .any(|e| e.file_name().to_string_lossy().contains("two-handles"));
-        if leaked {
-            panic!("C7c: detached-handle file reappeared after remount");
-        }
-        println!("  OK  C7 detached-handle semantics (a-c; read gaps recorded in docs)");
+        println!("  OK  C7 detached-handle semantics (a-c)");
     }
 
     // C4 clean shutdown: the drive must disappear with the mount process.

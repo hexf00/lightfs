@@ -424,10 +424,12 @@ fn commit_write(fh: u64) -> Result<(), Error> {
         }
         if sess.orphaned {
             // The name died while the handle was open (unlink, or the
-            // rename that overwrote it). POSIX: writes into the
-            // disembodied inode succeed but go nowhere - drop the batch,
-            // succeed, and never look the name up again (it may already
-            // belong to a different file). Mirrors fuse.rs::commit_write.
+            // rename that overwrote it). K2-B: writes to this handle were
+            // already REFUSED at the write boundary, so the batch is empty
+            // by construction; draining is defensive. Success - nothing
+            // was ever accepted that could be silently lost. Mirrors
+            // fuse.rs::commit_write (which implements full detached
+            // semantics instead).
             sess.chunks.drain();
             sess.committed = true;
             return Ok(());
@@ -611,6 +613,17 @@ unsafe extern "system" fn cb_read(
         if size == 0 {
             return 0;
         }
+        // K2-B: this adapter has no detached-inode store (no stable inode
+        // id to hold a dead name's bytes). A handle whose name was unlinked
+        // or renamed over must NOT resolve through the recycled path - that
+        // would alias the NEW file's bytes. Refuse at the boundary.
+        {
+            let fh = (*_fi).fh;
+            let writes = WRITES.lock().unwrap();
+            if writes.get(&fh).is_some_and(|sess| sess.orphaned) {
+                return -ENOENT;
+            }
+        }
         match state().read(path, offset as u64, size as u64) {
             Ok(mut data) => {
                 // Read-your-writes: serve session chunks still in flight
@@ -663,11 +676,12 @@ unsafe extern "system" fn cb_write(
             return -EIO;
         };
         if sess.orphaned {
-            // Disembodied inode (unlinked / renamed over): accept the
-            // write and drop it - POSIX unlink semantics for open fds.
-            // MUST run before the committed re-arm below: the blanked
-            // session path would turn that lookup into a spurious ENOENT.
-            return size as c_int;
+            // K2-B: no detached-inode store on this adapter (no stable
+            // inode id), so a write it cannot honestly persist is REFUSED
+            // here, at the write boundary - never accepted and silently
+            // dropped later. (The FUSE adapter implements full detached
+            // semantics instead; see fuse.rs.)
+            return -EIO;
         }
         if sess.committed {
             // New writes after a flush (Windows may flush and keep the handle
