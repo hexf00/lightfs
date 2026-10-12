@@ -138,7 +138,8 @@ jobs:
               --lightfs .\bin\lightfs.exe `
               --shell .\bin\lightfs-shell.exe `
               --config D:\lightfs-accept\cfg.toml `
-              --mount-target R:
+              --mount-target R: `
+              --section a --section b --section c --section w
             exit $LASTEXITCODE
           }
           finally {

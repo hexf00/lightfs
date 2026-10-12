@@ -1240,12 +1240,309 @@ fn main() {
     if ctx.sections_want("stress") {
         stress_a15(&ctx, &root);
     }
+    #[cfg(windows)]
+    if ctx.sections_want("w") {
+        section_w(&ctx, &root);
+    }
 
     println!(
         "=== ACCEPTANCE PASSED in {:.1}s ===",
         t0.elapsed().as_secs_f64()
     );
     // Drop kills remaining children.
+}
+
+// ---------------------------------------------------------------------------
+// W: Windows/WinFsp-specific semantics (E3 capability matrix, test-only).
+// Linux never compiles this section; Windows CI runs it with --section w
+// against the REAL WinFsp mount. Where a behavior is a SELECTED/documented
+// platform difference it is asserted on purpose; where WinFsp semantics
+// were previously unobserved the run RECORDS the observation and asserts
+// only data consistency (no corruption, no hang).
+#[cfg(windows)]
+fn dir_names(p: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(p)
+        .expect("W read_dir")
+        .map(|e| {
+            e.expect("W entry")
+                .file_name()
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+#[cfg(windows)]
+fn section_w(ctx: &Ctx, root: &Path) {
+    println!("--- W: Windows/WinFsp semantics (E3) ---");
+    let dir = root.join("w");
+    std::fs::create_dir_all(&dir).expect("W mkdir");
+
+    // W1 overwrite-in-place: reopen, overwrite a middle region, sync
+    // (FlushFileBuffers = the strong path), read back byte-exact.
+    let p = dir.join("w1.bin");
+    std::fs::write(&p, vec![0xAAu8; 65536]).expect("W1 seed");
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&p)
+            .expect("W1 open");
+        f.seek(SeekFrom::Start(1024)).expect("W1 seek");
+        f.write_all(&vec![0x55u8; 1024]).expect("W1 write");
+        f.sync_all().expect("W1 flush");
+    }
+    let got = std::fs::read(&p).expect("W1 read");
+    let mut want = vec![0xAAu8; 65536];
+    want[1024..2048].copy_from_slice(&[0x55u8; 1024]);
+    assert_eq!(got, want, "W1: in-place overwrite must be byte-exact");
+    println!("  OK   W1 overwrite-in-place (64KiB, middle 1KiB, flush-strong)");
+
+    // W2 directory rename: children reference the parent by id, so the
+    // whole subtree must follow.
+    let a = dir.join("w2dir");
+    std::fs::create_dir_all(a.join("sub")).expect("W2 mkdir");
+    std::fs::write(a.join("f.txt"), b"dir-content").expect("W2 seed");
+    std::fs::write(a.join("sub/g.txt"), b"nested").expect("W2 seed nested");
+    std::fs::rename(&a, dir.join("w2dir-moved")).expect("W2 rename dir");
+    assert_eq!(
+        std::fs::read(dir.join("w2dir-moved/f.txt")).unwrap(),
+        b"dir-content",
+        "W2: child must follow the renamed directory"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("w2dir-moved/sub/g.txt")).unwrap(),
+        b"nested"
+    );
+    assert!(!a.exists(), "W2: old name must be gone");
+    println!("  OK   W2 directory rename (subtree follows, byte-exact)");
+
+    // W2b: renaming ONTO an existing directory is rejected (v1 does not
+    // implement the POSIX empty-dir overwrite). Recorded deviation.
+    std::fs::create_dir_all(dir.join("w2b-target")).expect("W2b mkdir");
+    let e = std::fs::rename(dir.join("w2dir-moved"), dir.join("w2b-target")).unwrap_err();
+    assert!(
+        e.raw_os_error() != Some(0),
+        "W2b: directory overwrite must not succeed"
+    );
+    println!(
+        "  OK   W2b rename onto existing dir rejected ({}), documented v1 deviation",
+        e
+    );
+
+    // W3 rename over an existing FILE replaces it (destination retired).
+    std::fs::write(dir.join("w3-old"), b"OLD").expect("W3 seed");
+    std::fs::write(dir.join("w3-new"), b"NEWDATA").expect("W3 seed");
+    std::fs::rename(dir.join("w3-new"), dir.join("w3-old")).expect("W3 rename over");
+    assert_eq!(
+        std::fs::read(dir.join("w3-old")).unwrap(),
+        b"NEWDATA",
+        "W3: destination must carry the source content"
+    );
+    assert!(
+        !dir_names(&dir).iter().any(|n| n == "w3-new"),
+        "W3: source name must be gone"
+    );
+    println!("  OK   W3 rename replaces existing file (dest retired)");
+
+    // W4 open handle across rename/unlink. POSIX keeps the fd valid; on
+    // Windows this goes through WinFsp sharing semantics. The rename and
+    // content integrity are asserted; the unlink-while-open outcome is
+    // RECORDED (delete-pending vs sharing violation) and only consistency
+    // is asserted after close.
+    std::fs::write(dir.join("w4.txt"), b"HANDLE").expect("W4 seed");
+    let f = std::fs::File::open(dir.join("w4.txt")).expect("W4 open");
+    std::fs::rename(dir.join("w4.txt"), dir.join("w4-renamed")).expect("W4 rename while open");
+    let del = std::fs::remove_file(dir.join("w4-renamed"));
+    println!("  INFO W4 unlink while handle open: {:?}", del);
+    match &del {
+        Ok(()) => {
+            drop(f);
+            // delete-pending: the name disappears once the last handle
+            // closes (the WinFsp close path is asynchronous - bounded wait,
+            // this is the B4 "eventual visibility" pattern, not a retry of
+            // a failed operation).
+            let mut gone = false;
+            for _ in 0..100 {
+                if !dir.join("w4-renamed").exists() {
+                    gone = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                gone,
+                "W4: deleted-while-open name must disappear after close"
+            );
+            println!("  OK   W4 rename while open; unlink delete-pending, gone after close");
+        }
+        Err(e) => {
+            drop(f);
+            assert_eq!(
+                std::fs::read(dir.join("w4-renamed")).unwrap(),
+                b"HANDLE",
+                "W4: refused unlink must keep the content intact"
+            );
+            let _ = std::fs::remove_file(dir.join("w4-renamed"));
+            println!(
+                "  OK   W4 rename while open ok; unlink refused by sharing ({}), content intact",
+                e
+            );
+        }
+    }
+
+    // W5 case sensitivity: the mount is case-sensitive (WinFsp
+    // CaseSensitiveSearch, the design notes section 5). Opening a different
+    // case must fail, and the two spellings must coexist as two nodes.
+    std::fs::write(dir.join("CaseFile.txt"), b"upper").expect("W5 seed");
+    match std::fs::File::open(dir.join("casefile.txt")) {
+        Err(e) => println!("  OK   W5 case-sensitive lookup ('casefile.txt' -> {})", e),
+        Ok(_) => panic!("W5: mount behaved case-INSENSITIVELY - docs claim case-sensitive"),
+    }
+    std::fs::write(dir.join("casefile.txt"), b"lower").expect("W5 second");
+    let names = dir_names(&dir);
+    assert!(
+        names.iter().any(|n| n == "CaseFile.txt") && names.iter().any(|n| n == "casefile.txt"),
+        "W5: both spellings must coexist, got {names:?}"
+    );
+    assert_eq!(std::fs::read(dir.join("CaseFile.txt")).unwrap(), b"upper");
+    println!("  OK   W5 case-sensitive names coexist (CaseFile.txt / casefile.txt)");
+
+    // W6 timestamps: set mtime through the mount (cb_utimens -> setattr),
+    // read it back through cb_getattr; sub-second precision is not kept
+    // (node mtime is seconds), so compare at second granularity.
+    let p6 = dir.join("w6.txt");
+    std::fs::write(&p6, b"ts").expect("W6 seed");
+    let stamp = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(&p6)
+        .expect("W6 open")
+        .set_modified(stamp)
+        .expect("W6 set_modified");
+    let mt = std::fs::metadata(&p6).expect("W6 stat").modified().unwrap();
+    let secs = mt
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert_eq!(
+        secs, 1_700_000_000,
+        "W6: mtime must round-trip at second granularity"
+    );
+    // cross-check the same node via the RPC client (server-side truth)
+    let (ok, body) = rpc_call(&ctx.rpc_url(), "getattr", "{\"path\":\"/w/w6.txt\"}");
+    assert!(ok, "W6: RPC getattr failed: {body}");
+    assert!(
+        body.contains("\"mtime\":1700000000"),
+        "W6: RPC mtime must match the value set through the mount: {body}"
+    );
+    println!("  OK   W6 mtime round-trips mount->setattr->getattr (mount and RPC agree)");
+
+    // W7 names Win32 pre-normalizes or reserves (trailing dot/space,
+    // device names). What the FS actually sees/does is RECORDED; only
+    // non-corruption (the directory still lists consistently) is asserted.
+    for name in ["w7-dot.", "w7-sp ", "CON"] {
+        match std::fs::write(dir.join(name), b"x") {
+            Ok(()) => println!("  INFO W7 create {name:?} -> ok"),
+            Err(e) => println!("  INFO W7 create {name:?} -> {}", e),
+        }
+    }
+    let names = dir_names(&dir);
+    assert!(
+        names.contains(&"w6.txt".to_string()),
+        "W7: directory must stay consistent"
+    );
+    println!(
+        "  INFO W7 visible names after attempts: {:?}",
+        names
+            .iter()
+            .filter(|n| n.starts_with("w7") || n.eq_ignore_ascii_case("con"))
+            .collect::<Vec<_>>()
+    );
+
+    // W8 symlinks on Windows: creation from the mount is ENOSYS (the
+    // symlink callback is not wired - selected limitation). A link node
+    // created OUT OF BAND via RPC is then observed from Windows: readlink
+    // is an ENOSYS stub and WinFsp resolves far less of the link machinery
+    // than Linux VFS, so the observations are RECORDED as the capability-
+    // matrix evidence; only namespace consistency is asserted.
+    let (ok, body) = rpc_call(
+        &ctx.rpc_url(),
+        "symlink",
+        "{\"path\":\"/w/w-link\",\"target\":\"w1.bin\"}",
+    );
+    assert!(ok, "W8: RPC symlink create failed: {body}");
+    let (ok, body) = rpc_call(
+        &ctx.rpc_url(),
+        "symlink",
+        "{\"path\":\"/w/w-dangling\",\"target\":\"no-such-target\"}",
+    );
+    assert!(ok, "W8: RPC dangling symlink create failed: {body}");
+    let link = dir.join("w-link");
+    match std::fs::symlink_metadata(&link) {
+        Ok(m) => println!(
+            "  INFO W8 symlink_metadata(w-link): len={} is_symlink={}",
+            m.len(),
+            m.file_type().is_symlink()
+        ),
+        Err(e) => println!("  INFO W8 symlink_metadata(w-link) -> {e}"),
+    }
+    match std::fs::read_link(&link) {
+        Ok(t) => println!("  INFO W8 read_link -> {:?}", t.display().to_string()),
+        Err(e) => println!("  INFO W8 read_link -> {e} (cb_readlink is an ENOSYS stub)"),
+    }
+    match std::fs::read(&link) {
+        Ok(bytes) => println!(
+            "  INFO W8 open through link -> {} bytes (WinFsp resolved it)",
+            bytes.len()
+        ),
+        Err(e) => println!("  INFO W8 open through link -> {e}"),
+    }
+    match std::fs::metadata(dir.join("w-dangling")) {
+        Ok(_) => println!("  INFO W8 dangling link followed to something (unexpected)"),
+        Err(e) => println!("  INFO W8 dangling link open -> {e}"),
+    }
+    // create-link from the mount itself: Win32 CreateSymbolicLinkW (the
+    // only way std cannot do this - the windows fs::symlink API was never
+    // stabilized). WinFsp's FUSE layer should translate this to our symlink
+    // callback, which is deliberately not wired (ENOSYS). Whichever error
+    // comes back - ENOSYS from the FS or the privilege error - is recorded.
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateSymbolicLinkW(
+            lpsymlinkfilename: *const u16,
+            lptargetfilename: *const u16,
+            dwflags: u32,
+        ) -> u8;
+    }
+    fn to_wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    let rc = unsafe {
+        CreateSymbolicLinkW(
+            to_wide(dir.join("w-local-link").to_str().unwrap()).as_ptr(),
+            to_wide("w1.bin").as_ptr(),
+            0,
+        )
+    };
+    if rc == 0 {
+        println!(
+            "  INFO W8 mount-side symlink create -> {} (last_os_error)",
+            std::io::Error::last_os_error()
+        );
+    } else {
+        println!("  INFO W8 mount-side symlink create -> succeeded (Win32-level)");
+    }
+    let _ = std::fs::remove_file(dir.join("w-local-link"));
+    assert!(
+        dir_names(&dir).contains(&"w6.txt".to_string()),
+        "W8: directory must stay consistent after link observations"
+    );
+    println!("  OK   W8 out-of-band link nodes observed and recorded (see INFO lines)");
+
+    println!("    OK W: Windows semantics section complete");
 }
 
 impl Ctx {
