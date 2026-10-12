@@ -1614,8 +1614,9 @@ fn section_w(ctx: &Ctx, root: &Path) {
         ),
         Ok(()) => panic!("W9: rmdir of a non-empty dir must fail"),
     }
+    let child = std::fs::read(ne.join("child.txt")).expect("W9 child read-back");
     assert!(
-        std::fs::read(ne.join("child.txt")).as_deref() == Ok(b"keep".as_slice()),
+        child == b"keep",
         "W9: refused rmdir must keep the child intact"
     );
     std::fs::remove_file(ne.join("child.txt")).expect("W9 rm child");
