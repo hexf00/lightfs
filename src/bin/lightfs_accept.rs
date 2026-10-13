@@ -2144,7 +2144,90 @@ fn section_e(ctx: &mut Ctx, root: &Path) {
     assert_bytes("E6 destination content", &e6dst, b"E6-KEEP+POST-FAIL");
     assert_bytes("E6 source intact", &pp_root.join("a/x"), b"AAA");
 
+    // E7 (S1b-final): the rename's PREPARE snapshot read fails. The /p rule
+    // keeps its bytes in a plain local dir, so a chmod 000 makes the data
+    // unreadable while it stays intact (reversible - the handle must be
+    // able to read it again afterwards; rm would destroy the bytes and no
+    // code could bring them back). With an open write handle on the target,
+    // prepare must abort the rename instead of silently treating the read
+    // failure as an empty snapshot (the old unwrap_or(0)/unwrap_or_default
+    // behavior renamed right through it).
+    let pol7 = policy_config(
+        &base_cfg,
+        &ctx.workdir,
+        "cfg-policy-e7.toml",
+        &format!(
+            "[[policy.rule]]\nprefix = \"/p\"\nstorage = \"client-local\"\nroot = {:?}",
+            roots.join("rp")
+        ),
+    );
+    let target_p7 = format!("{target_p}7");
+    std::fs::create_dir_all(&target_p7).expect("E7 mountpoint");
+    let pm7 = ctx.spawn_mount_cfg(
+        target_p7.clone(),
+        &pol7,
+        &[("LIGHTFS_FUSE_ATTR_TTL_SECS", "0")],
+        "mount-p7",
+    );
+    let p7_root = PathBuf::from(&target_p7).join("p");
+    std::fs::create_dir_all(&p7_root).expect("E7 mkdir /p");
+    let e7dst = p7_root.join("t.txt");
+    let e7src = p7_root.join("s.txt");
+    {
+        // Both files committed through the mount (client-local bytes).
+        let mut ht = open_create(&e7dst);
+        write_at(&mut ht, 0, b"TARGET");
+        flush_strong(&mut ht, "E7 dst seed fsync");
+        // ht stays OPEN across the rename attempt: it is the handle whose
+        // base snapshot prepare must take.
+        let mut hs = open_create(&e7src);
+        write_at(&mut hs, 0, b"SOURCE");
+        flush_strong(&mut hs, "E7 src seed fsync");
+
+        // Make the destination's data unreadable (intact, reversible).
+        let backing = roots.join("rp").join("t.txt");
+        std::fs::set_permissions(
+            &backing,
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .expect("E7 chmod 000");
+
+        let failed = std::fs::rename(&e7src, &e7dst);
+        assert!(
+            failed.is_err(),
+            "E7: rename must fail when the prepare snapshot read fails"
+        );
+
+        // Nothing moved, nothing was orphaned, nothing was retired.
+        assert!(
+            e7dst.exists() && e7src.exists(),
+            "E7: both files must survive"
+        );
+        std::fs::set_permissions(
+            &backing,
+            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+        )
+        .expect("E7 chmod back");
+        // The target's original handle still reads its own content.
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        ht.seek(SeekFrom::Start(0)).expect("E7 seek");
+        let mut got = Vec::new();
+        ht.read_to_end(&mut got)
+            .expect("E7 read through target handle");
+        assert_eq!(
+            got, b"TARGET",
+            "E7: target handle lost its content: {got:?}"
+        );
+        // Accepted buffered writes still flush, byte-exact.
+        write_at(&mut ht, 6, b"+MORE");
+        flush_strong(&mut ht, "E7 fsync after failed rename");
+        assert_bytes("E7 target after post-failure flush", &e7dst, b"TARGET+MORE");
+        assert_bytes("E7 source untouched", &e7src, b"SOURCE");
+    }
+
     // cleanup (d-style, but the server stays for the main teardown)
+    drop(pm7);
+    ctx.unmount_at(&target_p7);
     drop(pm3);
     ctx.unmount_at(&target_pp);
     drop(pm2);

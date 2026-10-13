@@ -1448,7 +1448,12 @@ impl Filesystem for FuseAdapter {
         // base bytes while the name still resolves to the OLD file (after
         // a successful overwrite it resolves to the mover). No session is
         // touched here: a failed rename (cross-policy EXDEV, races, meta
-        // errors) must leave every handle exactly as it was.
+        // errors) must leave every handle exactly as it was. A snapshot
+        // that CANNOT be taken aborts the rename outright - swallowing a
+        // failed lookup/read as an empty base would hand the victim
+        // handle an empty view of its own file once detached. An EMPTY
+        // file is the Ok(zero bytes) success case, never an error
+        // stand-in.
         let dest_ino = self.ino_of_path(&new_path);
         let detached_base = match dest_ino {
             Some(_) => {
@@ -1459,12 +1464,14 @@ impl Filesystem for FuseAdapter {
                     .values()
                     .any(|st| st.path == new_path && !st.orphaned);
                 if victims {
-                    let size = self
-                        .fs
-                        .lookup(&new_path)
-                        .map(|n| n.size as u64)
-                        .unwrap_or(0);
-                    Some(self.fs.read(&new_path, 0, size).unwrap_or_default())
+                    let size = match self.fs.lookup(&new_path) {
+                        Ok(n) => n.size as u64,
+                        Err(e) => return reply.error(errno(&e)),
+                    };
+                    match self.fs.read(&new_path, 0, size) {
+                        Ok(bytes) => Some(bytes),
+                        Err(e) => return reply.error(errno(&e)),
+                    }
                 } else {
                     None
                 }
