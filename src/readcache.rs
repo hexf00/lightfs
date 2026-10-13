@@ -13,10 +13,12 @@
 //!   the instance records the prefix for diagnostics),
 //! - the VERSION and the ETAG are validated on EVERY hit against a live
 //!   authoritative lookup — an entry that no longer matches is dropped,
-//!   never served. The etag is not decoration: SQLite reuses rowids (no
-//!   AUTOINCREMENT), so a deleted file's id is handed to the next created
-//!   file, and two one-commit files both sit at version 1 — version alone
-//!   cannot tell them apart. The etag is a content fingerprint, but the
+//!   never served. The etag is not decoration: it is what keeps a hit
+//!   honest when (node_id, version) alone cannot identify content. The
+//!   motivating hole is historical now — before stable id allocation
+//!   (R4.2c), SQLite reused rowids, handing a deleted file's id to the
+//!   next created file, and two one-commit files both sat at version 1 —
+//!   and the etag stays as defense in depth for the identity pair. The etag is a content fingerprint, but the
 //!   two backends do NOT give it equal strength: the embedded store
 //!   computes it locally as a truncated SHA-256 of the bytes, while on S3
 //!   it is whatever the service reports (the ETag header of a plain PUT,
@@ -115,12 +117,13 @@ struct Entry {
     /// S3 it is whatever the service reported at commit time (ETag header
     /// of a plain PUT, the complete-multipart XML value) — content-derived
     /// by convention, implementation-defined beyond that. The (node_id,
-    /// version) pair alone does NOT identify content: SQLite reuses rowids
-    /// (no AUTOINCREMENT), so a deleted file's id can be handed to a newly
-    /// created file, and two one-commit files both sit at version 1. The
-    /// etag closes that hole only while it is non-empty and differs when
-    /// content differs — so an EMPTY etag never forms an entry (see
-    /// [`MemoryReadCache::insert`]): such data is simply not cached.
+    /// version) pair alone has not always identified content: before stable
+    /// id allocation (R4.2c) SQLite reused rowids, so a deleted file's id
+    /// could be handed to a newly created file and two one-commit files
+    /// both sat at version 1. The etag closes that hole while it is
+    /// non-empty and differs when content differs — so an EMPTY etag never
+    /// forms an entry (see [`MemoryReadCache::insert`]): such data is
+    /// simply not cached.
     etag: Box<str>,
     bytes: Arc<Vec<u8>>,
     seq: u64,

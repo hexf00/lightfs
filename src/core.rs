@@ -1547,8 +1547,16 @@ mod symlink_tests {
         let b = c.commit_write(&hb).unwrap();
         // AUTOINCREMENT: the recreated file got a fresh id.
         assert_ne!(b.id, a.id, "ids must never be reused");
-        assert!(c.lookup_by_id(a.id).is_err());
-        assert!(c.open_read_by_id(a.id, 0, 64).is_err());
+        // and the old identity is precisely IdentityGone, not some other
+        // error or another file's bytes
+        assert!(
+            matches!(c.lookup_by_id(a.id), Err(Error::IdentityGone(_))),
+            "lookup through a recycled id must report IdentityGone"
+        );
+        assert!(
+            matches!(c.open_read_by_id(a.id, 0, 64), Err(Error::IdentityGone(_))),
+            "a read through a recycled id must report IdentityGone"
+        );
         assert_eq!(c.read("/b", 0, 64).unwrap(), b"B's bytes");
     }
 

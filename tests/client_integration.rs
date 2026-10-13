@@ -8,7 +8,7 @@ use lightfs::api::FsApi;
 use lightfs::client::{Client, ClientConfig};
 use lightfs::config::Config;
 use lightfs::engine;
-use lightfs::error::Result;
+use lightfs::error::{Error, Result};
 
 struct TestServer {
     url: String,
@@ -264,16 +264,22 @@ fn recycled_identity_rpc_old_sessions_cannot_touch_recreated_file() {
         "AUTOINCREMENT never re-issues the deleted id"
     );
 
-    // by-id read via the old identity is an error, never the new bytes
+    // by-id read via the old identity is precisely IdentityGone over the
+    // wire, never the new bytes
     assert!(
-        a.read_by_id(node.id, "/f", 0, 64).is_err(),
-        "the old identity must be gone"
+        matches!(
+            a.read_by_id(node.id, "/f", 0, 64),
+            Err(Error::IdentityGone(_))
+        ),
+        "the old identity must surface as IdentityGone on the client"
     );
 
-    // the stale session's commit is rejected; the new file is untouched
+    // the stale session's commit is rejected; the new file is untouched:
+    // bytes, version, object key
     assert!(stale.commit().is_err(), "stale session must not commit");
     assert_eq!(a.read("/f", 0, 64).unwrap(), b"reborn bytes");
     let after = a.lookup("/f").unwrap();
     assert_eq!(after.version, 1, "recreated file untouched");
     assert_eq!(after.id, reborn.id);
+    assert_eq!(after.object_key, reborn.object_key, "object key unchanged");
 }

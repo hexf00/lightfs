@@ -4,12 +4,12 @@
 //! fixed at id=1 (parent NULL). All operations take BEGIN IMMEDIATE so a
 //! process sharing this store (the single server) sees serialized writes.
 //!
-//! Stable identity (R4.2c): `nodes.id` is AUTOINCREMENT, so a deleted
-//! node's id is NEVER handed to a later node — (id, version) identifies
-//! content for the whole lifetime of the database. This holds from CREATE
-//! time on; a database written before this schema cannot satisfy the
-//! guarantee and is rejected at open (never auto-migrated): re-initialize
-//! the store instead.
+//! Stable identity (R4.2c): `nodes.id` is AUTOINCREMENT, so ids a database
+//! has already allocated are never re-issued by that same database —
+//! (id, version) identifies content for the database's lifetime. The
+//! property is created WITH the schema: a database written before this
+//! schema cannot satisfy it and is rejected at open (never auto-migrated);
+//! re-initialize the store instead.
 
 use std::sync::Mutex;
 
@@ -91,30 +91,30 @@ impl SqliteMetadataStore {
     ///
     /// A database whose `nodes` table predates AUTOINCREMENT cannot satisfy
     /// the stable-identity guarantee and is rejected BEFORE anything is
-    /// written (even the journal-mode pragma) — the legacy file is left
-    /// byte-for-byte alone. There is deliberately no migration: the store
-    /// must be re-initialized (stop the service, unmount all clients,
-    /// discard the metadata database and the object namespace).
+    /// written (even the journal-mode pragma) — the legacy database is
+    /// left untouched: no schema change, no rows, no pragma side effects.
+    /// There is deliberately no migration: the store must be re-initialized
+    /// (stop the service, unmount all clients, discard the metadata
+    /// database and the object namespace). The check keys on the id
+    /// column's actual definition (see
+    /// [`Self::nodes_table_matches_contract`]), not on the stored SQL
+    /// text.
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
-        let nodes_sql: Option<String> = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'nodes'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(sql) = nodes_sql {
-            if !sql.contains("AUTOINCREMENT") {
-                return Err(Error::Storage(
-                    "nodes table predates AUTOINCREMENT id allocation: stable identity \
-                     is not satisfiable on this database. Re-initialize the store \
-                     (stop the service, unmount all clients, discard the metadata \
-                     database and the test object namespace, then start fresh); \
-                     automatic migration is intentionally not supported"
-                        .into(),
-                ));
-            }
+        let nodes_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'nodes'",
+            [],
+            |r| r.get(0),
+        )?;
+        if nodes_exists > 0 && !Self::nodes_table_matches_contract(&conn)? {
+            return Err(Error::Storage(
+                "nodes table predates AUTOINCREMENT id allocation: stable identity \
+                 is not satisfiable on this database. Re-initialize the store \
+                 (stop the service, unmount all clients, discard the metadata \
+                 database and the test object namespace, then start fresh); \
+                 automatic migration is intentionally not supported"
+                    .into(),
+            ));
         }
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -128,6 +128,54 @@ impl SqliteMetadataStore {
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Definition-level contract check for an existing `nodes` table — it
+    /// reads what the ENGINE recorded, never the CREATE statement's text:
+    ///
+    /// - every required column is present (`pragma_table_info`);
+    /// - `sqlite_sequence` holds a row for this table, the engine's own
+    ///   bookkeeping for AUTOINCREMENT tables (the row appears on first
+    ///   insert; `open` always seeds root id 1, so every database this code
+    ///   initialized has one). A legacy table that merely mentions the word
+    ///   AUTOINCREMENT anywhere in its SQL text has no such row and must
+    ///   not pass. The marker is engine-managed: a hand-forged
+    ///   sqlite_sequence row is out-of-model tampering, the same class as
+    ///   external tools writing the table directly.
+    fn nodes_table_matches_contract(conn: &Connection) -> Result<bool> {
+        const REQUIRED: [&str; 11] = [
+            "id",
+            "parent_id",
+            "name",
+            "kind",
+            "size",
+            "mtime",
+            "mode",
+            "object_key",
+            "version",
+            "etag",
+            "target",
+        ];
+        let mut present: Vec<String> = Vec::new();
+        let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('nodes')")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        for name in rows {
+            present.push(name?);
+        }
+        if REQUIRED.iter().any(|col| !present.iter().any(|c| c == col)) {
+            return Ok(false);
+        }
+        // The sqlite_sequence table itself exists only once some
+        // AUTOINCREMENT table exists; a legacy-only database has neither
+        // (the failed lookup counts as "no marker").
+        let marker: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_sequence WHERE name = 'nodes'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        Ok(marker > 0)
     }
 
     /// In-memory store for tests.
@@ -712,6 +760,68 @@ mod tests {
             before, after,
             "a rejected open must not touch the legacy file"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R4.2c review fix: the rejection must key on the id column's ACTUAL
+    /// definition, not on the word AUTOINCREMENT appearing in the stored
+    /// CREATE text. This legacy table is plain INTEGER PRIMARY KEY, but its
+    /// SQL text contains the word (in a column DEFAULT) — the previous
+    /// text-substring check admitted it; the definition-level check must
+    /// refuse it.
+    #[test]
+    fn legacy_table_mentioning_autoincrement_in_text_is_still_rejected() {
+        let dir = std::env::temp_dir().join(format!("lightfs-ra-word-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy-word.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE nodes (
+                    id INTEGER PRIMARY KEY, parent_id INTEGER, name TEXT NOT NULL,
+                    kind TEXT NOT NULL, size INTEGER NOT NULL DEFAULT 0,
+                    mtime INTEGER NOT NULL, mode INTEGER, object_key TEXT,
+                    version TEXT, etag TEXT, target TEXT,
+                    remark TEXT DEFAULT 'AUTOINCREMENT',
+                    UNIQUE(parent_id, name)
+                );
+                INSERT INTO nodes (id, parent_id, name, kind, size, mtime, mode)
+                VALUES (1, NULL, '', 'dir', 0, 0, 493);",
+            )
+            .unwrap();
+        }
+        let snapshot = |p: &std::path::Path| {
+            let conn = rusqlite::Connection::open(p).unwrap();
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'nodes'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+                .unwrap();
+            (sql, rows)
+        };
+        assert!(
+            snapshot(&path).0.contains("AUTOINCREMENT"),
+            "counterexample premise: the word IS in the stored SQL text"
+        );
+        let before = snapshot(&path);
+
+        match SqliteMetadataStore::open(path.to_str().unwrap()) {
+            Ok(_) => panic!(
+                "a table whose id is not AUTOINCREMENT must be rejected even when its SQL text mentions the word"
+            ),
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(msg.contains("AUTOINCREMENT"), "actionable message: {msg}");
+            }
+        }
+
+        assert_eq!(before, snapshot(&path), "rejected open must not write");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
