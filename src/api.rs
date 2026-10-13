@@ -4,7 +4,7 @@
 //! see SQLite or S3.
 
 use crate::core::{Core, WriteHandle};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::metadata::Node;
 
 /// One buffered write session. Commit publishes content atomically with
@@ -46,6 +46,40 @@ pub trait FsApi: Send + Sync {
     fn symlink(&self, target: &str, path: &str) -> Result<Node>;
     /// Return the stored target of the symlink at `path` (no-follow).
     fn readlink(&self, path: &str) -> Result<String>;
+
+    // ---- stable-identity anchors (M-phase protocol) ----
+    //
+    // These locate a node by its STABLE id instead of re-resolving the
+    // path, so an open handle keeps working across renames by other
+    // clients and a deleted identity fails with IdentityGone instead of
+    // aliasing the new occupant of the recycled path. `path_hint` is for
+    // error messages/diagnostics only - never consulted for resolution.
+    // Default implementations degrade to the path form so adapters that
+    // have no id anchor (WinFsp) keep their exact current behavior.
+
+    /// stat a node by id.
+    fn lookup_by_id(&self, node_id: i64, path_hint: &str) -> Result<Node> {
+        let _ = node_id;
+        self.lookup(path_hint)
+    }
+
+    /// read a byte range by id.
+    fn read_by_id(&self, node_id: i64, path_hint: &str, offset: u64, size: u64) -> Result<Vec<u8>> {
+        let _ = node_id;
+        self.read(path_hint, offset, size)
+    }
+
+    /// start a buffered write session anchored on the id (the session's
+    /// commit must then carry the id end-to-end).
+    fn open_write_by_id(
+        &self,
+        node_id: i64,
+        path: &str,
+        expected_version: Option<i64>,
+    ) -> Result<Box<dyn WriteSession + '_>> {
+        let _ = node_id;
+        self.open_write(path, expected_version)
+    }
 }
 
 struct CoreWriteSession<'a> {
@@ -114,5 +148,27 @@ impl FsApi for Core {
     }
     fn readlink(&self, path: &str) -> Result<String> {
         Core::readlink(self, path)
+    }
+    fn lookup_by_id(&self, node_id: i64, _path_hint: &str) -> Result<Node> {
+        Core::lookup_by_id(self, node_id)
+    }
+    fn read_by_id(&self, node_id: i64, _path_hint: &str, offset: u64, size: u64) -> Result<Vec<u8>> {
+        let (mut r, len) = Core::open_read_by_id(self, node_id, offset, size)?;
+        use std::io::Read as _;
+        let mut out = Vec::with_capacity(len as usize);
+        r.read_to_end(&mut out)?;
+        Ok(out)
+    }
+    fn open_write_by_id(
+        &self,
+        node_id: i64,
+        path: &str,
+        expected_version: Option<i64>,
+    ) -> Result<Box<dyn WriteSession + '_>> {
+        // In-process there is no re-resolution step to get wrong: anchor
+        // the handle on the id and let commit_write's existing by-id CAS
+        // gate versions (path stays for error messages only).
+        let handle = Core::open_write_id(self, node_id, path, expected_version)?;
+        Ok(Box::new(CoreWriteSession { core: self, handle }))
     }
 }

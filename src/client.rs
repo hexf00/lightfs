@@ -105,6 +105,10 @@ struct RpcErrorWire {
 
 struct ClientWriteSession<'a> {
     client: &'a Client,
+    /// STABLE node id this session is anchored on: the commit routes by
+    /// id, so a rename by another client cannot detach the session from
+    /// its own file (the path stays for diagnostics only).
+    node_id: i64,
     path: String,
     expected_version: i64,
     chunks: BTreeMap<u64, Vec<u8>>,
@@ -127,9 +131,12 @@ impl WriteSession for ClientWriteSession<'_> {
             content.resize(end, 0);
             content[off as usize..off as usize + data.len()].copy_from_slice(data);
         }
-        let node =
-            self.client
-                .write_node(&self.path, &content, Some(self.expected_version), false)?;
+        let node = self.client.write_node_by_id(
+            self.node_id,
+            &self.path,
+            &content,
+            Some(self.expected_version),
+        )?;
         self.client.after_mutation(&self.path);
         Ok(node)
     }
@@ -246,6 +253,48 @@ impl Client {
         node_from_json(&v)
     }
 
+    /// Commit anchored on the STABLE node id: the server locates the node
+    /// by id (never re-resolving the path), so the CAS gate protects THIS
+    /// file across renames by other clients, and a deleted identity fails
+    /// with IDENTITY_GONE instead of writing onto a path successor.
+    fn write_node_by_id(
+        &self,
+        node_id: i64,
+        path_hint: &str,
+        data: &[u8],
+        expected_version: Option<i64>,
+    ) -> Result<Node> {
+        let encoded_path = crate::sigv4::uri_encode(path_hint, true);
+        let mut builder = self
+            .agent
+            .post(format!("{}/data/write", self.url))
+            .header("X-LightFS-Path", &encoded_path)
+            .header("X-LightFS-Create", "0")
+            .header("X-LightFS-Node-Id", node_id.to_string())
+            .header("X-LightFS-Length", data.len().to_string());
+        if let Some(v) = expected_version {
+            builder = builder.header("X-LightFS-Expected-Version", v.to_string());
+        }
+        let mut resp = crate::metrics::time("client.data.write", || {
+            builder
+                .send(data)
+                .map_err(|e| Error::Io(format!("data/write transport: {e}")))
+        })?;
+        let status = resp.status().as_u16();
+        let text = resp
+            .body_mut()
+            .with_config()
+            .limit(MAX_RESPONSE_BODY)
+            .read_to_string()
+            .map_err(|e| Error::Io(e.to_string()))?;
+        if !(200..300).contains(&status) {
+            return Err(error_from_body(status, &text));
+        }
+        let v: Value =
+            serde_json::from_str(&text).map_err(|e| Error::Io(format!("node json: {e}")))?;
+        node_from_json(&v)
+    }
+
     /// Drop cached state affected by a local mutation of `path`.
     fn after_mutation(&self, path: &str) {
         if self.ttl.is_none() {
@@ -265,6 +314,7 @@ fn path_parent(path: &str) -> String {
 
 fn wire_to_error(e: &RpcErrorWire) -> Error {
     match e.code.as_str() {
+        "IDENTITY_GONE" => Error::IdentityGone(e.message.clone()),
         "NOT_FOUND" => Error::NotFound(e.message.clone()),
         "ALREADY_EXISTS" => Error::AlreadyExists(e.message.clone()),
         "CONFLICT" => Error::Conflict {
@@ -431,6 +481,69 @@ impl FsApi for Client {
         }
         Ok(Box::new(ClientWriteSession {
             client: self,
+            node_id: node.id,
+            path: path.to_string(),
+            expected_version: expected_version.unwrap_or(node.version),
+            chunks: BTreeMap::new(),
+        }))
+    }
+
+    fn lookup_by_id(&self, node_id: i64, _path_hint: &str) -> Result<Node> {
+        // Always a live RPC: the id anchor exists precisely because a
+        // cached (path -> node) snapshot may lie after another client's
+        // rename/unlink.
+        let r = self.call("lookup", json!({"node_id": node_id}))?;
+        node_from_json(&r)
+    }
+
+    fn read_by_id(&self, node_id: i64, _path_hint: &str, offset: u64, size: u64) -> Result<Vec<u8>> {
+        let mut resp = crate::metrics::time("client.data.read", || {
+            self.agent
+                .post(format!("{}/data/read", self.url))
+                .header("Content-Type", "application/json")
+                .send(
+                    json!({"node_id": node_id, "offset": offset, "size": size})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .map_err(|e| Error::Io(format!("data/read transport: {e}")))
+        })?;
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            let text = resp
+                .body_mut()
+                .with_config()
+                .limit(MAX_RESPONSE_BODY)
+                .read_to_string()
+                .unwrap_or_default();
+            return Err(error_from_body(status, &text));
+        }
+        resp.body_mut()
+            .with_config()
+            .limit(MAX_RESPONSE_BODY)
+            .read_to_vec()
+            .map_err(|e| Error::Io(e.to_string()))
+    }
+
+    fn open_write_by_id(
+        &self,
+        node_id: i64,
+        path: &str,
+        expected_version: Option<i64>,
+    ) -> Result<Box<dyn WriteSession + '_>> {
+        // Live version observation through the id anchor (see lookup_by_id).
+        let r = self.call("lookup", json!({"node_id": node_id}))?;
+        let node = node_from_json(&r)?;
+        if !node.is_file() {
+            return Err(Error::KindMismatch {
+                path: path.to_string(),
+                expected: "file",
+                actual: "dir".into(),
+            });
+        }
+        Ok(Box::new(ClientWriteSession {
+            client: self,
+            node_id,
             path: path.to_string(),
             expected_version: expected_version.unwrap_or(node.version),
             chunks: BTreeMap::new(),

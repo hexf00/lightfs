@@ -187,19 +187,31 @@ fn handle_request_inner(mut req: tiny_http::Request, core: &Core) {
             } else {
                 serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null)
             };
-            let parsed = (|| -> Result<(String, u64, u64)> {
-                let path = params["path"]
-                    .as_str()
-                    .ok_or_else(|| Error::InvalidArgument("path".into()))?;
+            let parsed = (|| -> Result<(Option<String>, u64, u64, Option<i64>)> {
+                // path is optional when the request carries a node-id
+                // anchor (M-phase identity protocol): the id locates the
+                // node, the path would only be a stale hint anyway.
+                let path = params["path"].as_str().map(String::from);
                 let offset = params["offset"]
                     .as_u64()
                     .ok_or_else(|| Error::InvalidArgument("offset".into()))?;
                 let size = params["size"]
                     .as_u64()
                     .ok_or_else(|| Error::InvalidArgument("size".into()))?;
-                Ok((path.to_string(), offset, size))
+                let node_id = params["node_id"].as_i64();
+                if path.is_none() && node_id.is_none() {
+                    return Err(Error::InvalidArgument("path".into()));
+                }
+                Ok((path, offset, size, node_id))
             })();
-            match parsed.and_then(|(path, offset, size)| core.open_read(&path, offset, size)) {
+            let read_result = match parsed {
+                Ok((path, offset, size, node_id)) => match node_id {
+                    Some(id) => core.open_read_by_id(id, offset, size),
+                    None => core.open_read(path.as_deref().unwrap_or(""), offset, size),
+                },
+                Err(e) => Err(e),
+            };
+            match read_result {
                 Ok((reader, len)) => {
                     let header = tiny_http::Header::from_bytes(
                         &b"Content-Type"[..],
@@ -351,9 +363,34 @@ fn handle_request_inner(mut req: tiny_http::Request, core: &Core) {
                     )));
                 }
                 // Validation passed — only now touch the object store and
-                // the metadata CAS.
+                // the metadata CAS. A node-id anchor (M-phase identity
+                // protocol) routes by STABLE id; identity-aware callers
+                // must not mix it with create-if-missing (an id write
+                // cannot create anything).
                 let mut f = std::fs::OpenOptions::new().read(true).open(&_guard.0)?;
-                core.write_stream(&path, expected_version, create, &mut f, written)
+                let node_id = req
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv("X-LightFS-Node-Id"))
+                    .and_then(|h| h.value.as_str().parse::<i64>().ok());
+                if let (Some(_), true) = (node_id, create) {
+                    return Err(Error::InvalidArgument(
+                        "X-LightFS-Node-Id cannot be combined with X-LightFS-Create=1".into(),
+                    ));
+                }
+                match node_id {
+                    Some(id) => {
+                        // An id-anchored commit without a version condition
+                        // would have to invent an anchor; refuse instead.
+                        let expected = expected_version.ok_or_else(|| {
+                            Error::InvalidArgument(
+                                "X-LightFS-Node-Id requires X-LightFS-Expected-Version".into(),
+                            )
+                        })?;
+                        core.write_stream_by_id(id, expected, &mut f, written)
+                    }
+                    None => core.write_stream(&path, expected_version, create, &mut f, written),
+                }
             })();
             match outcome {
                 Ok(node) => {

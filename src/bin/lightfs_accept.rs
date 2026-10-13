@@ -17,13 +17,20 @@
 //!   C  crash/persistence: dirty-data mount kill, server crash + remount,
 //!      rename/delete/enum, shell-client cross-check, offline fsck,
 //!      unmount-on-death
+//!   D  cross-client stable identity (Linux only): TWO mounts on one
+//!      server - ino==node id on both clients, open handles survive a
+//!      cross-client rename (read D5, write+fsync D1), a deleted identity
+//!      fails explicitly and never aliases the new occupant of the path
+//!      (D2/D3/D6b), CAS gates concurrent writers (D4/D6), identity
+//!      survives a server restart (D7)
 //!
 //! Usage (caller provides MinIO and a server-mode config):
 //!   lightfs-accept --lightfs ./lightfs --config cfg.toml --mount-target /mnt/x
 //!   lightfs-accept --lightfs lightfs.exe --config cfg.toml --mount-target Q:
 //! Optional:
 //!   --shell ./lightfs-shell   (client cross-check, section C)
-//!   --section a,b,c           (default: all)
+//!   --section a,b,c,d         (default: a,b,c; d must be requested and
+//!                              runs LAST - it tears everything down)
 //!   --selftest                (no mounts: run the local-only assertions
 //!                              against a temp dir - harness sanity check)
 
@@ -44,6 +51,10 @@ struct Ctx {
     server_url: String,
     server: Option<Child>,
     mount: Option<Child>,
+    /// Second FUSE mount on the SAME server: the B client of the
+    /// cross-client section D (stable file identity). None elsewhere.
+    mount2: Option<Child>,
+    mount_target2: String,
     section_list: Vec<String>,
     #[allow(dead_code)] // printed in the env header only on the mount path
     workdir: PathBuf,
@@ -55,6 +66,10 @@ struct Ctx {
 impl Drop for Ctx {
     fn drop(&mut self) {
         if let Some(c) = self.mount.as_mut() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        if let Some(c) = self.mount2.as_mut() {
             let _ = c.kill();
             let _ = c.wait();
         }
@@ -235,50 +250,58 @@ impl Ctx {
     /// BEFORE the mount, so "path exists" proves nothing - verify with
     /// mountpoint(1); on Windows a drive letter only exists once mounted.
     fn start_mount(&mut self) {
-        let root = PathBuf::from(&self.mount_target);
+        // Short dir-snapshot TTL (fuse-only, default 30): A12 exercises the
+        // expired-snapshot path in seconds. No other test leaves a walk
+        // open anywhere near this long, so nothing else can hit it.
+        let child = self.spawn_mount(
+            self.mount_target.clone(),
+            &[("LIGHTFS_FUSE_DIR_SNAPSHOT_SECS", "2")],
+            "mount",
+        );
+        self.mount = Some(child);
+    }
+
+    /// Spawn a mount process at `target` with extra env and WAIT until the
+    /// mount really appears. Returns the child; the caller owns the slot.
+    /// Section D uses this for BOTH mounts with ATTR_TTL=0 (a cached attr
+    /// would mask cross-client identity changes behind a stale size/inode).
+    fn spawn_mount(&mut self, target: String, envs: &[(&str, &str)], name: &str) -> Child {
+        let root = PathBuf::from(&target);
         // A mount still listed for the target is a stale (possibly DEAD)
         // leftover: mounting over it stacks and fails weirdly on old
         // kernels (seen on CentOS 7 / 3.10: fresh conn dies with
         // ENOTCONN, leaving another corpse). Detect via /proc/mounts -
         // mountpoint(1) LIES on dead mounts (exit 0 with "Transport
         // endpoint is not connected").
-        if cfg!(unix) && Self::unix_mounted(&self.mount_target) {
+        if cfg!(unix) && Self::unix_mounted(&target) {
             panic!(
                 "mount target {} already has a mount listed - a stale mount was not cleaned up",
-                self.mount_target
+                target
             );
         }
         let mut cmd = Command::new(&self.lightfs);
-        cmd.args(["mount", "--config"])
-            .arg(&self.config)
-            .arg(&self.mount_target);
-        // Short dir-snapshot TTL (fuse-only, default 30): A12 exercises the
-        // expired-snapshot path in seconds. No other test leaves a walk
-        // open anywhere near this long, so nothing else can hit it.
-        cmd.env("LIGHTFS_FUSE_DIR_SNAPSHOT_SECS", "2");
-        cmd.stdout(Stdio::null()).stderr(self.child_stderr("mount"));
-        self.mount = Some(cmd.spawn().expect("spawn lightfs mount"));
+        cmd.args(["mount", "--config"]).arg(&self.config).arg(&target);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        cmd.stdout(Stdio::null()).stderr(self.child_stderr(name));
+        let mut child = cmd.spawn().expect("spawn lightfs mount");
 
         for _ in 0..120 {
             let appeared = if cfg!(unix) {
-                Self::unix_mounted(&self.mount_target)
+                Self::unix_mounted(&target)
             } else {
                 root.exists()
             };
             if appeared {
-                return;
+                return child;
             }
-            if let Some(c) = self.mount.as_mut() {
-                if c.try_wait().map(|s| s.is_some()).unwrap_or(false) {
-                    panic!(
-                        "mount process exited before {} was mounted",
-                        self.mount_target
-                    );
-                }
+            if child.try_wait().map(|s| s.is_some()).unwrap_or(false) {
+                panic!("mount process exited before {} was mounted", target);
             }
             std::thread::sleep(Duration::from_millis(500));
         }
-        panic!("mount target {} never appeared", self.mount_target);
+        panic!("mount target {} never appeared", target);
     }
 
     /// Kill the mount daemon. Does NOT unmount: an unmount while fds may
@@ -308,6 +331,11 @@ impl Ctx {
     /// Windows: the kernel unmounts a drive when its process dies; wait
     /// for the letter to vanish.
     fn unmount_target(&self) {
+        self.unmount_at(&self.mount_target);
+    }
+
+    /// Unmount a specific target (section D's second mount).
+    fn unmount_at(&self, mount_target: &str) {
         if cfg!(unix) {
             for um in [
                 ["fusermount3", "-u"],
@@ -317,7 +345,7 @@ impl Ctx {
                 ["umount", "-l"],
             ] {
                 let _ = Command::new(um[0])
-                    .args([um[1], &self.mount_target])
+                    .args([um[1], mount_target])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status();
@@ -325,17 +353,17 @@ impl Ctx {
             // Truth source is /proc/mounts: mountpoint(1) reports success
             // on DEAD mounts ("Transport endpoint is not connected").
             for _ in 0..40 {
-                if !Self::unix_mounted(&self.mount_target) {
+                if !Self::unix_mounted(mount_target) {
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(250));
             }
             panic!(
                 "mount target {} still listed after unmount attempts",
-                self.mount_target
+                mount_target
             );
         } else {
-            let root = PathBuf::from(&self.mount_target);
+            let root = PathBuf::from(mount_target);
             for _ in 0..60 {
                 if !root.exists() {
                     return;
@@ -344,7 +372,7 @@ impl Ctx {
             }
             panic!(
                 "mount target {} still present after mount process death",
-                self.mount_target
+                mount_target
             );
         }
     }
@@ -1457,6 +1485,303 @@ fn section_c(ctx: &mut Ctx, root: &Path) {
 
 // ---------------------------------------------------------------- entry
 
+// ---------------------------------------------------------------------------
+// D: cross-client stable file identity (two FUSE mounts, ONE server).
+//
+// Contract under test (M-phase identity protocol):
+//   - the FUSE ino IS the server node id on every client (D0)
+//   - an open handle stays bound to its node id: a rename by ANOTHER client
+//     keeps the handle usable - reads follow the node (D5) and writes/fsync
+//     commit through the new name (D1)
+//   - a DELETED identity fails explicitly; it must never alias whatever
+//     now lives on the recycled path, and a version coincidence must not
+//     mask the identity mismatch (D2, D3, D6b)
+//   - concurrent writers to one node are gated by CAS: exactly the anchor's
+//     version wins, the loser reports an error (D4, D6)
+//   - identity and CAS anchors survive a server restart (D7)
+//
+// Both mounts run with LIGHTFS_FUSE_ATTR_TTL_SECS=0: a cached attr would
+// mask cross-client changes behind a plausible-looking size/inode.
+#[cfg(unix)]
+fn section_d(ctx: &mut Ctx, root: &Path, root2: &Path) {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::MetadataExt;
+
+    println!("--- D: cross-client stable identity (two mounts) ---");
+    let ino_of = |p: &Path| -> u64 { std::fs::metadata(p).expect("stat").ino() };
+    let open_rw = |p: &Path| -> std::fs::File {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(p)
+            .expect("open rw")
+    };
+
+    // D0 baseline: same file, both clients, same inode number.
+    std::fs::create_dir_all(root.join("d")).unwrap();
+    std::fs::create_dir_all(root2.join("d")).unwrap();
+    let _ = std::fs::metadata(root.join("d")).expect("D0: stat d dir through mount A");
+    let f0 = root.join("d/id0");
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&f0)
+    {
+        Ok(_) => {}
+        Err(e) => panic!("D0: create_new failed: {e}"),
+    }
+    // Reopen with O_TRUNC (the exact open_create shape the suite uses).
+    drop(std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .open(&f0)
+        .expect("D0: truncating reopen"));
+    write_strong(&f0, b"IDENTITY", "D0 seed");
+    assert_eq!(
+        ino_of(&f0),
+        ino_of(&root2.join("d/id0")),
+        "D0: the same file must report the SAME ino on both clients (ino == server node id)"
+    );
+    println!("  OK  D0 ino identity across mounts");
+
+    // D1 B renames behind A's open handle; A keeps writing and fsyncs.
+    // Contract: the handle is bound to the node id, so the commit goes
+    // through the NEW name and the data lands on the SAME node.
+    {
+        let f1 = root.join("d/r1");
+        write_strong(&f1, b"AAAA", "D1 seed");
+        let seed_ino = ino_of(&f1);
+        let mut fa = open_rw(&f1);
+        std::fs::rename(root2.join("d/r1"), root2.join("d/r1m")).expect("D1: B rename");
+        write_at(&mut fa, 4, b"BBBB");
+        if let Err(e) = fa.sync_all() {
+            panic!(
+                "D1 RED: fsync after cross-client rename failed ({e}) - the handle must stay bound to its node id and commit through the new name"
+            );
+        }
+        drop(fa);
+        assert_bytes("D1 renamed file carries A's write", &root2.join("d/r1m"), b"AAAABBBB");
+        assert!(!root.join("d/r1").exists(), "D1: old name must be gone");
+        assert_eq!(
+            ino_of(&root2.join("d/r1m")),
+            seed_ino,
+            "D1: rename must not change the node id"
+        );
+        println!("  OK  D1 fsync follows rename (write through new name)");
+    }
+
+    // D2 B unlinks the file behind A's open handle. The fd survives (POSIX),
+    // but a flush that cannot persist must REPORT so - never a silent Ok -
+    // and nothing may resurrect the name.
+    {
+        let f2 = root.join("d/u2");
+        write_strong(&f2, b"SEED2", "D2 seed");
+        let mut fa = open_rw(&f2);
+        std::fs::remove_file(root2.join("d/u2")).expect("D2: B unlink");
+        write_at(&mut fa, 5, b"MORE");
+        if fa.sync_all().is_ok() {
+            panic!(
+                "D2 RED: fsync reported success after another client deleted the node - silent loss"
+            );
+        }
+        drop(fa);
+        assert!(
+            !root2.join("d/u2").exists() && !root.join("d/u2").exists(),
+            "D2: unlink must stick on every client"
+        );
+        println!("  OK  D2 unlink reports identity-gone (no silent Ok)");
+    }
+
+    // D3 B renames ANOTHER file OVER the target A holds open. A's handle
+    // points at the dead node: reading it must never serve the incoming
+    // file's bytes, and a write+fsync must not land on the new occupant
+    // through a version coincidence.
+    {
+        let fa_p = root.join("d/ov_a");
+        let fc_p = root.join("d/ov_c");
+        write_strong(&fa_p, b"AAAA-SRC", "D3 src");
+        write_strong(&fc_p, b"CCCC-OLD", "D3 target");
+        let old_c_ino = ino_of(&fc_p);
+        let src_ino = ino_of(&root2.join("d/ov_a"));
+        let mut fc = open_rw(&fc_p);
+        std::fs::rename(root2.join("d/ov_a"), root2.join("d/ov_c"))
+            .expect("D3: B rename-over");
+        // 1) reads through the stale handle must fail explicitly, never
+        //    serve the new occupant (no clean page cache: the handle never
+        //    wrote, so this read really reaches the adapter)
+        fc.seek(SeekFrom::Start(0)).unwrap();
+        let mut buf = Vec::new();
+        match fc.read_to_end(&mut buf) {
+            Ok(_) if buf == b"AAAA-SRC" => panic!(
+                "D3 RED: stale handle silently reads the NEW occupant of the path ({} bytes cross-read)",
+                buf.len()
+            ),
+            Ok(_) => panic!(
+                "D3: stale handle read succeeded with unexpected content {:?}",
+                String::from_utf8_lossy(&buf)
+            ),
+            Err(_) => {} // explicit failure = the selected contract
+        }
+        // 2) writes through the stale handle must not commit into the new
+        //    occupant even when versions happen to line up
+        write_at(&mut fc, 0, b"ZZZZ");
+        if fc.sync_all().is_ok() {
+            panic!(
+                "D3 RED: fsync committed into a node this handle no longer owns - identity mismatch masked by a version coincidence"
+            );
+        }
+        drop(fc);
+        assert_bytes("D3 incoming file unpolluted", &root2.join("d/ov_c"), b"AAAA-SRC");
+        assert_eq!(
+            ino_of(&root2.join("d/ov_c")),
+            src_ino,
+            "D3: the incoming file keeps its own node id"
+        );
+        assert_ne!(ino_of(&root2.join("d/ov_c")), old_c_ino);
+        println!("  OK  D3 rename-over: stale handle fails explicitly, no cross-read, no clobber");
+    }
+
+    // D4 concurrent writers, one node: CAS gates. B's stale-anchor commit
+    // loses with a visible error; a fresh handle commits cleanly.
+    {
+        let f4 = root.join("d/cas");
+        write_strong(&f4, b"0000", "D4 seed");
+        let mut fa = open_rw(&f4);
+        let mut fb = open_rw(&root2.join("d/cas"));
+        write_at(&mut fa, 0, b"AAAA");
+        fa.sync_all().expect("D4: A commits first");
+        write_at(&mut fb, 0, b"BBBB");
+        if fb.sync_all().is_ok() {
+            panic!("D4 RED: B's stale-version commit succeeded over A's - CAS did not gate");
+        }
+        drop(fb);
+        assert_bytes("D4 winner content", &root2.join("d/cas"), b"AAAA");
+        let mut fb2 = open_rw(&root2.join("d/cas"));
+        write_at(&mut fb2, 0, b"CCCC");
+        fb2.sync_all().expect("D4: fresh handle commits on the new version");
+        assert_bytes("D4 fresh writer content", &root2.join("d/cas"), b"CCCC");
+        println!("  OK  D4 concurrent CAS: loser rejected, fresh writer proceeds");
+    }
+
+    // D5 pure READ through a handle after a cross-client rename: the
+    // kernel revalidates attrs BEFORE the read, so this also proves
+    // getattr does not short-circuit the I/O on the renamed node.
+    {
+        let f5 = root.join("d/rr");
+        write_strong(&f5, b"DATA05", "D5 seed");
+        let ino5 = ino_of(&f5);
+        let mut fa = open_rw(&f5);
+        std::fs::rename(root2.join("d/rr"), root2.join("d/rrm")).expect("D5: B rename");
+        fa.seek(SeekFrom::Start(0)).unwrap();
+        let mut buf = Vec::new();
+        match fa.read_to_end(&mut buf) {
+            Ok(_) => assert_eq!(
+                buf, b"DATA05",
+                "D5: read through handle after rename returned wrong bytes"
+            ),
+            Err(e) => panic!(
+                "D5 RED: read through handle after cross-client rename failed: {e} - the handle must follow its node id"
+            ),
+        }
+        drop(fa);
+        assert_eq!(ino_of(&root2.join("d/rrm")), ino5, "D5: node id unchanged");
+        println!("  OK  D5 read follows rename (getattr must not short-circuit)");
+    }
+
+    // D6 version change between open and commit: the stale task must fail
+    // WITHOUT clobbering the newer version. Then D6b - the identity trap:
+    // B renames the node away and a NEW file takes the old path with the
+    // version A anchored on; A's flush must fail on identity, not sneak
+    // onto the new file through the version coincidence.
+    {
+        let f6 = root.join("d/vc");
+        write_strong(&f6, b"V1.....", "D6 seed");
+        let mut fa = open_rw(&f6);
+        write_at(&mut fa, 0, b"W1");
+        // B rewrites the whole file from the other client
+        write_strong(&root2.join("d/vc"), b"V2-NEW", "D6 B rewrite");
+        if fa.sync_all().is_ok() {
+            panic!("D6 RED: A's stale-version flush succeeded over B's newer version");
+        }
+        assert_bytes("D6 B version intact", &root2.join("d/vc"), b"V2-NEW");
+
+        // D6b: the identity TRAP. B renames the node away AND DELETES it,
+        // then a NEW file takes the old path with a version that happens
+        // to line up. A path-anchored flush would sneak onto the new
+        // occupant through the version coincidence (the K3 defect); the
+        // id anchor must fail with identity-gone instead.
+        std::fs::rename(root2.join("d/vc"), root2.join("d/vc_moved")).expect("D6b: B rename");
+        write_strong(&root2.join("d/vc"), b"FRESH", "D6b new occupant");
+        std::fs::remove_file(root2.join("d/vc_moved")).expect("D6b: B deletes A's node");
+        write_at(&mut fa, 6, b"W2");
+        if fa.sync_all().is_ok() {
+            panic!(
+                "D6b RED: flush succeeded although this handle's node was deleted - identity mismatch masked by the recycled path"
+            );
+        }
+        drop(fa);
+        assert_bytes("D6b new occupant unpolluted", &root2.join("d/vc"), b"FRESH");
+        assert!(
+            !root2.join("d/vc_moved").exists(),
+            "D6b: the deleted node stays deleted"
+        );
+        println!("  OK  D6/D6b stale version rejected; deleted identity fails explicitly");
+    }
+
+    // D7 identity survives a server restart: metadata (node id, version)
+    // is durable, so an open handle's CAS anchor still matches after the
+    // restart and the commit lands on the SAME node - never on a lookalike.
+    {
+        let f7 = root.join("d/persist");
+        write_strong(&f7, b"PERSIST", "D7 seed");
+        let ino7 = ino_of(&f7);
+        let mut fa = open_rw(&f7);
+        write_at(&mut fa, 7, b"X");
+        ctx.kill_server();
+        ctx.start_server();
+        fa.sync_all()
+            .expect("D7: flush after server restart must succeed on the durable identity");
+        drop(fa);
+        assert_bytes("D7 committed through restart", &root2.join("d/persist"), b"PERSISTX");
+        assert_eq!(
+            ino_of(&root2.join("d/persist")),
+            ino7,
+            "D7: node id survives the restart"
+        );
+        println!("  OK  D7 identity + CAS anchor survive server restart");
+    }
+
+    // Offline fsck over everything D touched (server stopped first).
+    ctx.kill_mount_only();
+    if let Some(c) = ctx.mount2.as_mut() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    ctx.mount2 = None;
+    ctx.unmount_at(&ctx.mount_target2.clone());
+    let m_child = ctx.mount.take();
+    drop(m_child);
+    ctx.unmount_target();
+    ctx.kill_server();
+    let out = Command::new(&ctx.lightfs)
+        .args(["fsck", "--config"])
+        .arg(&ctx.config)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("D: fsck spawn");
+    if !out.status.success() {
+        panic!(
+            "D: fsck reported problems after the cross-client section (exit {:?}): {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+    println!("  OK  D: offline fsck clean");
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut lightfs = PathBuf::from("lightfs");
@@ -1505,6 +1830,8 @@ fn main() {
             server_url: String::new(),
             server: None,
             mount: None,
+            mount2: None,
+            mount_target2: String::new(),
             section_list: vec!["a".into()],
             workdir: dir.clone(),
             adapter: false,
@@ -1543,10 +1870,12 @@ fn main() {
         lightfs,
         shell,
         config,
-        mount_target,
+        mount_target: mount_target.clone(),
         server_url,
         server: None,
         mount: None,
+        mount2: None,
+        mount_target2: format!("{mount_target}x"),
         section_list: sections,
         workdir,
         adapter: true,
@@ -1566,6 +1895,36 @@ fn main() {
     }
     if ctx.sections_want("c") {
         section_c(&mut ctx, &root);
+    }
+    #[cfg(unix)]
+    if ctx.sections_want("d") {
+        // D brings its own mount lifecycle: BOTH mounts without attr
+        // caching (a cached attr would mask cross-client identity
+        // changes), second mountpoint derived from the first.
+        ctx.ensure_running();
+        ctx.kill_mount();
+        let target2 = ctx.mount_target2.clone();
+        std::fs::create_dir_all(&target2).expect("create D second mountpoint");
+        let m1 = ctx.spawn_mount(
+            ctx.mount_target.clone(),
+            &[
+                ("LIGHTFS_FUSE_ATTR_TTL_SECS", "0"),
+                ("LIGHTFS_FUSE_DIR_SNAPSHOT_SECS", "2"),
+            ],
+            "mount",
+        );
+        ctx.mount = Some(m1);
+        let m2 = ctx.spawn_mount(
+            target2.clone(),
+            &[("LIGHTFS_FUSE_ATTR_TTL_SECS", "0")],
+            "mount2",
+        );
+        ctx.mount2 = Some(m2);
+        let root2 = PathBuf::from(&target2);
+        section_d(&mut ctx, &root, &root2);
+        // section_d ends with both mounts and the server torn down; the
+        // suite's other sections must have run BEFORE d.
+        println!("MOUNTS TORN DOWN (d)");
     }
     #[cfg(unix)]
     if ctx.sections_want("stress") {

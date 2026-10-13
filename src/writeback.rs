@@ -287,6 +287,11 @@ impl PendingEof {
 
 pub struct PendingWrite {
     pub path: String,
+    /// STABLE node id captured when write intent started. The commit
+    /// anchors on THIS id (not the path), so a rename by another client
+    /// cannot detach the session from its file and a deleted identity
+    /// fails explicitly instead of aliasing the path successor.
+    pub node_id: i64,
     /// Version captured when write intent started; the CAS anchor.
     pub expected_version: i64,
     pub chunks: ChunkMap,
@@ -304,17 +309,26 @@ pub struct PendingWrite {
     /// this file's bytes. Writes go there and reads are served from it
     /// until the last handle closes; None on a live (non-orphaned) session.
     pub detached_ino: Option<u64>,
+    /// Set when a flush/fsync reported an error to the application. The
+    /// release-time best-effort commit must then STAY BEST-EFFORT-REFUSED:
+    /// the app already saw the failure, and a close-time retry that flips
+    /// the outcome would turn "error + not committed" into the lie
+    /// "error + committed anyway". An explicit retry flush clears this by
+    /// succeeding (note_commit_success).
+    pub flush_failed: bool,
 }
 
 impl PendingWrite {
-    pub fn new(path: String, expected_version: i64) -> Self {
+    pub fn new(path: String, node_id: i64, expected_version: i64) -> Self {
         Self {
             path,
+            node_id,
             expected_version,
             chunks: ChunkMap::new(),
             committed: false,
             orphaned: false,
             detached_ino: None,
+            flush_failed: false,
         }
     }
 
@@ -324,6 +338,7 @@ impl PendingWrite {
     /// here, so that next commit's CAS succeeds).
     pub fn note_commit_success(&mut self, new_version: i64) -> bool {
         self.expected_version = new_version;
+        self.flush_failed = false;
         if self.chunks.is_empty() {
             self.committed = true;
             true
@@ -448,7 +463,7 @@ mod tests {
 
     #[test]
     fn commit_success_with_new_chunks_stays_uncommitted() {
-        let mut s = PendingWrite::new("/f".into(), 1);
+        let mut s = PendingWrite::new("/f".into(), 77, 1);
         s.chunks.insert(0, b"old".to_vec());
         let drained = s.chunks.drain();
         // a write lands while the commit is in flight
@@ -467,7 +482,7 @@ mod tests {
 
     #[test]
     fn restore_under_lets_newer_writes_win() {
-        let mut s = PendingWrite::new("/f".into(), 1);
+        let mut s = PendingWrite::new("/f".into(), 77, 1);
         s.chunks.insert(0, vec![b'O'; 8192]); // old batch [0, 8192)
         let drained = s.chunks.drain();
         // during the (failing) commit, a new write lands at [4096, 4196)
@@ -484,7 +499,7 @@ mod tests {
 
     #[test]
     fn restore_under_covers_tail_beyond_new_write() {
-        let mut s = PendingWrite::new("/f".into(), 1);
+        let mut s = PendingWrite::new("/f".into(), 77, 1);
         s.chunks.insert(0, b"OLDOLDOLD".to_vec()); // [0, 9)
         let drained = s.chunks.drain();
         s.chunks.insert(0, b"new".to_vec()); // [0, 3) newer

@@ -3,7 +3,7 @@
 //! Request:  {"id":N,"method":"lookup","params":{...}}
 //! Response: {"id":N,"ok":true,"result":...} | {"id":N,"ok":false,"error":{...}}
 //!
-//! The protocol never exposes SQLite/S3 internals.
+//! The protocol never exposes SQLite/S3 internals (see the design notes).
 //! `write` is stateless and atomic: the client buffers its WriteSession and
 //! commits the whole content in one call, carrying expected_version for
 //! optimistic concurrency. Server restarts therefore cannot lose sessions.
@@ -142,6 +142,13 @@ fn handle(core: &Core, method: &str, params: &Value) -> Result<Value> {
             }))
         }
         "lookup" | "getattr" | "open" => {
+            // Optional node_id anchor (M-phase identity protocol): stat by
+            // STABLE id instead of path. Old clients never send it and keep
+            // the path behavior unchanged.
+            if let Some(id) = p_opt_i64(params, "node_id") {
+                let node = core.lookup_by_id(id)?;
+                return Ok(node_to_json(&node));
+            }
             let path = p_str(params, "path")?;
             let node = if method == "open" {
                 core.open(&path)?

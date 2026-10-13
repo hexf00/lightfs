@@ -333,6 +333,7 @@ fn visible_eof(path: &str, committed_size: u64) -> u64 {
 fn errno(e: &Error) -> c_int {
     match e {
         Error::NotFound(_) | Error::ParentNotFound(_) | Error::ObjectMissing(_) => ENOENT,
+        Error::IdentityGone(_) => ENOENT,
         Error::AlreadyExists(_) => EEXIST,
         Error::KindMismatch {
             expected: "dir", ..
@@ -404,7 +405,7 @@ fn start_write(fs: &dyn FsApi, path: &str) -> Result<u64, Error> {
     WRITES
         .lock()
         .unwrap()
-        .insert(fh, PendingWrite::new(path.to_string(), node.version));
+        .insert(fh, PendingWrite::new(path.to_string(), node.id, node.version));
     Ok(fh)
 }
 
@@ -454,6 +455,9 @@ fn commit_write(fh: u64) -> Result<(), Error> {
             if let Some(v) = observed {
                 sess.rebase(v);
             }
+            // mirror fuse.rs: the app saw this failure; release must not
+            // retry it behind its back (flush_failed gates cb_release)
+            sess.flush_failed = true;
         }
         e
     };
@@ -781,7 +785,20 @@ unsafe extern "system" fn cb_release(path: *const c_char, fi: *mut FuseFileInfo)
             return -EINVAL;
         };
         let fh = (*fi).fh;
-        if let Err(e) = commit_write(fh) {
+        // Same gate as fuse.rs release: a session whose flush already
+        // reported an error to the application must not flip the outcome
+        // through a close-time retry (the app was told it did NOT commit).
+        let already_failed = WRITES
+            .lock()
+            .unwrap()
+            .get(&fh)
+            .map(|st| st.flush_failed)
+            .unwrap_or(false);
+        if already_failed {
+            eprintln!(
+                "lightfs-winfsp: WARNING release: fh={fh} ({path}) had a FAILED flush; close-time retry REFUSED - data not persisted"
+            );
+        } else if let Err(e) = commit_write(fh) {
             // Release's result is ignored by the DLL; flush/fsync surface errors.
             eprintln!(
                 "lightfs-winfsp: WARNING release: final commit FAILED for {path} (fh={fh}): {e} - data not persisted"

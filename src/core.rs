@@ -2,7 +2,7 @@
 //! Embedded mode, the server, and (through the client protocol) FUSE all
 //! go through this module. Adapters never touch SQLite or S3 directly.
 //!
-//! Concurrency model (architecture):
+//! Concurrency model (see the design notes, concurrency section):
 //! - metadata mutations are serialized by the metadata store's transactions
 //! - file content uses optimistic version checking; stale writes get CONFLICT,
 //!   never a silent overwrite
@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::metadata::{MetadataStore, Node, NodeKind};
 use crate::object_store::ObjectStore;
 
-/// Counters per spec. Cheap atomics; the benchmark reads them.
+/// Counters per the spec notes. Cheap atomics; the benchmark reads them.
 #[derive(Debug, Default)]
 pub struct Metrics {
     pub s3_get: AtomicU64,
@@ -246,6 +246,16 @@ impl Core {
         }
     }
 
+    /// By-id lookup: stat a node by its STABLE id. A rename on another
+    /// client is invisible here by construction (rename only moves
+    /// parent/name - the id never changes); a deleted node reports
+    /// IdentityGone, never the new occupant of the old path.
+    pub fn lookup_by_id(&self, node_id: i64) -> Result<Node> {
+        self.meta
+            .get_node(node_id)?
+            .ok_or_else(|| Error::IdentityGone(node_id.to_string()))
+    }
+
     /// symlink(target, link_path): store the target VERBATIM. Fails with
     /// AlreadyExists if ANY node occupies the final name (POSIX EEXIST).
     pub fn symlink(&self, target: &str, link_path: &str) -> Result<Node> {
@@ -410,6 +420,39 @@ impl Core {
                 actual: "dir".into(),
             });
         }
+        self.open_read_node(&node, offset, size)
+    }
+
+    /// By-id read: the node is located by its STABLE id, so a rename by
+    /// another client cannot detach an open handle from its bytes, and a
+    /// deleted node reports IdentityGone instead of whatever now lives on
+    /// the recycled path.
+    pub fn open_read_by_id(
+        &self,
+        node_id: i64,
+        offset: u64,
+        size: u64,
+    ) -> Result<(Box<dyn std::io::Read + Send>, u64)> {
+        let node = self
+            .meta
+            .get_node(node_id)?
+            .ok_or_else(|| Error::IdentityGone(node_id.to_string()))?;
+        if !node.is_file() {
+            return Err(Error::KindMismatch {
+                path: node_id.to_string(),
+                expected: "file",
+                actual: "dir".into(),
+            });
+        }
+        self.open_read_node(&node, offset, size)
+    }
+
+    fn open_read_node(
+        &self,
+        node: &Node,
+        offset: u64,
+        size: u64,
+    ) -> Result<(Box<dyn std::io::Read + Send>, u64)> {
         if offset >= node.size as u64 || size == 0 {
             return Ok((Box::new(std::io::empty()), 0));
         }
@@ -455,13 +498,53 @@ impl Core {
             });
         }
         let expected = expected_version.unwrap_or(node.version);
+        self.write_stream_node(&node, expected, reader, len, create_if_missing && node.version == 1)
+    }
+
+    /// By-id streaming write: the node is located by its STABLE id (never
+    /// re-resolved through the path), so a rename by another client cannot
+    /// detach an open handle from its own commit, and a deleted node fails
+    /// with IdentityGone instead of writing onto whatever took its place.
+    /// `create_if_missing` is meaningless for an id anchor: the caller MUST
+    /// pass false (the protocol surface enforces this).
+    pub fn write_stream_by_id(
+        &self,
+        node_id: i64,
+        expected_version: i64,
+        reader: &mut dyn std::io::Read,
+        len: u64,
+    ) -> Result<Node> {
+        let node = self
+            .meta
+            .get_node(node_id)?
+            .ok_or_else(|| Error::IdentityGone(node_id.to_string()))?;
+        if !node.is_file() {
+            return Err(Error::KindMismatch {
+                path: node_id.to_string(),
+                expected: "file",
+                actual: "dir".into(),
+            });
+        }
+        self.write_stream_node(&node, expected_version, reader, len, false)
+    }
+
+    /// CAS commit shared by both anchors. `drop_created_node` mirrors the
+    /// path-anchored create-if-missing cleanup (no phantom empty file).
+    fn write_stream_node(
+        &self,
+        node: &Node,
+        expected: i64,
+        reader: &mut dyn std::io::Read,
+        len: u64,
+        drop_created_node: bool,
+    ) -> Result<Node> {
         let version_key = self.new_version_key(node.id);
         let info = match self.objects.put_stream(&version_key, reader, len) {
             Ok(info) => info,
             Err(e) => {
                 // If we created the node for this write, don't leave a
                 // phantom empty file behind.
-                if create_if_missing && node.version == 1 {
+                if drop_created_node {
                     let _ = self.meta.delete_node(node.id);
                 }
                 let _ = self.objects.delete(&version_key);
@@ -483,7 +566,7 @@ impl Core {
                 if let Some(old_key) = &node.object_key {
                     self.retire_object(old_key);
                 }
-                let mut node = node;
+                let mut node = node.clone();
                 node.size = len as i64;
                 node.version += 1;
                 node.etag = info.etag;
@@ -522,6 +605,32 @@ impl Core {
         })
     }
 
+    /// Start a buffered write session anchored on the STABLE node id: the
+    /// handle is located by id (never re-resolving the path), and the
+    /// existing by-id CAS in commit_write gates versions.
+    pub fn open_write_id(
+        &self,
+        node_id: i64,
+        path_hint: &str,
+        expected_version: Option<i64>,
+    ) -> Result<WriteHandle> {
+        let node = self.lookup_by_id(node_id)?;
+        if !node.is_file() {
+            return Err(Error::KindMismatch {
+                path: path_hint.to_string(),
+                expected: "file",
+                actual: "dir".into(),
+            });
+        }
+        let expected = expected_version.unwrap_or(node.version);
+        Ok(WriteHandle {
+            file_id: node.id,
+            path: path_hint.to_string(),
+            expected_version: expected,
+            chunks: Mutex::new(BTreeMap::new()),
+        })
+    }
+
     /// Buffer bytes at `offset` for a later commit_write.
     pub fn write(&self, handle: &WriteHandle, offset: u64, data: &[u8]) -> Result<usize> {
         if data.is_empty() {
@@ -538,13 +647,13 @@ impl Core {
     ///
     /// 1. upload to a per-write version key `objects/<id>/w-<uniq>.data`
     ///    (immutable once written — a losing writer can never overwrite the
-    ///    winner's bytes)
+    ///    winner's bytes - the design notes, concurrency section)
     /// 2. flip the node's object pointer with a single-statement CAS
     ///    (`WHERE version = expected`); only the CAS winner becomes current
     /// 3. on conflict, delete our version key and report CONFLICT
     /// 4. on success, best-effort delete the superseded object; until that
     ///    runs (or after a crash) the old key is a stale version that fsck
-    ///    reports
+    ///    reports (the spec notes, fsck section)
     pub fn commit_write(&self, handle: &WriteHandle) -> Result<Node> {
         // Fast-fail before any network I/O; the CAS below is the real gate.
         let node = self

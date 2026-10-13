@@ -34,6 +34,12 @@ pub enum Error {
     Storage(String),
     /// Object missing in the object store (fsck/detach between layers).
     ObjectMissing(String),
+    /// A stable node identity (node id) an open handle was bound to no
+    /// longer exists: the file was deleted by another client while the
+    /// handle stayed open. Distinct from NotFound (path-based) so a caller
+    /// can tell "the path is gone" from "THIS identity is gone" - the
+    /// identity-aware commit must never mask this behind a generic error.
+    IdentityGone(String),
     /// Metadata store failure.
     Db(String),
     /// I/O failure.
@@ -73,6 +79,7 @@ impl fmt::Display for Error {
             Error::InvalidArgument(m) => write!(f, "invalid argument: {m}"),
             Error::Storage(m) => write!(f, "object storage: {m}"),
             Error::ObjectMissing(k) => write!(f, "object missing: {k}"),
+            Error::IdentityGone(k) => write!(f, "identity gone: node {k} no longer exists"),
             Error::Db(m) => write!(f, "metadata: {m}"),
             Error::Io(m) => write!(f, "io: {m}"),
             Error::Config(m) => write!(f, "config: {m}"),
@@ -102,6 +109,7 @@ impl Error {
     pub fn code(&self) -> &'static str {
         match self {
             Error::NotFound(_) | Error::ParentNotFound(_) | Error::ObjectMissing(_) => "NOT_FOUND",
+            Error::IdentityGone(_) => "IDENTITY_GONE",
             Error::AlreadyExists(_) => "ALREADY_EXISTS",
             Error::Conflict { .. } => "CONFLICT",
             Error::KindMismatch { .. } => "KIND_MISMATCH",

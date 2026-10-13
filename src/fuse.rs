@@ -120,6 +120,10 @@ fn unix_to_systemtime(secs: i64) -> SystemTime {
 fn errno(e: &Error) -> Errno {
     match e {
         Error::NotFound(_) | Error::ParentNotFound(_) | Error::ObjectMissing(_) => Errno::ENOENT,
+        // The identity an open handle was bound to was deleted by another
+        // client. POSIX has no richer errno for this; the contract (M3) is
+        // that it fails explicitly and observably instead of aliasing.
+        Error::IdentityGone(_) => Errno::ENOENT,
         Error::AlreadyExists(_) => Errno::EEXIST,
         Error::KindMismatch {
             expected: "dir", ..
@@ -311,8 +315,17 @@ impl FuseAdapter {
     /// before flush. The kernel page cache usually serves those reads, but
     /// any attribute refresh / page eviction sends it HERE - and committed-
     /// only reads truncated files (git pack verification hit exactly that).
-    fn read_with_session(&self, path: &str, offset: u64, size: u64) -> Result<Vec<u8>, Error> {
-        let mut data = self.fs.read(path, offset, size)?;
+    fn read_with_session(
+        &self,
+        node_id: u64,
+        path: &str,
+        offset: u64,
+        size: u64,
+    ) -> Result<Vec<u8>, Error> {
+        // by-id: a rename by another client must not detach the read from
+        // this inode's bytes (the path only steers same-mount session
+        // coherence below).
+        let mut data = self.fs.read_by_id(node_id as i64, path, offset, size)?;
         let in_flight = self.pending.get(path);
         let want = if in_flight > offset {
             ((in_flight - offset) as usize).min(size as usize)
@@ -333,7 +346,8 @@ impl FuseAdapter {
 
     fn start_write(&self, path: &str) -> Result<u64, Error> {
         // Bypass caches where possible: the version we capture now decides
-        // optimistic concurrency at commit time.
+        // optimistic concurrency at commit time, and the node id becomes
+        // the session's stable anchor (the commit routes by id).
         let node = self.fs.lookup(path)?;
         if !node.is_file() {
             return Err(Error::KindMismatch {
@@ -343,10 +357,10 @@ impl FuseAdapter {
             });
         }
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-        self.writes
-            .lock()
-            .unwrap()
-            .insert(fh, PendingWrite::new(path.to_string(), node.version));
+        self.writes.lock().unwrap().insert(
+            fh,
+            PendingWrite::new(path.to_string(), node.id, node.version),
+        );
         Ok(fh)
     }
 
@@ -511,9 +525,9 @@ impl FuseAdapter {
                 state.committed = true;
                 return Ok(());
             }
-            (state.path.clone(), state.expected_version, drained)
+            (state.path.clone(), state.node_id, state.expected_version, drained)
         };
-        let (path, expected, drained) = snapshot;
+        let (path, node_id, expected, drained) = snapshot;
         let fail = |e: Error, observed: Option<i64>| -> Error {
             let mut writes = self.writes.lock().unwrap();
             if let Some(state) = writes.get_mut(&fh) {
@@ -521,24 +535,32 @@ impl FuseAdapter {
                 if let Some(v) = observed {
                     state.rebase(v);
                 }
+                // The app now knows this flush failed. A later EXPLICIT
+                // retry is the app's decision (A7 semantics); the implicit
+                // release-time retry must not flip the reported outcome
+                // (D4: a CAS loser must not win through close).
+                state.flush_failed = true;
             }
             e
         };
         // Write-back overlay: final content = the file's CURRENT committed
         // content with the drained chunks overlaid at their offsets (the
         // kernel only sends dirty pages - chunks alone would zero-fill the
-        // base and destroy existing data).
-        let node_now = match self.fs.lookup(&path) {
+        // base and destroy existing data). Everything routes by the
+        // session's STABLE node id: a rename by another client cannot
+        // detach this commit from its file, and a deleted identity fails
+        // with IdentityGone instead of touching the path successor.
+        let node_now = match self.fs.lookup_by_id(node_id, &path) {
             Ok(n) => n,
             Err(e) => return Err(fail(e, None)),
         };
-        let mut content = match self.fs.read(&path, 0, node_now.size as u64) {
+        let mut content = match self.fs.read_by_id(node_id, &path, 0, node_now.size as u64) {
             Ok(c) => c,
             Err(Error::ObjectMissing(_)) => Vec::new(),
             Err(e) => return Err(fail(e, Some(node_now.version))),
         };
         drained_overlay(&drained, &mut content);
-        let mut session = match self.fs.open_write(&path, Some(expected)) {
+        let mut session = match self.fs.open_write_by_id(node_id, &path, Some(expected)) {
             Ok(s) => s,
             Err(e) => return Err(fail(e, Some(node_now.version))),
         };
@@ -679,7 +701,7 @@ impl Filesystem for FuseAdapter {
                     crate::metrics::observe("fuse.getattr.cache_hit", Duration::ZERO);
                     n
                 }
-                None => match self.fs.lookup(&path) {
+                None => match self.fs.lookup_by_id(ino.0 as i64, &path) {
                     Ok(n) => {
                         self.attr_cache
                             .lock()
@@ -733,23 +755,26 @@ impl Filesystem for FuseAdapter {
             // open write sessions re-based to the new version — otherwise
             // the data flush would conflict with the truncation commit and
             // lose the user's data.
-            let node_now = match self.fs.lookup(&path) {
+            let node_now = match self.fs.lookup_by_id(ino.0 as i64, &path) {
                 Ok(n) => n,
                 Err(e) => return reply.error(errno(&e)),
             };
             let cur_len = (node_now.size as u64).min(new_size);
-            let commit = self.fs.read(&path, 0, cur_len).and_then(|mut content| {
-                if new_size > content.len() as u64 {
-                    // extension: zero-fill (ftruncate semantics)
-                    content.resize(new_size as usize, 0);
-                }
-                // CAS on the version we just observed: a concurrent commit
-                // between the lookup and here fails the truncate instead of
-                // silently clobbering it.
-                let mut ws = self.fs.open_write(&path, Some(node_now.version))?;
-                ws.write(0, &content)?;
-                ws.commit()
-            });
+            let commit = self
+                .fs
+                .read_by_id(ino.0 as i64, &path, 0, cur_len)
+                .and_then(|mut content| {
+                    if new_size > content.len() as u64 {
+                        // extension: zero-fill (ftruncate semantics)
+                        content.resize(new_size as usize, 0);
+                    }
+                    // CAS on the version we just observed: a concurrent commit
+                    // between the lookup and here fails the truncate instead of
+                    // silently clobbering it.
+                    let mut ws = self.fs.open_write_by_id(ino.0 as i64, &path, Some(node_now.version))?;
+                    ws.write(0, &content)?;
+                    ws.commit()
+                });
             match commit {
                 Ok(new_node) => {
                     let mut writes = self.writes.lock().unwrap();
@@ -1058,7 +1083,7 @@ impl Filesystem for FuseAdapter {
                 return reply.error(e);
             }
         };
-        match self.read_with_session(&path, offset, size as u64) {
+        match self.read_with_session(ino.0, &path, offset, size as u64) {
             Ok(data) => reply.data(&data),
             Err(e) => reply.error(errno(&e)),
         }
@@ -1109,7 +1134,7 @@ impl Filesystem for FuseAdapter {
             }
         }
         if state.committed {
-            match self.fs.lookup(&state.path) {
+            match self.fs.lookup_by_id(state.node_id, &state.path) {
                 Ok(node) => state.expected_version = node.version,
                 Err(e) => return reply.error(errno(&e)),
             }
@@ -1140,7 +1165,23 @@ impl Filesystem for FuseAdapter {
             "fuse.flush.inflight",
             std::time::Duration::from_micros(lvl as u64),
         );
-        let r = self.commit_write(fh.0);
+        // FLUSH is the kernel's CLOSE-side flush (fsync goes to the fsync
+        // callback). A session whose earlier flush/fsync already reported
+        // an error must not have that outcome silently flipped here: a
+        // close-time commit would turn "error + not committed" into "error
+        // + committed anyway" (D4: a CAS loser must not win through
+        // close). An explicit retry remains available through fsync (A7).
+        let gated = {
+            let writes = self.writes.lock().unwrap();
+            writes.get(&fh.0).map(|st| st.flush_failed).unwrap_or(false)
+        };
+        let r = if gated {
+            Err(Error::Io(
+                "earlier flush already reported failure; close-time retry refused (explicit fsync retry is still available)".into(),
+            ))
+        } else {
+            self.commit_write(fh.0)
+        };
         FLUSH_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         match r {
             Ok(()) => reply.ok(),
@@ -1173,7 +1214,22 @@ impl Filesystem for FuseAdapter {
         // orphaned sessions carry a blank path: nothing left to recompute,
         // and the name may belong to a different file now
         let path = if path.is_empty() { None } else { Some(path) };
-        if let Err(e) = self.commit_write(fh.0) {
+        let already_failed = {
+            let writes = self.writes.lock().unwrap();
+            writes.get(&fh.0).map(|st| st.flush_failed).unwrap_or(false)
+        };
+        if already_failed {
+            // The application already received a flush/fsync error for this
+            // session. Retrying here could commit data the app was told did
+            // NOT commit (CAS conflict loser winning through close) - the
+            // exact "error + committed anyway" lie M-phase forbids. An
+            // explicit retry flush remains the app's escape hatch (A7).
+            eprintln!(
+                "lightfs-fuse: WARNING release: fh={} ({}) had a FAILED flush; close-time retry REFUSED - data not persisted",
+                fh.0,
+                path.as_deref().unwrap_or("?")
+            );
+        } else if let Err(e) = self.commit_write(fh.0) {
             eprintln!(
                 "lightfs-fuse: WARNING release: final commit FAILED for fh={} ({}): {e} - data not persisted",
                 fh.0,
