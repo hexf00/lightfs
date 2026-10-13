@@ -16,9 +16,16 @@
 //!   never served. The etag is not decoration: SQLite reuses rowids (no
 //!   AUTOINCREMENT), so a deleted file's id is handed to the next created
 //!   file, and two one-commit files both sit at version 1 — version alone
-//!   cannot tell them apart, the content fingerprint can (the etag is a
-//!   content hash on both backends, so id+version+etag equal implies the
-//!   bytes equal, which keeps every hit correct within this model),
+//!   cannot tell them apart. The etag is a content fingerprint, but the
+//!   two backends do NOT give it equal strength: the embedded store
+//!   computes it locally as a truncated SHA-256 of the bytes, while on S3
+//!   it is whatever the service reports (the ETag header of a plain PUT,
+//!   the complete-multipart XML value) — content-derived by convention
+//!   for a plain PUT, implementation-defined beyond that. The guard
+//!   therefore rests on the etag being NON-EMPTY and differing when the
+//!   content differs; an empty etag makes the data UNCACHEABLE (no entry
+//!   can form, nothing is hit), which costs hit rate and never
+//!   correctness,
 //! - (node_id, offset, len) is the physical slot key, so a version bump
 //!   replaces the stale entry in O(log n) instead of accumulating.
 //!
@@ -102,14 +109,18 @@ struct SlotKey {
 
 struct Entry {
     version: i64,
-    /// Content fingerprint of the version object (sha256 prefix on the
-    /// embedded store, the storage service's ETag on S3). The (node_id,
+    /// Content fingerprint of the version object. NOT the same thing on
+    /// the two backends: the embedded store computes it locally as a
+    /// truncated SHA-256 of the bytes (proven content-derived), while on
+    /// S3 it is whatever the service reported at commit time (ETag header
+    /// of a plain PUT, the complete-multipart XML value) — content-derived
+    /// by convention, implementation-defined beyond that. The (node_id,
     /// version) pair alone does NOT identify content: SQLite reuses rowids
     /// (no AUTOINCREMENT), so a deleted file's id can be handed to a newly
-    /// created file, and two one-commit files both sit at version 1. Same
-    /// id + same version + same etag implies the same bytes (the etag is a
-    /// fingerprint of the content), which makes the extra check complete
-    /// within this threat model - and free of any protocol change.
+    /// created file, and two one-commit files both sit at version 1. The
+    /// etag closes that hole only while it is non-empty and differs when
+    /// content differs — so an EMPTY etag never forms an entry (see
+    /// [`MemoryReadCache::insert`]): such data is simply not cached.
     etag: Box<str>,
     bytes: Arc<Vec<u8>>,
     seq: u64,
@@ -204,6 +215,15 @@ impl MemoryReadCache {
         offset: u64,
         len: u64,
     ) -> Option<Arc<Vec<u8>>> {
+        // R4.3: entries with empty etags never form (insert refuses), so an
+        // empty-etag lookup is structurally always a miss. Kept explicit so
+        // the invariant holds even if a future entry-creating path slipped
+        // one in — version-only matching is exactly the id-reuse hole.
+        if etag.is_empty() {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            count_event(M_MISS);
+            return None;
+        }
         let key = SlotKey {
             node_id,
             offset,
@@ -285,6 +305,15 @@ impl MemoryReadCache {
         len: u64,
         bytes: Arc<Vec<u8>>,
     ) -> bool {
+        // R4.3: an empty etag means no content fingerprint exists (missing
+        // ETag header/XML value, or a pre-etag server) — an entry without
+        // one degenerates to version-only validation, which is exactly the
+        // id-reuse hole the etag exists to close. Such data is never
+        // cached: correctness over hit rate, reported as a bypass.
+        if etag.is_empty() {
+            count_event(M_BYPASS);
+            return false;
+        }
         let size = bytes.len() as u64;
         if size > self.max_bytes {
             self.oversize.fetch_add(1, Ordering::Relaxed);
@@ -402,6 +431,13 @@ impl CacheFs {
             // larger than the whole budget: skip the recheck RPC too —
             // there is nothing to insert
             self.cache.oversize.fetch_add(1, Ordering::Relaxed);
+            count_event(M_BYPASS);
+            return;
+        }
+        // R4.3: nothing would be cached for an empty etag (insert refuses
+        // it), so skip the recheck RPC entirely — same reasoning as the
+        // oversize skip above.
+        if insert_etag.is_empty() {
             count_event(M_BYPASS);
             return;
         }
@@ -1055,7 +1091,9 @@ mod r1 {
     /// have one commit (version 1 - the overwhelmingly common recreate
     /// shape), the version check alone cannot tell the entries apart and
     /// the DEAD file's cached bytes would be served for the LIVE file.
-    /// The guard is the etag (a content fingerprint on both backends).
+    /// The guard is the etag — a content fingerprint computed locally on
+    /// the embedded store, taken from the storage service on S3 (see the
+    /// module docs for the exact strength of each).
     #[test]
     fn recreated_identity_never_serves_the_dead_files_bytes() {
         let core = core_at("reuse");
@@ -1090,6 +1128,141 @@ mod r1 {
             got, b"the LIVE file's bytes",
             "the cache served the DEAD file's bytes for the recreated identity"
         );
+    }
+
+    /// R4.3 unit: an entry can never FORM for an empty etag — no insert,
+    /// no occupancy, no hit. This is the whole fix: empty etag (missing
+    /// ETag on the write response, or a pre-etag server) = not cached,
+    /// never version-only.
+    #[test]
+    fn empty_etag_entries_are_never_formed() {
+        let cache = MemoryReadCache::new(1 << 20);
+        assert!(
+            !cache.insert(7, 1, "", 0, 8, Arc::new(vec![0u8; 8])),
+            "empty-etag insert must be refused"
+        );
+        assert_eq!(cache.occupied_bytes(), 0, "nothing was stored");
+        assert!(
+            cache.get(7, 1, "", 0, 8).is_none(),
+            "an empty-etag lookup can never hit"
+        );
+        assert_eq!(cache.stats().misses, 1);
+    }
+
+    /// R4.3 degenerate scenario, end to end: a backend that provides NO
+    /// etags at all. Rowid reuse + version collision then cannot be told
+    /// apart by ANY metadata — so nothing may be cached for such data,
+    /// and the recreated file must read its own bytes through the cold
+    /// path. The double blanks the etag on both lookup forms, matching a
+    /// deployment where the etag channel is absent (missing header, old
+    /// server): the cache must degrade to NO caching, never to
+    /// version-only.
+    struct BlankEtagFs {
+        inner: Arc<Core>,
+    }
+    impl FsApi for BlankEtagFs {
+        fn lookup(&self, p: &str) -> Result<Node> {
+            let mut n = self.inner.lookup(p)?;
+            n.etag = String::new();
+            Ok(n)
+        }
+        fn readdir(&self, p: &str) -> Result<Vec<Node>> {
+            self.inner.readdir(p)
+        }
+        fn mkdir(&self, p: &str, m: u32) -> Result<Node> {
+            self.inner.mkdir(p, m)
+        }
+        fn create(&self, p: &str, m: u32) -> Result<Node> {
+            self.inner.create(p, m)
+        }
+        fn open(&self, p: &str) -> Result<Node> {
+            self.inner.open(p)
+        }
+        fn read(&self, p: &str, o: u64, s: u64) -> Result<Vec<u8>> {
+            self.inner.read(p, o, s)
+        }
+        fn open_write(&self, p: &str, e: Option<i64>) -> Result<Box<dyn WriteSession + '_>> {
+            FsApi::open_write(self.inner.as_ref(), p, e)
+        }
+        fn rename(&self, o: &str, n: &str) -> Result<()> {
+            self.inner.rename(o, n)
+        }
+        fn unlink(&self, p: &str) -> Result<()> {
+            self.inner.unlink(p)
+        }
+        fn rmdir(&self, p: &str) -> Result<()> {
+            self.inner.rmdir(p)
+        }
+        fn setattr(&self, p: &str, m: Option<u32>, t: Option<i64>) -> Result<Node> {
+            self.inner.setattr(p, m, t)
+        }
+        fn symlink(&self, t: &str, p: &str) -> Result<Node> {
+            self.inner.symlink(t, p)
+        }
+        fn readlink(&self, p: &str) -> Result<String> {
+            self.inner.readlink(p)
+        }
+        fn lookup_by_id(&self, id: i64, h: &str) -> Result<Node> {
+            let mut n = FsApi::lookup_by_id(self.inner.as_ref(), id, h)?;
+            n.etag = String::new();
+            Ok(n)
+        }
+        fn read_by_id(&self, id: i64, _h: &str, o: u64, s: u64) -> Result<Vec<u8>> {
+            FsApi::read_by_id(self.inner.as_ref(), id, "", o, s)
+        }
+    }
+
+    #[test]
+    fn etagless_backend_degenerates_to_no_caching_never_to_stale_bytes() {
+        let core = core_at("etagless");
+        let inner: Arc<dyn FsApi> = Arc::new(BlankEtagFs {
+            inner: core.clone(),
+        });
+        let f = CacheFs::with_cache(
+            inner,
+            "/hot".to_string(),
+            Arc::new(MemoryReadCache::new(1 << 20)),
+        );
+        f.mkdir("/hot", 0o755).unwrap();
+
+        // DEAD: create + commit + read. The read must NOT be cached.
+        f.create("/hot/f", 0o644).unwrap();
+        commit_bytes(&f, "/hot/f", b"the DEAD file's bytes");
+        let dead_id = f.lookup("/hot/f").unwrap().id;
+        assert_eq!(
+            f.read_by_id(dead_id, "/hot/f", 0, 100).unwrap(),
+            b"the DEAD file's bytes"
+        );
+        assert_eq!(
+            f.cache().occupied_bytes(),
+            0,
+            "etagless data is never cached"
+        );
+
+        // LIVE: unlink + recreate; rowid and version collide, and no etag
+        // exists to tell the two identities apart.
+        f.unlink("/hot/f").unwrap();
+        f.create("/hot/g", 0o644).unwrap();
+        commit_bytes(&f, "/hot/g", b"the LIVE file's bytes");
+        let live = f.lookup("/hot/g").unwrap();
+        assert_eq!(live.id, dead_id, "precondition: SQLite reused the rowid");
+        assert_eq!(
+            live.version, 1,
+            "precondition: version collision (one commit each)"
+        );
+        assert_eq!(
+            live.etag, "",
+            "precondition: this backend provides no etags"
+        );
+
+        // THE assertion: the recreated file reads its OWN bytes.
+        let got = f.read_by_id(live.id, "/hot/g", 0, 100).unwrap();
+        assert_eq!(
+            got, b"the LIVE file's bytes",
+            "the cache served the DEAD file's bytes for an etagless backend"
+        );
+        assert_eq!(f.cache().stats().hits, 0, "nothing was ever cacheable");
+        assert_eq!(f.cache().occupied_bytes(), 0);
     }
 }
 
