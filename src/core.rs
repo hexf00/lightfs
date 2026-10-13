@@ -498,7 +498,13 @@ impl Core {
             });
         }
         let expected = expected_version.unwrap_or(node.version);
-        self.write_stream_node(&node, expected, reader, len, create_if_missing && node.version == 1)
+        self.write_stream_node(
+            &node,
+            expected,
+            reader,
+            len,
+            create_if_missing && node.version == 1,
+        )
     }
 
     /// By-id streaming write: the node is located by its STABLE id (never

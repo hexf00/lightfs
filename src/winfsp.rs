@@ -402,10 +402,10 @@ fn start_write(fs: &dyn FsApi, path: &str) -> Result<u64, Error> {
         });
     }
     let fh = NEXT_FH.fetch_add(1, Ordering::Relaxed);
-    WRITES
-        .lock()
-        .unwrap()
-        .insert(fh, PendingWrite::new(path.to_string(), node.id, node.version));
+    WRITES.lock().unwrap().insert(
+        fh,
+        PendingWrite::new(path.to_string(), node.id, node.version),
+    );
     Ok(fh)
 }
 

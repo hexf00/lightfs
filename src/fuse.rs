@@ -456,10 +456,10 @@ impl FuseAdapter {
             ino,
             size,
             blocks: size.div_ceil(4096),
-            atime: std::time::SystemTime::now().into(),
-            mtime: std::time::SystemTime::now().into(),
-            ctime: std::time::SystemTime::now().into(),
-            crtime: std::time::SystemTime::now().into(),
+            atime: std::time::SystemTime::now(),
+            mtime: std::time::SystemTime::now(),
+            ctime: std::time::SystemTime::now(),
+            crtime: std::time::SystemTime::now(),
             kind: FileType::RegularFile,
             perm: 0o644,
             nlink: 1,
@@ -525,7 +525,12 @@ impl FuseAdapter {
                 state.committed = true;
                 return Ok(());
             }
-            (state.path.clone(), state.node_id, state.expected_version, drained)
+            (
+                state.path.clone(),
+                state.node_id,
+                state.expected_version,
+                drained,
+            )
         };
         let (path, node_id, expected, drained) = snapshot;
         let fail = |e: Error, observed: Option<i64>| -> Error {
@@ -771,7 +776,9 @@ impl Filesystem for FuseAdapter {
                     // CAS on the version we just observed: a concurrent commit
                     // between the lookup and here fails the truncate instead of
                     // silently clobbering it.
-                    let mut ws = self.fs.open_write_by_id(ino.0 as i64, &path, Some(node_now.version))?;
+                    let mut ws =
+                        self.fs
+                            .open_write_by_id(ino.0 as i64, &path, Some(node_now.version))?;
                     ws.write(0, &content)?;
                     ws.commit()
                 });

@@ -4,7 +4,7 @@
 //! see SQLite or S3.
 
 use crate::core::{Core, WriteHandle};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::metadata::Node;
 
 /// One buffered write session. Commit publishes content atomically with
@@ -152,7 +152,13 @@ impl FsApi for Core {
     fn lookup_by_id(&self, node_id: i64, _path_hint: &str) -> Result<Node> {
         Core::lookup_by_id(self, node_id)
     }
-    fn read_by_id(&self, node_id: i64, _path_hint: &str, offset: u64, size: u64) -> Result<Vec<u8>> {
+    fn read_by_id(
+        &self,
+        node_id: i64,
+        _path_hint: &str,
+        offset: u64,
+        size: u64,
+    ) -> Result<Vec<u8>> {
         let (mut r, len) = Core::open_read_by_id(self, node_id, offset, size)?;
         use std::io::Read as _;
         let mut out = Vec::with_capacity(len as usize);

@@ -280,7 +280,9 @@ impl Ctx {
             );
         }
         let mut cmd = Command::new(&self.lightfs);
-        cmd.args(["mount", "--config"]).arg(&self.config).arg(&target);
+        cmd.args(["mount", "--config"])
+            .arg(&self.config)
+            .arg(&target);
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -1532,12 +1534,14 @@ fn section_d(ctx: &mut Ctx, root: &Path, root2: &Path) {
         Err(e) => panic!("D0: create_new failed: {e}"),
     }
     // Reopen with O_TRUNC (the exact open_create shape the suite uses).
-    drop(std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .truncate(true)
-        .open(&f0)
-        .expect("D0: truncating reopen"));
+    drop(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&f0)
+            .expect("D0: truncating reopen"),
+    );
     write_strong(&f0, b"IDENTITY", "D0 seed");
     assert_eq!(
         ino_of(&f0),
@@ -1562,7 +1566,11 @@ fn section_d(ctx: &mut Ctx, root: &Path, root2: &Path) {
             );
         }
         drop(fa);
-        assert_bytes("D1 renamed file carries A's write", &root2.join("d/r1m"), b"AAAABBBB");
+        assert_bytes(
+            "D1 renamed file carries A's write",
+            &root2.join("d/r1m"),
+            b"AAAABBBB",
+        );
         assert!(!root.join("d/r1").exists(), "D1: old name must be gone");
         assert_eq!(
             ino_of(&root2.join("d/r1m")),
@@ -1606,8 +1614,7 @@ fn section_d(ctx: &mut Ctx, root: &Path, root2: &Path) {
         let old_c_ino = ino_of(&fc_p);
         let src_ino = ino_of(&root2.join("d/ov_a"));
         let mut fc = open_rw(&fc_p);
-        std::fs::rename(root2.join("d/ov_a"), root2.join("d/ov_c"))
-            .expect("D3: B rename-over");
+        std::fs::rename(root2.join("d/ov_a"), root2.join("d/ov_c")).expect("D3: B rename-over");
         // 1) reads through the stale handle must fail explicitly, never
         //    serve the new occupant (no clean page cache: the handle never
         //    wrote, so this read really reaches the adapter)
@@ -1633,7 +1640,11 @@ fn section_d(ctx: &mut Ctx, root: &Path, root2: &Path) {
             );
         }
         drop(fc);
-        assert_bytes("D3 incoming file unpolluted", &root2.join("d/ov_c"), b"AAAA-SRC");
+        assert_bytes(
+            "D3 incoming file unpolluted",
+            &root2.join("d/ov_c"),
+            b"AAAA-SRC",
+        );
         assert_eq!(
             ino_of(&root2.join("d/ov_c")),
             src_ino,
@@ -1660,7 +1671,8 @@ fn section_d(ctx: &mut Ctx, root: &Path, root2: &Path) {
         assert_bytes("D4 winner content", &root2.join("d/cas"), b"AAAA");
         let mut fb2 = open_rw(&root2.join("d/cas"));
         write_at(&mut fb2, 0, b"CCCC");
-        fb2.sync_all().expect("D4: fresh handle commits on the new version");
+        fb2.sync_all()
+            .expect("D4: fresh handle commits on the new version");
         assert_bytes("D4 fresh writer content", &root2.join("d/cas"), b"CCCC");
         println!("  OK  D4 concurrent CAS: loser rejected, fresh writer proceeds");
     }
@@ -1744,7 +1756,11 @@ fn section_d(ctx: &mut Ctx, root: &Path, root2: &Path) {
         fa.sync_all()
             .expect("D7: flush after server restart must succeed on the durable identity");
         drop(fa);
-        assert_bytes("D7 committed through restart", &root2.join("d/persist"), b"PERSISTX");
+        assert_bytes(
+            "D7 committed through restart",
+            &root2.join("d/persist"),
+            b"PERSISTX",
+        );
         assert_eq!(
             ino_of(&root2.join("d/persist")),
             ino7,
@@ -2088,7 +2104,7 @@ fn section_w(ctx: &Ctx, root: &Path) {
     }
 
     // W5 case sensitivity: the mount is case-sensitive (WinFsp
-    // CaseSensitiveSearch, the design notes section 5). Opening a different
+    // CaseSensitiveSearch, docs/WINDOWS.md section 5). Opening a different
     // case must fail, and the two spellings must coexist as two nodes.
     write_strong(&dir.join("CaseFile.txt"), b"upper", "W5 seed");
     match std::fs::File::open(dir.join("casefile.txt")) {

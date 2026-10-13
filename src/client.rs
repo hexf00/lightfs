@@ -496,7 +496,13 @@ impl FsApi for Client {
         node_from_json(&r)
     }
 
-    fn read_by_id(&self, node_id: i64, _path_hint: &str, offset: u64, size: u64) -> Result<Vec<u8>> {
+    fn read_by_id(
+        &self,
+        node_id: i64,
+        _path_hint: &str,
+        offset: u64,
+        size: u64,
+    ) -> Result<Vec<u8>> {
         let mut resp = crate::metrics::time("client.data.read", || {
             self.agent
                 .post(format!("{}/data/read", self.url))
