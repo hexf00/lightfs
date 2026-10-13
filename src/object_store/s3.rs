@@ -407,7 +407,7 @@ impl S3ObjectStore {
         if !(200..300).contains(&status) {
             return Err(Self::map_status(status, &body, key));
         }
-        Ok(xml_extract_first(&body, "ETag").unwrap_or_default())
+        parse_multipart_complete(&body)
     }
 
     fn multipart_abort(&self, key: &str, upload_id: &str) -> Result<()> {
@@ -469,6 +469,39 @@ impl S3ObjectStore {
             .read_to_string()
             .unwrap_or_default()
     }
+}
+
+/// Validate a CompleteMultipartUpload response body and return the object
+/// ETag. S3 does not guarantee that every failure is a non-2xx status: a
+/// complete may answer HTTP 200 with an `<Error>` document in the body. On
+/// `Ok` the caller commits a metadata pointer to this object, so this fails
+/// CLOSED: only a well-formed success document — a
+/// `<CompleteMultipartUploadResult>` open AND close tag (the xmlns attribute
+/// is tolerated) plus a non-empty `<ETag>` — is success. Embedded error
+/// documents, gateway HTML, truncated bodies, and missing/empty ETags are
+/// all errors. A result-unknown complete is never retried here; cleanup
+/// (abort the upload, remove the uncommitted version key) stays with the
+/// caller's existing error path.
+fn parse_multipart_complete(body: &str) -> Result<String> {
+    // A success document never contains a <Code> element, so its presence
+    // marks an embedded error — the way S3 reports complete failures under
+    // HTTP 200.
+    if let Some(code) = xml_extract_first(body, "Code") {
+        return Err(Error::Storage(format!(
+            "store rejected multipart complete: {code}"
+        )));
+    }
+    let well_formed = body.contains("<CompleteMultipartUploadResult")
+        && body.contains("</CompleteMultipartUploadResult>");
+    let etag = xml_extract_first(body, "ETag").unwrap_or_default();
+    if well_formed && !etag.is_empty() {
+        return Ok(etag);
+    }
+    Err(Error::Storage(
+        "multipart complete response is not a well-formed \
+         CompleteMultipartUploadResult with a non-empty ETag"
+            .into(),
+    ))
 }
 
 impl ObjectStore for S3ObjectStore {
@@ -1109,6 +1142,81 @@ mod tests {
             ("list-type".to_string(), "2".to_string()),
         ];
         assert_eq!(encode_query(&q), "max-keys=3&prefix=a%20b&list-type=2");
+    }
+
+    // ------------------------------------------------------ S1a: complete
+    // A CompleteMultipartUpload may answer HTTP 200 with an <Error> document.
+    // The parser must fail closed: only a well-formed success document with a
+    // non-empty ETag may become the Ok the metadata CAS commits on.
+
+    fn complete_success_body() -> String {
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Location>http://mybkt.s3.amazonaws.com/objects/1/w-1.data</Location>\
+         <Bucket>mybkt</Bucket><Key>objects/1/w-1.data</Key>\
+         <ETag>\"abc123\"</ETag>\
+         </CompleteMultipartUploadResult>"
+            .to_string()
+    }
+
+    #[test]
+    fn complete_success_document_with_etag_is_ok() {
+        // The xmlns attribute on the root must not defeat recognition
+        // (real AWS/MinIO success bodies carry it).
+        let etag = parse_multipart_complete(&complete_success_body()).unwrap();
+        assert_eq!(etag, "\"abc123\"");
+        // Same without the XML declaration and without xmlns.
+        let bare = "<CompleteMultipartUploadResult><ETag>\"x\"</ETag>\
+                    </CompleteMultipartUploadResult>";
+        assert_eq!(parse_multipart_complete(bare).unwrap(), "\"x\"");
+    }
+
+    #[test]
+    fn complete_200_embedded_error_is_an_error() {
+        // Documented S3 behavior: complete failures can arrive under HTTP 200.
+        let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error>\
+                    <Code>InternalError</Code>\
+                    <Message>We encountered an internal error. Please try again.</Message>\
+                    <Resource>/mybkt/objects/1/w-1.data</Resource>\
+                    <RequestId>req-1</RequestId></Error>";
+        let err = parse_multipart_complete(body).unwrap_err();
+        assert!(err.to_string().contains("InternalError"), "{err}");
+    }
+
+    #[test]
+    fn complete_200_malformed_or_foreign_body_is_an_error() {
+        // Gateway HTML / junk where XML was expected.
+        assert!(parse_multipart_complete("<html><body>502</body></html>").is_err());
+        // Empty body (read failure surfaces as "" via read_body).
+        assert!(parse_multipart_complete("").is_err());
+        // Random truncation garbage.
+        assert!(parse_multipart_complete("<CompleteMultipartUploadRes").is_err());
+    }
+
+    #[test]
+    fn complete_200_truncated_success_is_an_error() {
+        let full = complete_success_body();
+        // Cut before the root close tag, even though the ETag survived —
+        // the response as a whole did not complete.
+        let cut = full.find("</CompleteMultipartUploadResult>").unwrap();
+        assert!(parse_multipart_complete(&full[..cut]).is_err());
+        // Cut mid-ETag: no complete ETag element.
+        let mid = full.find("<ETag>").unwrap() + 4;
+        assert!(parse_multipart_complete(&full[..mid]).is_err());
+        // Cut right after the root open tag.
+        let open_end = full.find('>').unwrap() + 1;
+        assert!(parse_multipart_complete(&full[..open_end]).is_err());
+    }
+
+    #[test]
+    fn complete_200_success_without_etag_is_an_error() {
+        let no_etag = complete_success_body()
+            .replace("<ETag>\"abc123\"</ETag>", "")
+            .replace("<ETag></ETag>", "");
+        assert!(parse_multipart_complete(&no_etag).is_err());
+        // An explicitly empty ETag is just as missing.
+        let empty = complete_success_body().replace("\"abc123\"", "");
+        assert!(parse_multipart_complete(&empty).is_err());
     }
 }
 

@@ -15,8 +15,11 @@
 //!      is detected by fsck
 //!
 //! NOT covered here (needs a seam inside S3ObjectStore — reported as a
-//! Phase-2b proposal): failing an individual multipart PART/COMPLETE against
-//! the real S3 API, and abort-failure observability against a real backend.
+//! Phase-2b proposal): failing an individual multipart PART against the real
+//! S3 API, the real backend's HTTP-200-with-Error wire shape for complete
+//! (the response parser is unit-tested fail-closed instead, S1a), and
+//! abort-failure observability against a real backend. The COMPLETE-stage
+//! failure IS modeled at this trait seam (test 6).
 
 use std::io::Read;
 use std::sync::Arc;
@@ -36,6 +39,7 @@ struct FaultFlags {
     fail_put: AtomicBool,
     fail_put_stream: AtomicBool,
     fail_put_stream_midway: AtomicBool,
+    fail_put_stream_at_complete: AtomicBool,
 }
 
 /// ObjectStore wrapper that injects failures at the selected commit points.
@@ -62,6 +66,21 @@ impl ObjectStore for InjectingStore {
             let mut buf = vec![0u8; 1024];
             let _ = reader.read(&mut buf)?;
             return Err(Error::Storage("injected: midway stream failure".into()));
+        }
+        if self
+            .faults
+            .fail_put_stream_at_complete
+            .load(Ordering::SeqCst)
+        {
+            // The multipart-COMPLETE failure shape: the bytes reached the
+            // store (parts uploaded), then the complete stage reports
+            // failure — in the worst case as HTTP 200 with an <Error> body
+            // (S1a). Distinct from the midway shape in what must be cleaned
+            // up: the landed-but-uncommitted version key.
+            let _ = self.inner.put_stream(key, reader, len);
+            return Err(Error::Storage(
+                "injected: multipart complete failure".into(),
+            ));
         }
         self.inner.put_stream(key, reader, len)
     }
@@ -350,4 +369,56 @@ fn crash_between_upload_and_cas_detected_by_fsck() {
     let report = lightfs::fsck::fsck(&core).unwrap();
     assert_eq!(report.stale_versions.len(), 1, "{}", report.render());
     assert_eq!(report.problems(), 0, "stale versions are not problems");
+}
+
+/// 6. multipart-complete-stage failure (S1a): the bytes reached the store,
+///    then complete reported failure (worst case: HTTP 200 with an <Error>
+///    body — the parser now rejects that before any Ok can reach the
+///    caller). The metadata CAS is never invoked: old version, content and
+///    object key stand, and the landed-but-uncommitted version key is
+///    cleaned up.
+#[test]
+fn complete_failure_never_commits_and_cleans_landed_key() {
+    let faults = Arc::new(FaultFlags::default());
+    faults
+        .fail_put_stream_at_complete
+        .store(true, Ordering::SeqCst);
+    let (core, meta, _objects) = setup(faults);
+    core.create("/f", 0o644).unwrap();
+    let h = core.open_write("/f", None).unwrap();
+    core.write(&h, 0, b"original").unwrap();
+    let v0 = core.commit_write(&h).unwrap();
+    assert_eq!(meta.cas_calls.load(Ordering::SeqCst), 1);
+
+    // Overwrite through the streaming path; complete fails after upload.
+    let err = core
+        .write_stream(
+            "/f",
+            Some(v0.version),
+            false,
+            &mut std::io::Cursor::new(vec![7u8; 4096]),
+            4096,
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::Storage(_)), "{err}");
+
+    // The metadata CAS was never reached: no new object_key pointer.
+    assert_eq!(meta.cas_calls.load(Ordering::SeqCst), 1);
+    let after = core.lookup("/f").unwrap();
+    assert_eq!(after.version, v0.version);
+    assert_eq!(after.size, v0.size);
+    assert_eq!(after.object_key, v0.object_key);
+    assert_eq!(core.read("/f", 0, 100).unwrap(), b"original");
+
+    // The key the upload landed under is gone; the only unrecorded key
+    // left is the live v0 object.
+    let remaining = version_keys(&core, after.id);
+    let retained: std::collections::HashSet<String> =
+        meta.inner.all_superseded().unwrap().into_iter().collect();
+    let unrecorded: Vec<&String> = remaining
+        .iter()
+        .filter(|k| !retained.contains(*k))
+        .collect();
+    assert_eq!(unrecorded.len(), 1, "{}", remaining.len());
+    assert_eq!(unrecorded[0], after.object_key.as_ref().unwrap());
 }
