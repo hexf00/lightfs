@@ -2189,6 +2189,137 @@ fn section_q(ctx: &mut Ctx, root: &Path) {
     println!("  OK  Q: policy cache section complete");
 }
 
+// ---------------------------------------------------------------------------
+// R: R4.2c-final identity acceptance over the REAL server and storage
+// backend. The client library drives everything directly (no mount): stale
+// by-id reads and stale write sessions are protocol-level semantics. The
+// restart in the middle is a PLAIN restart - database and bucket untouched,
+// nothing reset.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+fn section_r(ctx: &mut Ctx) {
+    use lightfs::api::FsApi;
+    use lightfs::client::{Client, ClientConfig};
+    use lightfs::error::Error;
+
+    println!("--- R: stable identity over the real server (RPC path) ---");
+    let c = Client::new(ClientConfig {
+        url: ctx.rpc_url(),
+        metadata_ttl: None,
+    });
+
+    // 1. A: create + one commit => version 1; open a SECOND session on it
+    //    (the stale writer) and buffer its payload.
+    c.write_full("/r-identity-a", b"file A's real bytes", true)
+        .unwrap();
+    let a = c.lookup("/r-identity-a").unwrap();
+    assert_eq!(a.version, 1, "precondition: one commit");
+    let mut stale = FsApi::open_write(&c, "/r-identity-a", Some(a.version)).unwrap();
+    stale.write(0, b"POISON").unwrap();
+
+    // 2. delete A; create B; one commit.
+    c.unlink("/r-identity-a").unwrap();
+    c.write_full("/r-identity-b", b"file B's real bytes", true)
+        .unwrap();
+    let b = c.lookup("/r-identity-b").unwrap();
+
+    // 3. the recreated file got a FRESH id.
+    assert_ne!(
+        b.id, a.id,
+        "AUTOINCREMENT never re-issues the deleted id (real server)"
+    );
+    println!(
+        "  OK  A id={} deleted; B id={} allocated (ids differ)",
+        a.id, b.id
+    );
+
+    // 4. by-id read through the OLD identity: IdentityGone over the wire,
+    //    never B's bytes.
+    let got = c.read_by_id(a.id, "/r-identity-a", 0, 64);
+    assert!(
+        matches!(got, Err(Error::IdentityGone(_))),
+        "old identity must be IdentityGone, got {}",
+        match &got {
+            Ok(bytes) => format!("Ok({} bytes)", bytes.len()),
+            Err(e) => format!("Err({e})"),
+        }
+    );
+    println!("  OK  by-id read via the old identity -> IdentityGone");
+
+    // 5. the stale session's commit is rejected; B is untouched: bytes,
+    //    version, object key.
+    match stale.commit() {
+        Ok(_) => panic!("stale session must not commit"),
+        Err(e) => println!("  OK  stale session commit rejected ({e})"),
+    }
+    let after = c.lookup("/r-identity-b").unwrap();
+    assert_eq!(after.id, b.id);
+    assert_eq!(after.version, 1, "B version untouched");
+    assert_eq!(after.object_key, b.object_key, "B object key untouched");
+    assert_eq!(
+        FsApi::read(&c, "/r-identity-b", 0, 64).unwrap(),
+        b"file B's real bytes",
+        "B bytes untouched"
+    );
+    println!("  OK  B intact after the rejected stale commit");
+
+    // 7 (pre-restart half): churn - create + commit + delete, ids strictly
+    // increasing across the whole run, none reused.
+    let mut max_id = b.id;
+    for i in 0..20u32 {
+        let p = format!("/r-churn-{i}");
+        c.write_full(&p, format!("churn {i}").as_bytes(), true)
+            .unwrap();
+        let n = c.lookup(&p).unwrap();
+        assert!(
+            n.id > max_id,
+            "id {} not above the previous max {}",
+            n.id,
+            max_id
+        );
+        max_id = n.id;
+        c.unlink(&p).unwrap();
+    }
+    println!("  OK  churn x20: ids strictly increasing, none reused");
+
+    // a survivor whose id pins the allocation frontier across the restart
+    c.write_full("/r-keep", b"kept across restart", true)
+        .unwrap();
+    let keep = c.lookup("/r-keep").unwrap();
+    println!("  OK  survivor /r-keep id={}", keep.id);
+
+    // 6. PLAIN restart: kill the server, start it again on the SAME
+    //    database and bucket. No reset, no migration, no fallback.
+    ctx.kill_server();
+    ctx.ensure_running();
+    println!("  ..  server restarted (same database, same bucket)");
+
+    let keep2 = c.lookup("/r-keep").unwrap();
+    assert_eq!(keep2.id, keep.id, "survivor identity stable across restart");
+    assert_eq!(keep2.version, 1);
+    assert_eq!(
+        FsApi::read(&c, "/r-keep", 0, 64).unwrap(),
+        b"kept across restart",
+        "committed data readable after the restart"
+    );
+    c.write_full("/r-after", b"allocated after restart", true)
+        .unwrap();
+    let fa = c.lookup("/r-after").unwrap();
+    assert!(
+        fa.id > keep.id,
+        "allocation must continue above the pre-restart frontier ({} !> {})",
+        fa.id,
+        keep.id
+    );
+    println!(
+        "  OK  post-restart: data readable, new id {} > pre-restart {}",
+        fa.id, keep.id
+    );
+
+    println!("  OK  R: stable identity section complete");
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut lightfs = PathBuf::from("lightfs");
@@ -2348,6 +2479,14 @@ fn main() {
         ctx.ensure_running();
         let root = PathBuf::from(&ctx.mount_target);
         section_q(&mut ctx, &root);
+    }
+    #[cfg(unix)]
+    if ctx.sections_want("r") {
+        // R: pure RPC - the client library drives the real server directly,
+        // no FUSE mount involved (stale by-id reads and stale write
+        // sessions are protocol-level semantics).
+        ctx.ensure_running();
+        section_r(&mut ctx);
     }
     #[cfg(unix)]
     if ctx.sections_want("stress") {
