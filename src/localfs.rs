@@ -47,6 +47,10 @@ const RESERVED: &str = ".lightfs-tmp";
 struct IdMap {
     by_id: HashMap<i64, String>,
     by_path: HashMap<String, i64>,
+    /// Content version per id (CAS anchor); absent = 1. Bumped ONLY by a
+    /// committed write, exactly like the remote node versions - a second
+    /// session armed on the same version then loses the CAS with Conflict.
+    versions: HashMap<i64, i64>,
 }
 
 pub struct LocalFs {
@@ -58,6 +62,13 @@ pub struct LocalFs {
     /// turn ("do you know this id?") without ambiguity. Also names commit
     /// temp files (fetch_add - uniqueness, not identity).
     seq: Arc<AtomicU64>,
+    /// Serializes CAS-check -> write -> version-bump AND every namespace
+    /// mutation (create/unlink/rename/rmdir/mkdir). Without the mutation
+    /// half, an unlink landing inside a commit's write window would let
+    /// the commit's rename RESURRECT the file it already deleted - the
+    /// gate makes {commit, mutation} pairs linearizable. Local commits
+    /// are fsync-dominated, so the serialization costs ~nothing.
+    commit_gate: Mutex<()>,
 }
 
 fn io_err(e: std::io::Error, rel: &str) -> Error {
@@ -99,30 +110,47 @@ impl LocalFs {
     /// and its canonical path (the caller runs the mount-tree containment
     /// checks on it before the backend goes live).
     pub fn new(root: &Path, seq: Arc<AtomicU64>) -> Result<(Self, PathBuf)> {
-        let canon = match std::fs::canonicalize(root) {
-            Ok(p) => p,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Lazy-create is allowed (P2); it happens HERE, at the
-                // configured path - never by silently picking another one.
-                std::fs::create_dir_all(root).map_err(|e| {
-                    Error::Config(format!("local root {}: cannot create: {e}", root.display()))
-                })?;
-                std::fs::canonicalize(root)
-                    .map_err(|e| Error::Config(format!("local root {}: {e}", root.display())))?
-            }
-            Err(e) => return Err(Error::Config(format!("local root {}: {e}", root.display()))),
-        };
-        std::fs::create_dir_all(canon.join(RESERVED)).map_err(|e| {
-            Error::Config(format!("local root {}: scratch dir: {e}", canon.display()))
-        })?;
-        Ok((
-            Self {
-                root: canon.clone(),
-                ids: Mutex::new(IdMap::default()),
-                seq,
-            },
-            canon,
-        ))
+        #[cfg(not(unix))]
+        {
+            // Support claim must match reality (P-R3): the symlink-escape
+            // protection (O_NOFOLLOW opens, no-follow deletion) has no
+            // Windows implementation, so a local backend is REFUSED rather
+            // than silently weaker. No runtime claim is made on WinFsp.
+            let _ = (root, seq);
+            Err(Error::Config(
+                "client-local authority requires a POSIX filesystem; Windows \
+                 (WinFsp) support for it is not implemented and not claimed"
+                    .into(),
+            ))
+        }
+        #[cfg(unix)]
+        {
+            let canon = match std::fs::canonicalize(root) {
+                Ok(p) => p,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Lazy-create is allowed (P2); it happens HERE, at the
+                    // configured path - never by silently picking another one.
+                    std::fs::create_dir_all(root).map_err(|e| {
+                        Error::Config(format!("local root {}: cannot create: {e}", root.display()))
+                    })?;
+                    std::fs::canonicalize(root)
+                        .map_err(|e| Error::Config(format!("local root {}: {e}", root.display())))?
+                }
+                Err(e) => return Err(Error::Config(format!("local root {}: {e}", root.display()))),
+            };
+            std::fs::create_dir_all(canon.join(RESERVED)).map_err(|e| {
+                Error::Config(format!("local root {}: scratch dir: {e}", canon.display()))
+            })?;
+            Ok((
+                Self {
+                    root: canon.clone(),
+                    ids: Mutex::new(IdMap::default()),
+                    seq,
+                    commit_gate: Mutex::new(()),
+                },
+                canon,
+            ))
+        }
     }
 
     pub fn canonical_root(&self) -> &Path {
@@ -231,10 +259,23 @@ impl LocalFs {
             mtime,
             mode,
             object_key: None,
-            version: 1,
+            version: self.version_of(id),
             etag: String::new(),
             target: None,
         })
+    }
+
+    /// The content version of `id` (CAS anchor). Absent = 1: a file that
+    /// predates the mount or was never committed through this backend
+    /// starts at the same version a fresh create gets.
+    fn version_of(&self, id: i64) -> i64 {
+        self.ids
+            .lock()
+            .unwrap()
+            .versions
+            .get(&id)
+            .copied()
+            .unwrap_or(1)
     }
 
     /// lstat a relative path and return its (stable) node. Reuses the id
@@ -245,10 +286,7 @@ impl LocalFs {
         Self::rel_ok(rel)?;
         let md = std::fs::symlink_metadata(self.abs(rel)).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                let mut ids = self.ids.lock().unwrap();
-                if let Some(old) = ids.by_path.remove(rel) {
-                    ids.by_id.remove(&old);
-                }
+                self.purge(rel);
             }
             io_err(e, rel)
         })?;
@@ -272,6 +310,7 @@ impl LocalFs {
         let mut ids = self.ids.lock().unwrap();
         if let Some(old) = ids.by_path.remove(rel) {
             ids.by_id.remove(&old);
+            ids.versions.remove(&old);
         }
     }
 
@@ -343,6 +382,7 @@ impl LocalFs {
         if rel.is_empty() {
             return Err(Error::AlreadyExists("/".into()));
         }
+        let _gate = self.commit_gate.lock().unwrap();
         self.checked_parent(rel)?;
         self.parent_must_exist(rel)?;
         std::fs::create_dir(self.abs(rel)).map_err(|e| io_err(e, rel))?;
@@ -357,6 +397,7 @@ impl LocalFs {
         if rel.is_empty() {
             return Err(Error::InvalidPath("/".into()));
         }
+        let _gate = self.commit_gate.lock().unwrap();
         self.checked_parent(rel)?;
         self.parent_must_exist(rel)?;
         // create_new: an existing occupant (including a symlink) refuses;
@@ -369,14 +410,16 @@ impl LocalFs {
         drop(f);
         // Fresh identity, even if a stale mapping for this path existed
         // (the previous file is gone; old handles must see IdentityGone,
-        // not alias the new file - M3 locally).
+        // not alias the new file - M3 locally). Version: 1, like Core.
         let mut ids = self.ids.lock().unwrap();
         if let Some(old) = ids.by_path.remove(rel) {
             ids.by_id.remove(&old);
+            ids.versions.remove(&old);
         }
         let id = (LOCAL_FLAG | self.seq.fetch_add(1, Ordering::Relaxed)) as i64;
         ids.by_path.insert(rel.to_string(), id);
         ids.by_id.insert(id, rel.to_string());
+        ids.versions.insert(id, 1);
         drop(ids);
         self.stat_rel(rel).map(|mut n| {
             n.id = id;
@@ -432,6 +475,7 @@ impl LocalFs {
                 "cannot rename onto the rule root".into(),
             ));
         }
+        let _gate = self.commit_gate.lock().unwrap();
         self.checked_parent(old_rel)?;
         self.checked_parent(new_rel)?;
         // Source must exist (rename(2) would say ENOENT too, but an
@@ -454,11 +498,30 @@ impl LocalFs {
         if overwritten {
             if let Some(victim) = ids.by_path.remove(new_rel) {
                 ids.by_id.remove(&victim);
+                ids.versions.remove(&victim);
             }
         }
         if let Some(id) = id {
             ids.by_path.insert(new_rel.to_string(), id);
             ids.by_id.insert(id, new_rel.to_string());
+            // A DIRECTORY rename moves every descendant's mapped path:
+            // identity is stable, the rel prefix is not. Without this
+            // rewrite a child's open handle would keep pointing at the
+            // old (now empty) path and a lookup of the new path would
+            // mint a DUPLICATE identity for the same file.
+            let old_prefix = format!("{old_rel}/");
+            let moved: Vec<(String, i64)> = ids
+                .by_path
+                .iter()
+                .filter(|(p, _)| p.starts_with(&old_prefix))
+                .map(|(p, id)| (p.clone(), *id))
+                .collect();
+            for (p, cid) in moved {
+                ids.by_path.remove(&p);
+                let np = format!("{new_rel}/{}", &p[old_prefix.len()..]);
+                ids.by_path.insert(np.clone(), cid);
+                ids.by_id.insert(cid, np);
+            }
         }
         Ok(())
     }
@@ -468,6 +531,7 @@ impl LocalFs {
         if rel.is_empty() {
             return Err(Error::InvalidPath("cannot unlink the rule root".into()));
         }
+        let _gate = self.commit_gate.lock().unwrap();
         self.checked_parent(rel)?;
         let md = std::fs::symlink_metadata(self.abs(rel)).map_err(|e| io_err(e, rel))?;
         if md.is_dir() {
@@ -487,6 +551,7 @@ impl LocalFs {
         if rel.is_empty() {
             return Err(Error::InvalidPath("cannot remove the rule root".into()));
         }
+        let _gate = self.commit_gate.lock().unwrap();
         self.checked_parent(rel)?;
         std::fs::remove_dir(self.abs(rel)).map_err(|e| io_err(e, rel))?;
         self.purge(rel);
@@ -618,7 +683,7 @@ impl LocalFs {
         &self,
         id: i64,
         _path: &str,
-        _expected_version: Option<i64>,
+        expected_version: Option<i64>,
     ) -> Result<LocalWriteSession<'_>> {
         // The identity must be alive at open; the session re-resolves its
         // path FROM THE ID at commit, so a rename during the session
@@ -627,12 +692,15 @@ impl LocalFs {
         let rel = self.path_of_id(id)?;
         std::fs::symlink_metadata(self.abs(&rel))
             .map_err(|_| Error::IdentityGone(format!("local id {id} ({rel})")))?;
-        // Strict-sync local authority: there is no optimistic-concurrency
-        // gate to arm (single-machine authority, local FS ordering rules),
-        // so `expected_version` is accepted and ignored by design.
+        // Arm the CAS exactly like Core does: an explicit expected wins,
+        // otherwise the version observed at open. The commit then checks
+        // it against the LIVE version - a second session armed on the
+        // same version loses with Conflict instead of silently winning.
+        let expected = expected_version.unwrap_or_else(|| self.version_of(id));
         Ok(LocalWriteSession {
             fs: self,
             id,
+            expected_version: expected,
             chunks: Vec::new(),
         })
     }
@@ -664,6 +732,9 @@ impl LocalFs {
 pub struct LocalWriteSession<'a> {
     fs: &'a LocalFs,
     id: i64,
+    /// Version this session is armed on: commit CASes the live version
+    /// against it (mismatch = Conflict), success bumps to expected+1.
+    expected_version: i64,
     chunks: Vec<(u64, Vec<u8>)>,
 }
 
@@ -693,10 +764,27 @@ impl WriteSession for LocalWriteSession<'_> {
     fn commit(self: Box<Self>) -> Result<Node> {
         let content = self.assemble();
         let fs = self.fs;
+        // Serialize CAS-check -> write -> version-bump against every other
+        // commit AND every namespace mutation. Without the mutation half,
+        // an unlink landing inside the write window below would let this
+        // commit's rename RESURRECT a deleted file.
+        let _gate = fs.commit_gate.lock().unwrap();
         // Re-resolve the id -> path NOW: a rename during the session is
         // picked up here; an unlink removed the mapping and the commit
         // must fail IdentityGone, never resurrect or alias.
         let rel = fs.path_of_id(self.id)?;
+        // The CAS. expected_version participates for real: two sessions
+        // armed on the same version cannot both win - the second sees the
+        // bumped version and gets Conflict (same contract as the remote
+        // commit chain).
+        let actual = fs.version_of(self.id);
+        if actual != self.expected_version {
+            return Err(Error::Conflict {
+                path: rel,
+                expected: self.expected_version,
+                actual,
+            });
+        }
         // The escape gate runs on every platform; the handle is only
         // needed for the unix parent-fsync below.
         #[cfg(unix)]
@@ -723,12 +811,23 @@ impl WriteSession for LocalWriteSession<'_> {
             let _ = std::fs::remove_file(&tmp);
             io_err(e, &rel)
         })?;
+        // Parent-directory fsync: strict sync means "durable" includes the
+        // rename, so a failed directory sync must NOT be reported as a
+        // successful commit. (A retry is safe: the version is not bumped
+        // on this path, the CAS re-arms, the rewrite is idempotent.)
         #[cfg(unix)]
         {
-            if let Ok(dir) = std::fs::File::open(&parent) {
-                let _ = dir.sync_all(); // file fsync already guarantees the bytes
-            }
+            let dir = std::fs::File::open(&parent)
+                .map_err(|e| Error::Io(format!("parent dir open after commit: {e}")))?;
+            dir.sync_all()
+                .map_err(|e| Error::Io(format!("parent dir fsync after commit: {e}")))?;
         }
+        // Durability confirmed: now the version moves.
+        fs.ids
+            .lock()
+            .unwrap()
+            .versions
+            .insert(self.id, self.expected_version + 1);
         let md = std::fs::symlink_metadata(fs.abs(&rel))
             .map_err(|_| Error::IdentityGone(format!("local id {}", self.id)))?;
         fs.node_for(&rel, self.id, &md)
@@ -846,16 +945,20 @@ mod tests {
         let root = t.join("root");
         let fs = fs_at(&root);
         fs.create("f", 0o644).unwrap();
+        assert_eq!(fs.lookup("f").unwrap().version, 1, "create arms version 1");
         // first commit: full replacement with one chunk
         let mut s = fs.open_write("f", None).unwrap();
         s.write(0, b"hello").unwrap();
         let n = Box::new(s).commit().unwrap();
         assert_eq!(n.size, 5);
+        assert_eq!(n.version, 2, "commit bumps the version");
+        assert_eq!(fs.lookup("f").unwrap().version, 2);
         assert_eq!(std::fs::read(root.join("f")).unwrap(), b"hello".to_vec());
         // second (smaller) commit truncates: full-content semantics
         let mut s = fs.open_write("f", None).unwrap();
         s.write(0, b"hi").unwrap();
-        Box::new(s).commit().unwrap();
+        let n = Box::new(s).commit().unwrap();
+        assert_eq!(n.version, 3);
         assert_eq!(std::fs::read(root.join("f")).unwrap(), b"hi".to_vec());
         // scratch dir is empty after commits (temp renamed away)
         let scratch: Vec<_> = std::fs::read_dir(root.join(RESERVED)).unwrap().collect();
@@ -878,5 +981,266 @@ mod tests {
             Err(Error::IdentityGone(_))
         ));
         assert!(!t.join("root").join("f").exists());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P-R1: concurrent commit semantics - sessions, CAS, namespaces
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod pr1_tests {
+    use super::*;
+    use crate::error::Error;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "lightfs-pr1-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn fs_at(root: &Path) -> LocalFs {
+        let (fs, _) = LocalFs::new(root, Arc::new(AtomicU64::new(1))).unwrap();
+        fs
+    }
+
+    /// P-R1.1: two sessions armed on the same version, disjoint offsets,
+    /// both full-content commits: first wins, second gets Conflict with
+    /// exact expected/actual. (Full-content semantics means "different
+    /// offsets" is still two competing contents - the CAS is what makes
+    /// the outcome deterministic.)
+    #[test]
+    fn two_sessions_same_version_disjoint_offsets() {
+        let t = tmpdir("disjoint");
+        let fs = fs_at(&t.join("root"));
+        fs.create("f", 0o644).unwrap();
+
+        let mut a = fs.open_write("f", None).unwrap();
+        let mut b = fs.open_write("f", None).unwrap();
+        a.write(0, b"AAAA").unwrap();
+        b.write(8, b"BBBB").unwrap();
+
+        let na = Box::new(a).commit().unwrap();
+        assert_eq!(na.version, 2);
+        assert_eq!(
+            std::fs::read(t.join("root").join("f")).unwrap(),
+            b"AAAA".to_vec()
+        );
+
+        match Box::new(b).commit() {
+            Err(Error::Conflict {
+                expected, actual, ..
+            }) => {
+                assert_eq!(expected, 1, "b was armed on the version a started from");
+                assert_eq!(actual, 2, "a's commit moved the live version");
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+        // namespace: the winner's bytes stand, unchanged by the loser
+        assert_eq!(
+            std::fs::read(t.join("root").join("f")).unwrap(),
+            b"AAAA".to_vec()
+        );
+        assert_eq!(fs.lookup("f").unwrap().version, 2);
+    }
+
+    /// P-R1.2: same offset, same story - explicit Conflict, then the loser
+    /// recovers by re-arming on the CURRENT version (the adapter's rebase
+    /// path).
+    #[test]
+    fn two_sessions_same_offset_conflict_then_rebase() {
+        let t = tmpdir("sameoff");
+        let fs = fs_at(&t.join("root"));
+        fs.create("f", 0o644).unwrap();
+
+        let mut a = fs.open_write("f", None).unwrap();
+        let mut b = fs.open_write("f", None).unwrap();
+        a.write(0, b"from-a").unwrap();
+        b.write(0, b"from-b").unwrap();
+
+        Box::new(a).commit().unwrap();
+        assert!(matches!(Box::new(b).commit(), Err(Error::Conflict { .. })));
+        assert_eq!(
+            std::fs::read(t.join("root").join("f")).unwrap(),
+            b"from-a".to_vec()
+        );
+
+        // b re-arms on the live version (what the adapter does after a
+        // failed flush) and its retry succeeds - observable error, then a
+        // deliberate retry, never a silent interleave.
+        let mut b2 = fs.open_write("f", None).unwrap();
+        b2.write(0, b"from-b-rebased").unwrap();
+        let n = Box::new(b2).commit().unwrap();
+        assert_eq!(n.version, 3);
+        assert_eq!(
+            std::fs::read(t.join("root").join("f")).unwrap(),
+            b"from-b-rebased".to_vec()
+        );
+    }
+
+    /// P-R1.3: an EXPLICIT stale expected_version commits after a newer
+    /// commit: refused with exact expected/actual - the parameter
+    /// genuinely participates.
+    #[test]
+    fn explicit_stale_version_refused() {
+        let t = tmpdir("stale");
+        let fs = fs_at(&t.join("root"));
+        fs.create("f", 0o644).unwrap();
+        let mut a = fs.open_write("f", None).unwrap();
+        a.write(0, b"first").unwrap();
+        Box::new(a).commit().unwrap();
+
+        // b claims version 1; the file is at 2. Open succeeds (the
+        // identity is alive - Core behaves the same), the CAS fails.
+        let mut b = fs.open_write("f", Some(1)).unwrap();
+        b.write(0, b"stale").unwrap();
+        match Box::new(b).commit() {
+            Err(Error::Conflict {
+                path,
+                expected,
+                actual,
+            }) => {
+                assert_eq!(path, "f");
+                assert_eq!(expected, 1);
+                assert_eq!(actual, 2);
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(t.join("root").join("f")).unwrap(),
+            b"first".to_vec()
+        );
+        // and the equal check passes: armed on 2, CAS against 2
+        let mut c = fs.open_write("f", Some(2)).unwrap();
+        c.write(0, b"second").unwrap();
+        Box::new(c).commit().unwrap();
+        assert_eq!(fs.lookup("f").unwrap().version, 3);
+    }
+
+    /// P-R1.4: two handles on one file, a rename lands between open and
+    /// commit: the armed session commits through the NEW name (identity
+    /// routing), the second handle's stale CAS loses.
+    #[test]
+    fn rename_between_open_and_commit_multi_handle() {
+        let t = tmpdir("multih");
+        let fs = fs_at(&t.join("root"));
+        fs.create("f", 0o644).unwrap();
+
+        let mut a = fs.open_write("f", None).unwrap();
+        let mut b = fs.open_write("f", None).unwrap();
+
+        fs.rename("f", "g").unwrap();
+        // the rename moved the NAME; both sessions still hold the identity
+
+        a.write(0, b"through-rename").unwrap();
+        let na = Box::new(a).commit().unwrap();
+        assert_eq!(na.version, 2);
+        // lands under the new name, byte-exact; the old name is gone
+        assert_eq!(
+            std::fs::read(t.join("root").join("g")).unwrap(),
+            b"through-rename".to_vec()
+        );
+        assert!(!t.join("root").join("f").exists());
+        assert_eq!(fs.lookup("g").unwrap().version, 2);
+
+        // b was armed on 1: the rename does not rescue its CAS
+        b.write(0, b"loser").unwrap();
+        assert!(matches!(Box::new(b).commit(), Err(Error::Conflict { .. })));
+        assert_eq!(
+            std::fs::read(t.join("root").join("g")).unwrap(),
+            b"through-rename".to_vec()
+        );
+    }
+
+    /// P-R1.5: unlink with sessions in flight - deletion wins, commits
+    /// report IdentityGone, a fresh create gets a fresh identity and
+    /// version; nothing resurrects.
+    #[test]
+    fn unlink_wins_over_inflight_sessions() {
+        let t = tmpdir("unlink");
+        let fs = fs_at(&t.join("root"));
+        fs.create("f", 0o644).unwrap();
+        let old_id = fs.lookup("f").unwrap().id;
+
+        let mut a = fs.open_write("f", None).unwrap();
+        let mut b = fs.open_write_by_id(old_id, "f", None).unwrap();
+
+        fs.unlink("f").unwrap();
+
+        a.write(0, b"orphan-a").unwrap();
+        assert!(matches!(Box::new(a).commit(), Err(Error::IdentityGone(_))));
+        b.write(0, b"orphan-b").unwrap();
+        assert!(matches!(Box::new(b).commit(), Err(Error::IdentityGone(_))));
+
+        // namespace: gone is gone; reads by the dead identity fail too
+        assert!(matches!(fs.lookup("f"), Err(Error::NotFound(_))));
+        assert!(matches!(
+            fs.lookup_by_id(old_id),
+            Err(Error::IdentityGone(_))
+        ));
+        assert!(matches!(
+            fs.read_by_id(old_id, 0, 10),
+            Err(Error::IdentityGone(_))
+        ));
+        assert!(!t.join("root").join("f").exists());
+
+        // a NEW file at the recycled path: fresh identity, version 1, and
+        // the dead sessions still cannot touch it
+        fs.create("f", 0o644).unwrap();
+        let new_id = fs.lookup("f").unwrap().id;
+        assert_ne!(new_id, old_id);
+        assert_eq!(fs.lookup("f").unwrap().version, 1);
+        // the dead identity cannot even open a session anymore
+        assert!(matches!(
+            fs.open_write_by_id(old_id, "f", None),
+            Err(Error::IdentityGone(_))
+        ));
+        assert_eq!(
+            std::fs::read(t.join("root").join("f")).unwrap(),
+            Vec::<u8>::new()
+        );
+    }
+
+    /// P-R1b: a DIRECTORY rename rewrites every descendant's mapped path -
+    /// a child handle opened before the rename commits through the child's
+    /// NEW path, and the new path does NOT mint a duplicate identity.
+    #[test]
+    fn dir_rename_rewrites_descendant_identity() {
+        let t = tmpdir("dirren");
+        let fs = fs_at(&t.join("root"));
+        fs.mkdir("d", 0o755).unwrap();
+        fs.create("d/child", 0o644).unwrap();
+        let child_id = fs.lookup("d/child").unwrap().id;
+        let dir_id = fs.lookup("d").unwrap().id;
+
+        let mut sess = fs.open_write_by_id(child_id, "d/child", None).unwrap();
+
+        fs.rename("d", "d2").unwrap();
+
+        // the child's identity still resolves - to the new path
+        let n = fs.lookup_by_id(child_id).unwrap();
+        assert_eq!(n.name, "child");
+        // and the NEW path maps to the SAME id (no duplicate identity)
+        assert_eq!(fs.lookup("d2/child").unwrap().id, child_id);
+        assert!(matches!(fs.lookup("d/child"), Err(Error::NotFound(_))));
+
+        // a session opened BEFORE the rename commits through the new path
+        sess.write(0, b"moved-deep").unwrap();
+        let n = Box::new(sess).commit().unwrap();
+        assert_eq!(n.version, 2);
+        assert_eq!(
+            std::fs::read(t.join("root").join("d2").join("child")).unwrap(),
+            b"moved-deep".to_vec()
+        );
+        assert!(!t.join("root").join("d").exists());
+        // the directory identity survived too
+        assert_eq!(fs.lookup("d2").unwrap().id, dir_id);
     }
 }

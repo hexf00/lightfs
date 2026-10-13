@@ -187,6 +187,13 @@ pub enum PolicyError {
     /// Local root malformed or unsafe (relative, ".." segment, "/" or "~",
     /// or duplicated across rules).
     UnsafeRoot { prefix: String, reason: String },
+    /// A cache kind whose implementation (CacheStore) does not exist yet.
+    /// Rejected, never silently ignored (P-R2): a config that asks for a
+    /// cache must not mount looking like the cache is active.
+    CacheUnavailable { prefix: String, kind: &'static str },
+    /// `authority_life = "task"` (TaskScoped cleanup) has no implementation
+    /// yet (P-R2).
+    TaskScopedUnavailable { prefix: String },
 }
 
 impl std::fmt::Display for PolicyError {
@@ -225,6 +232,18 @@ impl std::fmt::Display for PolicyError {
                 f,
                 "rule {prefix:?}: authority_life applies to client-local rules only — s3 \
                  authoritative data is never deleted by client policy"
+            ),
+            PolicyError::CacheUnavailable { prefix, kind } => write!(
+                f,
+                "rule {prefix:?}: cache {kind:?} has no implementation yet (CacheStore is \
+                 unbuilt) — the mount is refused rather than running without the \
+                 optimization it asked for"
+            ),
+            PolicyError::TaskScopedUnavailable { prefix } => write!(
+                f,
+                "rule {prefix:?}: authority_life = \"task\" (TaskScoped cleanup) has no \
+                 implementation yet — the mount is refused rather than leaking local \
+                 files past their promised scope"
             ),
             PolicyError::RootOnRemote { prefix } => {
                 write!(
@@ -416,6 +435,31 @@ impl ResolvedPolicy {
             };
             if disk_sum > g {
                 return Err(PolicyError::BudgetOvercommit { kind: "disk" });
+            }
+        }
+
+        // Availability gate (P-R2): everything above validates CONFIG
+        // SHAPE; a well-formed request for something that does not exist
+        // must still be refused, never mounted as if it were active.
+        // Placed AFTER the model validation so malformed cache configs
+        // keep their specific errors; placed BEFORE matching so no
+        // resolved view can ever carry an unimplemented feature.
+        for r in &rules {
+            if r.view.read_cache != CacheKind::None {
+                return Err(PolicyError::CacheUnavailable {
+                    prefix: r.prefix.clone(),
+                    kind: match r.view.read_cache {
+                        CacheKind::Memory => "memory",
+                        CacheKind::Disk => "disk",
+                        CacheKind::MemoryAndDisk => "memory+disk",
+                        CacheKind::None => unreachable!(),
+                    },
+                });
+            }
+            if r.view.authority_life == AuthorityLife::TaskScoped {
+                return Err(PolicyError::TaskScopedUnavailable {
+                    prefix: r.prefix.clone(),
+                });
             }
         }
 
@@ -842,16 +886,15 @@ mod tests {
     fn explicit_root_rule_replaces_the_implicit_default_once() {
         // A user-written "/" rule is the explicit default; a second "/" is a
         // duplicate like any other.
-        let mut r = cached_s3("/", "memory");
-        r.memory_budget = Some("64MiB".into());
-        let mut s = section(vec![r]);
-        s.limits = Some(PolicyLimits {
-            memory_budget: Some("128MiB".into()),
-            disk_budget: None,
-        });
+        let s = section(vec![rule("/", "s3")]);
         let p = ResolvedPolicy::build(&s).expect("build");
-        assert_eq!(p.resolve("/x").expect("v").read_cache, CacheKind::Memory);
         assert_eq!(p.resolve("/x").expect("v").rule_prefix, "/");
+        assert_eq!(p.resolve("/x").expect("v").authority, Authority::Remote);
+        assert_eq!(
+            p.rules().count(),
+            1,
+            "explicit / replaces the implicit default"
+        );
     }
 
     // -- O2.6: budget fields and global relationships -------------------------
@@ -888,7 +931,12 @@ mod tests {
             memory_budget: None,
             disk_budget: Some("2GiB".into()),
         });
-        assert!(ResolvedPolicy::build(&ok).is_ok());
+        // the shape is valid, but the FEATURE is not implemented: the gate
+        // fires only after shape validation passes (P-R2)
+        assert!(matches!(
+            ResolvedPolicy::build(&ok),
+            Err(PolicyError::CacheUnavailable { kind: "disk", .. })
+        ));
 
         let mut r2 = cached_s3("/hot", "disk");
         r2.cache_root = Some("~/.cache/x".into());
@@ -930,13 +978,17 @@ mod tests {
             ResolvedPolicy::build(&s),
             Err(PolicyError::BudgetOvercommit { kind: "memory" })
         ));
-        // ceiling fits
+        // ceiling fits: shape validation passes, the availability gate
+        // fires (budget machinery revives with CacheStore)
         let mut ok = section(vec![r]);
         ok.limits = Some(PolicyLimits {
             memory_budget: Some("128MiB".into()),
             disk_budget: None,
         });
-        assert!(ResolvedPolicy::build(&ok).is_ok());
+        assert!(matches!(
+            ResolvedPolicy::build(&ok),
+            Err(PolicyError::CacheUnavailable { kind: "memory", .. })
+        ));
     }
 
     #[test]
@@ -1086,19 +1138,9 @@ mod tests {
 
     #[test]
     fn resolution_is_independent_of_declaration_order() {
-        let mut cached = cached_s3("/a/b", "memory");
-        cached.memory_budget = Some("64MiB".into());
-        let rules_a = vec![local("/a", "~/r-a"), local("/a/b/c", "~/r-abc"), cached];
-        // (the single memory-budgeted rule needs its global ceiling)
-        // — provided via a closure so both orders share one config shape.
-        let mk = |rules: Vec<RawRule>| {
-            let mut s = section(rules);
-            s.limits = Some(PolicyLimits {
-                memory_budget: Some("128MiB".into()),
-                disk_budget: None,
-            });
-            ResolvedPolicy::build(&s).expect("build")
-        };
+        let remote = rule("/a/b", "s3");
+        let rules_a = vec![local("/a", "~/r-a"), local("/a/b/c", "~/r-abc"), remote];
+        let mk = |rules: Vec<RawRule>| ResolvedPolicy::build(&section(rules)).expect("build");
         let rules_b: Vec<RawRule> = rules_a.iter().rev().cloned().collect();
         let pa = mk(rules_a);
         let pb = mk(rules_b);
@@ -1122,14 +1164,16 @@ mod tests {
         assert_eq!(v.authority_life, AuthorityLife::Persistent);
         assert_eq!(v.cache_eviction, None);
 
-        // task-scoped local authority
+        // task-scoped local authority: the MODEL parses it, the
+        // availability gate refuses it until TaskScoped cleanup exists
         let mut r = local("/jobs", "~/j");
         r.authority_life = Some("task".into());
-        let p = build(vec![r]);
-        let v = p.resolve("/jobs/f").expect("v");
-        assert_eq!(v.authority_life, AuthorityLife::TaskScoped);
+        assert!(matches!(
+            ResolvedPolicy::build(&section(vec![r])),
+            Err(PolicyError::TaskScopedUnavailable { prefix }) if prefix == "/jobs"
+        ));
 
-        // cached remote rule, task-scoped cache
+        // cached remote rule: model-valid, feature-unbuilt -> gate
         let mut r = cached_s3("/models", "memory+disk");
         r.memory_budget = Some("64MiB".into());
         r.disk_budget = Some("1GiB".into());
@@ -1140,10 +1184,71 @@ mod tests {
             memory_budget: Some("128MiB".into()),
             disk_budget: Some("2GiB".into()),
         });
-        let p = ResolvedPolicy::build(&s).expect("build");
-        let v = p.resolve("/models/f.bin").expect("v");
-        assert_eq!(v.authority, Authority::Remote);
-        assert_eq!(v.read_cache, CacheKind::MemoryAndDisk);
-        assert_eq!(v.cache_eviction, Some(CacheEviction::Persistent));
+        assert!(matches!(
+            ResolvedPolicy::build(&s),
+            Err(PolicyError::CacheUnavailable {
+                kind: "memory+disk",
+                ..
+            })
+        ));
+    }
+
+    // -- P-R2: unimplemented features are refused, never silently off ------
+
+    #[test]
+    fn unimplemented_cache_is_named_not_silently_ignored() {
+        for (kind, want) in [
+            ("memory", "memory"),
+            ("disk", "disk"),
+            ("memory+disk", "memory+disk"),
+        ] {
+            let mut r = cached_s3("/hot", kind);
+            if kind != "disk" {
+                r.memory_budget = Some("64MiB".into());
+            }
+            if kind != "memory" {
+                r.disk_budget = Some("1GiB".into());
+                r.cache_root = Some("~/cache/hot".into());
+            }
+            let mut s = section(vec![r]);
+            s.limits = Some(PolicyLimits {
+                memory_budget: Some("128MiB".into()),
+                disk_budget: Some("2GiB".into()),
+            });
+            match ResolvedPolicy::build(&s) {
+                Err(PolicyError::CacheUnavailable { prefix, kind: k }) => {
+                    assert_eq!(prefix, "/hot");
+                    assert_eq!(k, want);
+                    let msg = PolicyError::CacheUnavailable {
+                        prefix: "/hot".into(),
+                        kind: k,
+                    }
+                    .to_string();
+                    assert!(
+                        msg.contains("no implementation"),
+                        "message must say WHY: {msg}"
+                    );
+                }
+                other => panic!("cache {kind}: expected CacheUnavailable, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn availability_gate_is_order_independent() {
+        // the same two rules in both orders: the gate fires identically
+        let mut a = cached_s3("/a", "memory");
+        a.memory_budget = Some("1MiB".into());
+        let b = local("/b", "~/r-b");
+        let mut s1 = section(vec![a.clone(), b.clone()]);
+        s1.limits = Some(PolicyLimits {
+            memory_budget: Some("8MiB".into()),
+            disk_budget: None,
+        });
+        let mut s2 = section(vec![b, a]);
+        s2.limits = s1.limits.clone();
+        let e1 = ResolvedPolicy::build(&s1).unwrap_err();
+        let e2 = ResolvedPolicy::build(&s2).unwrap_err();
+        assert_eq!(e1, e2, "the gate must not depend on declaration order");
     }
 }

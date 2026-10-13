@@ -840,6 +840,46 @@ mod tests {
         assert_eq!(counting.count(), probe + 1);
     }
 
+    // P-R2: the mount entry refuses unimplemented features with the SAME
+    // errors the parser produces - parser and mount gate are one surface.
+    #[test]
+    fn unimplemented_features_refuse_the_mount() {
+        let t = tmpdir("pr2");
+        let core = mem_core("pr2");
+
+        // cache = memory: model-valid, feature-unbuilt -> named refusal
+        let mut r = local_rule("/p", &t.join("root"));
+        r.storage = "s3".into();
+        r.root = None;
+        r.cache = Some("memory".into());
+        r.memory_budget = Some("1MiB".into());
+        let mut sec = section(vec![r]);
+        sec.limits = Some(crate::policy::PolicyLimits {
+            memory_budget: Some("8MiB".into()),
+            disk_budget: None,
+        });
+        let err = match RoutingFs::build(core.clone(), Some(&sec), &t.join("mnt")) {
+            Err(e) => e,
+            Ok(_) => panic!("an unimplemented cache must refuse the mount"),
+        };
+        assert!(
+            err.to_string().contains("no implementation"),
+            "mount error must name the reason: {err}"
+        );
+
+        // authority_life = task on a local rule: same surface
+        let mut r = local_rule("/jobs", &t.join("jobs-root"));
+        r.authority_life = Some("task".into());
+        let err = match RoutingFs::build(core, Some(&section(vec![r])), &t.join("mnt")) {
+            Err(e) => e,
+            Ok(_) => panic!("TaskScoped cleanup must refuse the mount until it exists"),
+        };
+        assert!(
+            err.to_string().contains("TaskScoped"),
+            "mount error must name the reason: {err}"
+        );
+    }
+
     // P4-7: unsafe roots and unsupported config fail loudly.
     #[test]
     fn unsafe_roots_and_bad_config_refused() {
