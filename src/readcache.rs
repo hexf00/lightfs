@@ -1,0 +1,973 @@
+//! Phase Q: single-tier memory read cache for s3-authoritative rules.
+//!
+//! Scope (Q1 contract): exactly one opened combination —
+//! `storage = "s3"` + `cache = "memory"` + strict commit + the default
+//! capacity-LRU eviction, on at most ONE rule per mount (the policy build
+//! gate refuses more). Disk caches, memory+disk, write-back and TaskScoped
+//! cleanup keep their named refusals.
+//!
+//! What is cached: COMMITTED bytes of remote files only, read through
+//! [`CacheFs::read_by_id`] (the FUSE read path). Entry identity is the
+//! logical key (rule, node_id, authoritative version, offset, len):
+//! - the RULE is the cache instance itself (one cached rule per mount;
+//!   the instance records the prefix for diagnostics),
+//! - the VERSION is validated on EVERY hit against a live authoritative
+//!   lookup — an entry whose version no longer matches is dropped, never
+//!   served,
+//! - (node_id, offset, len) is the physical slot key, so a version bump
+//!   replaces the stale entry in O(log n) instead of accumulating.
+//!
+//! Two structural guarantees carry the correctness story:
+//! 1. Never change an outcome. The cache sits BELOW the identity protocol:
+//!    a hit requires a fresh `lookup_by_id` (a live RPC on both backends —
+//!    the Client MetaCache TTL is never consulted), and any uncertainty
+//!    (lookup error, non-file node) falls through to the plain read, which
+//!    produces exactly yesterday's behavior. A deleted identity therefore
+//!    cannot be served from the cache — IDENTITY_GONE surfaces as before.
+//! 2. The commit chain never reads the cache. Base reads for overlay
+//!    assembly (FUSE flush, truncate) go through
+//!    [`FsApi::read_by_id_authoritative`], which this layer overrides as a
+//!    bypass. Dirty write-session data never enters this cache either:
+//!    pending chunks live in the adapters' overlays ABOVE it, and this
+//!    cache only ever stores what the authority returned for a completed
+//!    read.
+//!
+//! Concurrency (Q3): between the version pre-lookup and the content read,
+//! another client may commit; the authority then serves the NEW version's
+//! bytes for a read keyed at the old version. Inserting that pairing would
+//! poison the cache, so every insert re-checks the version and refuses to
+//! cache anything it cannot re-confirm (the caller still gets the bytes).
+//! The cost is one extra metadata query per miss; hits cost exactly one.
+//! This is the honest trade of the first version — the read response does
+//! not carry a version (that would be an RPC protocol change, out of
+//! scope) — and it is reported, not hidden.
+//!
+//! Eviction: hard byte budget (the rule's `memory_budget`, already
+//! validated against the mount-wide ceiling), LRU order, single mutex,
+//! no RPC under the lock. A read larger than the whole budget bypasses
+//! (and never fails). Readers receive cloned bytes, so an eviction can
+//! never pull data out from under an in-flight read.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::api::{FsApi, WriteSession};
+use crate::error::Result;
+use crate::metadata::Node;
+use crate::policy::{normalize_path, prefix_matches};
+
+// ---------------------------------------------------------------------------
+// metrics plumbing: the crate metrics are microsecond histograms with static
+// op names; event counters record one microsecond per event (the dump's
+// count column IS the counter), and the cache's byte occupancy is sampled
+// under `client.cache.bytes` (avg_us column reads back as average bytes).
+// ---------------------------------------------------------------------------
+
+const M_HIT: &str = "client.cache.read.hit";
+const M_MISS: &str = "client.cache.read.miss";
+const M_EVICT: &str = "client.cache.read.evict";
+const M_BYPASS: &str = "client.cache.read.bypass";
+const M_STALE: &str = "client.cache.read.stale";
+const M_UNCONFIRMED: &str = "client.cache.read.unconfirmed";
+const M_BYTES: &str = "client.cache.bytes";
+
+fn count_event(op: &'static str) {
+    crate::metrics::observe(op, std::time::Duration::from_micros(1));
+}
+
+fn sample_bytes(n: u64) {
+    crate::metrics::observe(M_BYTES, std::time::Duration::from_micros(n));
+}
+
+// ---------------------------------------------------------------------------
+// MemoryReadCache: slots + LRU + hard budget
+// ---------------------------------------------------------------------------
+
+/// Physical slot key: one slot per (file, requested range). The rule
+/// identity and the version are carried by the instance and the entry
+/// respectively (see module docs).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct SlotKey {
+    node_id: i64,
+    offset: u64,
+    len: u64,
+}
+
+struct Entry {
+    version: i64,
+    bytes: Arc<Vec<u8>>,
+    seq: u64,
+}
+
+#[derive(Default)]
+struct State {
+    slots: HashMap<SlotKey, Entry>,
+    /// seq -> slot key; pop_first evicts the least recently used.
+    lru: BTreeMap<u64, SlotKey>,
+    occupied: u64,
+    seq: u64,
+}
+
+/// Event counters (always on — cheap atomics; tests and benchmarks read
+/// these directly, the metrics registry mirrors them when enabled).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub oversize_bypass: u64,
+    pub stale_skip: u64,
+    pub unconfirmed: u64,
+    /// Authoritative lookups the cache layer initiated (pre-lookup + insert
+    /// recheck). This IS the honest metadata cost: one per hit, two per
+    /// cached miss, one per unconfirmed insert.
+    pub authority_lookups: u64,
+}
+
+pub struct MemoryReadCache {
+    max_bytes: u64,
+    state: Mutex<State>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
+    oversize: AtomicU64,
+    stale: AtomicU64,
+    unconfirmed: AtomicU64,
+    lookups: AtomicU64,
+}
+
+impl MemoryReadCache {
+    pub fn new(max_bytes: u64) -> Self {
+        Self {
+            max_bytes,
+            state: Mutex::new(State::default()),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+            oversize: AtomicU64::new(0),
+            stale: AtomicU64::new(0),
+            unconfirmed: AtomicU64::new(0),
+            lookups: AtomicU64::new(0),
+        }
+    }
+
+    /// Count one authority lookup initiated by the cache layer.
+    fn note_lookup(&self) {
+        self.lookups.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+
+    pub fn occupied_bytes(&self) -> u64 {
+        self.state.lock().unwrap().occupied
+    }
+
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+            oversize_bypass: self.oversize.load(Ordering::Relaxed),
+            stale_skip: self.stale.load(Ordering::Relaxed),
+            unconfirmed: self.unconfirmed.load(Ordering::Relaxed),
+            authority_lookups: self.lookups.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Version-validated lookup. A slot whose version no longer matches
+    /// the authority's current version is dropped on the spot (counted as
+    /// `stale_skip`), never served.
+    pub fn get(&self, node_id: i64, version: i64, offset: u64, len: u64) -> Option<Arc<Vec<u8>>> {
+        let key = SlotKey {
+            node_id,
+            offset,
+            len,
+        };
+        // Probe without acting (the entry borrow must not span the
+        // bookkeeping), then apply under a short second lock.
+        enum Found {
+            Hit(Arc<Vec<u8>>),
+            Stale,
+            Miss,
+        }
+        let found = {
+            let st = self.state.lock().unwrap();
+            match st.slots.get(&key) {
+                Some(e) if e.version == version => Found::Hit(e.bytes.clone()),
+                Some(_) => Found::Stale,
+                None => Found::Miss,
+            }
+        };
+        match found {
+            Found::Hit(bytes) => {
+                self.touch(key);
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                count_event(M_HIT);
+                Some(bytes)
+            }
+            Found::Stale => {
+                // the authority moved past this entry's version: drop it
+                // now so the budget is not held by bytes that can never be
+                // hit again
+                let mut st = self.state.lock().unwrap();
+                if let Some(e) = st.slots.remove(&key) {
+                    st.lru.remove(&e.seq);
+                    st.occupied -= e.bytes.len() as u64;
+                }
+                drop(st);
+                self.stale.fetch_add(1, Ordering::Relaxed);
+                count_event(M_STALE);
+                None
+            }
+            Found::Miss => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                count_event(M_MISS);
+                None
+            }
+        }
+    }
+
+    /// Mark a slot as most-recently-used (O(log n)).
+    fn touch(&self, key: SlotKey) {
+        let mut st = self.state.lock().unwrap();
+        let old = st.slots.get(&key).map(|e| e.seq);
+        if let Some(old) = old {
+            st.lru.remove(&old);
+            st.seq += 1;
+            let seq = st.seq;
+            st.lru.insert(seq, key);
+            if let Some(e) = st.slots.get_mut(&key) {
+                e.seq = seq;
+            }
+        }
+    }
+
+    /// Insert (replacing any same-slot entry). The slot is identified by
+    /// the REQUESTED range (offset, len) — the authority may have returned
+    /// fewer bytes than requested (clamped at EOF), and a re-read of the
+    /// same range must hit. Refuses (counting a bypass) anything whose
+    /// payload is larger than the whole budget; evicts LRU-first until the
+    /// entry fits. Returns false when nothing was stored.
+    pub fn insert(
+        &self,
+        node_id: i64,
+        version: i64,
+        offset: u64,
+        len: u64,
+        bytes: Arc<Vec<u8>>,
+    ) -> bool {
+        let size = bytes.len() as u64;
+        if size > self.max_bytes {
+            self.oversize.fetch_add(1, Ordering::Relaxed);
+            count_event(M_BYPASS);
+            return false;
+        }
+        let key = SlotKey {
+            node_id,
+            offset,
+            len,
+        };
+        let mut st = self.state.lock().unwrap();
+        if let Some(old) = st.slots.remove(&key) {
+            st.lru.remove(&old.seq);
+            st.occupied -= old.bytes.len() as u64;
+        }
+        while st.occupied + size > self.max_bytes {
+            let Some((_, evict_key)) = st.lru.pop_first() else {
+                break;
+            };
+            if let Some(e) = st.slots.remove(&evict_key) {
+                st.occupied -= e.bytes.len() as u64;
+                self.evictions.fetch_add(1, Ordering::Relaxed);
+                count_event(M_EVICT);
+            }
+        }
+        // After evicting everything the entry always fits (size <= budget),
+        // so this is purely defensive.
+        if st.occupied + size > self.max_bytes {
+            drop(st);
+            self.oversize.fetch_add(1, Ordering::Relaxed);
+            count_event(M_BYPASS);
+            return false;
+        }
+        st.seq += 1;
+        let seq = st.seq;
+        st.slots.insert(
+            key,
+            Entry {
+                version,
+                bytes,
+                seq,
+            },
+        );
+        st.lru.insert(seq, key);
+        st.occupied += size;
+        let occupied = st.occupied;
+        drop(st);
+        sample_bytes(occupied);
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CacheFs: the FsApi decorator the router installs in front of the s3 backend
+// ---------------------------------------------------------------------------
+
+/// Wraps the remote backend. Every method is a passthrough except
+/// `read_by_id` (version-validated read-through) and
+/// `read_by_id_authoritative` (structural bypass for the commit chain).
+pub struct CacheFs {
+    inner: Arc<dyn FsApi>,
+    /// The single cached rule's prefix. Decides ELIGIBILITY only (via the
+    /// path hint, the same component-boundary match the policy uses);
+    /// identity and versioning never consult the hint.
+    prefix: String,
+    cache: Arc<MemoryReadCache>,
+}
+
+impl CacheFs {
+    pub fn new(inner: Arc<dyn FsApi>, prefix: String, budget: u64) -> Self {
+        Self::with_cache(inner, prefix, Arc::new(MemoryReadCache::new(budget)))
+    }
+
+    pub fn with_cache(inner: Arc<dyn FsApi>, prefix: String, cache: Arc<MemoryReadCache>) -> Self {
+        Self {
+            inner,
+            prefix,
+            cache,
+        }
+    }
+
+    pub fn cache(&self) -> &Arc<MemoryReadCache> {
+        &self.cache
+    }
+
+    /// Cache-eligibility of a by-id read, decided from the caller's path
+    /// hint with the policy's own component-boundary match. A malformed
+    /// hint is ineligible (never guess). The hint being stale after a
+    /// cross-client rename can only shift eligibility at the margin — a
+    /// cached byte range is still that node_id's committed bytes at a
+    /// validated version, so no wrong bytes are possible, only budget
+    /// attribution that trails a rename until the entry is evicted.
+    fn eligible(&self, path_hint: &str) -> bool {
+        match normalize_path(path_hint) {
+            Ok(p) => prefix_matches(&self.prefix, &p),
+            Err(_) => false,
+        }
+    }
+
+    fn consider_insert(
+        &self,
+        node_id: i64,
+        version: i64,
+        offset: u64,
+        requested_len: u64,
+        bytes: &[u8],
+        hint: &str,
+    ) {
+        if bytes.len() as u64 > self.cache.max_bytes() {
+            // larger than the whole budget: skip the recheck RPC too —
+            // there is nothing to insert
+            self.cache.oversize.fetch_add(1, Ordering::Relaxed);
+            count_event(M_BYPASS);
+            return;
+        }
+        // Insert-time recheck (Q3): the authority resolved the read at its
+        // own point in time, which may have moved past `version` while the
+        // bytes were in flight. Only a re-confirmable pairing is cacheable.
+        self.cache.note_lookup();
+        match self.inner.lookup_by_id(node_id, hint) {
+            Ok(n) if n.version == version => {
+                self.cache.insert(
+                    node_id,
+                    version,
+                    offset,
+                    requested_len,
+                    Arc::new(bytes.to_vec()),
+                );
+            }
+            _ => {
+                self.cache.unconfirmed.fetch_add(1, Ordering::Relaxed);
+                count_event(M_UNCONFIRMED);
+            }
+        }
+    }
+}
+
+impl FsApi for CacheFs {
+    fn lookup(&self, path: &str) -> Result<Node> {
+        self.inner.lookup(path)
+    }
+    fn readdir(&self, path: &str) -> Result<Vec<Node>> {
+        self.inner.readdir(path)
+    }
+    fn mkdir(&self, path: &str, mode: u32) -> Result<Node> {
+        self.inner.mkdir(path, mode)
+    }
+    fn create(&self, path: &str, mode: u32) -> Result<Node> {
+        self.inner.create(path, mode)
+    }
+    fn open(&self, path: &str) -> Result<Node> {
+        self.inner.open(path)
+    }
+    fn read(&self, path: &str, offset: u64, size: u64) -> Result<Vec<u8>> {
+        self.inner.read(path, offset, size)
+    }
+    fn open_write(
+        &self,
+        path: &str,
+        expected_version: Option<i64>,
+    ) -> Result<Box<dyn WriteSession + '_>> {
+        self.inner.open_write(path, expected_version)
+    }
+    fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
+        self.inner.rename(old_path, new_path)
+    }
+    fn unlink(&self, path: &str) -> Result<()> {
+        self.inner.unlink(path)
+    }
+    fn rmdir(&self, path: &str) -> Result<()> {
+        self.inner.rmdir(path)
+    }
+    fn setattr(&self, path: &str, mode: Option<u32>, mtime: Option<i64>) -> Result<Node> {
+        self.inner.setattr(path, mode, mtime)
+    }
+    fn symlink(&self, target: &str, path: &str) -> Result<Node> {
+        self.inner.symlink(target, path)
+    }
+    fn readlink(&self, path: &str) -> Result<String> {
+        self.inner.readlink(path)
+    }
+    fn lookup_by_id(&self, node_id: i64, path_hint: &str) -> Result<Node> {
+        self.inner.lookup_by_id(node_id, path_hint)
+    }
+
+    fn read_by_id(&self, node_id: i64, path_hint: &str, offset: u64, size: u64) -> Result<Vec<u8>> {
+        if !self.eligible(path_hint) {
+            return self.inner.read_by_id(node_id, path_hint, offset, size);
+        }
+        // Authoritative version observation: `lookup_by_id` is a live query
+        // on both implementations (the id anchor exists precisely because a
+        // cached path->node snapshot may lie). If it errors, the plain read
+        // reproduces the caller's today-behavior exactly — the cache never
+        // turns a would-succeed read into an error, and a dead identity can
+        // never be served from cached bytes.
+        self.cache.note_lookup();
+        let node = match self.inner.lookup_by_id(node_id, path_hint) {
+            Ok(n) => n,
+            Err(_) => return self.inner.read_by_id(node_id, path_hint, offset, size),
+        };
+        if !node.is_file() {
+            return self.inner.read_by_id(node_id, path_hint, offset, size);
+        }
+        if let Some(bytes) = self.cache.get(node_id, node.version, offset, size) {
+            return Ok((*bytes).clone());
+        }
+        let bytes = self.inner.read_by_id(node_id, path_hint, offset, size)?;
+        self.consider_insert(node_id, node.version, offset, size, &bytes, path_hint);
+        Ok(bytes)
+    }
+
+    /// The commit chain's base read: structural bypass (module docs,
+    /// guarantee 2). Dirty data and cache contents can never meet here.
+    fn read_by_id_authoritative(
+        &self,
+        node_id: i64,
+        path_hint: &str,
+        offset: u64,
+        size: u64,
+    ) -> Result<Vec<u8>> {
+        self.inner.read_by_id(node_id, path_hint, offset, size)
+    }
+
+    fn open_write_by_id(
+        &self,
+        node_id: i64,
+        path: &str,
+        expected_version: Option<i64>,
+    ) -> Result<Box<dyn WriteSession + '_>> {
+        self.inner.open_write_by_id(node_id, path, expected_version)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: unit behavior of the store + the FsApi contract over a real
+// embedded Core (the same engine the server runs, on the in-memory store).
+// The network-mode two-client regression (default metadata TTL) lives in
+// tests/client_integration.rs; the FUSE-level checks run against real
+// kernel mounts.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, MetadataSection};
+    use crate::core::Core;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "lightfs-q-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A fresh embedded Core: SQLite metadata (own file) + in-memory
+    /// objects — the real commit/CAS/identity chain, no network.
+    pub(super) fn core_at(tag: &str) -> Arc<Core> {
+        let cfg = Config {
+            metadata: MetadataSection {
+                path: tmpdir(tag).join("meta.db").to_string_lossy().into_owned(),
+            },
+            ..Default::default()
+        };
+        crate::engine::open_embedded_mem(&cfg).unwrap().core
+    }
+
+    fn cached(core: Arc<Core>, prefix: &str, budget: u64) -> CacheFs {
+        CacheFs::new(core, prefix.to_string(), budget)
+    }
+
+    pub(super) fn write_via(fs: &dyn FsApi, path: &str, data: &[u8]) -> i64 {
+        if let Some((dir, _)) = path.rsplit_once('/') {
+            if !dir.is_empty() {
+                let _ = fs.mkdir(dir, 0o755); // idempotent for tests
+            }
+        }
+        let node = fs.create(path, 0o644).unwrap();
+        let mut s = fs.open_write(path, None).unwrap();
+        s.write(0, data).unwrap();
+        s.commit().unwrap();
+        node.id
+    }
+
+    // -- store-level -------------------------------------------------------
+
+    #[test]
+    fn slot_is_version_validated_and_stale_entries_are_dropped() {
+        let c = MemoryReadCache::new(1 << 20);
+        let b: Arc<Vec<u8>> = Arc::new(b"one".to_vec());
+        assert!(c.insert(7, 1, 0, 3, b));
+        assert_eq!(
+            c.get(7, 1, 0, 3).unwrap().as_slice(),
+            b"one",
+            "same version hits"
+        );
+        // version moved on: the slot must never serve, and it is dropped
+        assert!(c.get(7, 2, 0, 3).is_none());
+        let s = c.stats();
+        assert_eq!(s.stale_skip, 1);
+        assert_eq!(c.occupied_bytes(), 0, "stale slot released");
+        assert!(c.get(7, 1, 0, 3).is_none(), "dropped means dropped");
+    }
+
+    #[test]
+    fn lru_eviction_respects_touch_order_and_budget() {
+        let c = MemoryReadCache::new(10);
+        assert!(c.insert(1, 1, 0, 4, Arc::new(vec![0u8; 4]))); // A
+        assert!(c.insert(2, 1, 0, 4, Arc::new(vec![0u8; 4]))); // B
+        assert!(c.get(1, 1, 0, 4).is_some(), "touch A");
+        assert!(c.insert(3, 1, 0, 4, Arc::new(vec![0u8; 4]))); // needs 4: B evicted
+        let s = c.stats();
+        assert_eq!(s.evictions, 1, "exactly the LRU (untouched B) evicted");
+        assert!(c.get(1, 1, 0, 4).is_some(), "touched A survives");
+        assert!(c.get(2, 1, 0, 4).is_none(), "B was the LRU victim");
+        assert!(c.occupied_bytes() <= 10);
+    }
+
+    #[test]
+    fn oversize_read_is_refused_by_the_store_and_counted() {
+        let c = MemoryReadCache::new(8);
+        assert!(!c.insert(1, 1, 0, 9, Arc::new(vec![0u8; 9])));
+        assert_eq!(c.stats().oversize_bypass, 1);
+        assert_eq!(c.occupied_bytes(), 0);
+    }
+
+    #[test]
+    fn same_slot_new_version_replaces_without_leaking_budget() {
+        let c = MemoryReadCache::new(16);
+        assert!(c.insert(5, 1, 0, 8, Arc::new(vec![b'a'; 8])));
+        assert!(c.insert(5, 2, 0, 8, Arc::new(vec![b'b'; 8])));
+        assert_eq!(c.occupied_bytes(), 8, "replacement, not accumulation");
+        assert_eq!(c.get(5, 2, 0, 8).unwrap().as_slice(), &[b'b'; 8]);
+        assert_eq!(c.stats().evictions, 0);
+    }
+
+    #[test]
+    fn eviction_never_pulls_data_from_an_in_flight_reader() {
+        // the reader holds an Arc clone; dropping the entry only drops the
+        // cache's reference (Q4: eviction vs in-flight reads)
+        let c = MemoryReadCache::new(4);
+        assert!(c.insert(1, 1, 0, 4, Arc::new(vec![7u8; 4])));
+        let held = c.get(1, 1, 0, 4).unwrap();
+        assert!(c.insert(2, 1, 0, 4, Arc::new(vec![9u8; 4]))); // evicts entry 1
+        assert_eq!(c.stats().evictions, 1);
+        assert_eq!(held.as_slice(), &[7u8; 4], "reader's bytes are its own");
+        assert_eq!(c.occupied_bytes(), 4);
+    }
+
+    // -- FsApi contract over a real embedded Core ---------------------------
+
+    #[test]
+    fn read_through_hit_serves_identical_bytes_and_counts() {
+        let core = core_at("hit");
+        let f = cached(core, "/hot", 1 << 20);
+        let id = write_via(&f, "/hot/f", b"hello cached world");
+
+        let a = f.read_by_id(id, "/hot/f", 0, 100).unwrap();
+        let s1 = f.cache().stats();
+        assert_eq!(s1.misses, 1);
+        assert_eq!(s1.hits, 0);
+        let b = f.read_by_id(id, "/hot/f", 0, 100).unwrap();
+        let s2 = f.cache().stats();
+        assert_eq!(s2.hits, 1, "second read is a hit");
+        assert_eq!(s2.misses, 1, "no extra authority read");
+        assert_eq!(a, b);
+        assert_eq!(b, b"hello cached world");
+
+        // ranged reads are their own slots (exact-range entries, Q2)
+        let r = f.read_by_id(id, "/hot/f", 6, 6).unwrap();
+        assert_eq!(r, b"cached");
+        let s3 = f.cache().stats();
+        assert_eq!(s3.misses, 2, "a different range is a different slot");
+        assert_eq!(f.read_by_id(id, "/hot/f", 6, 6).unwrap(), b"cached");
+        assert_eq!(f.cache().stats().hits, 2);
+    }
+
+    #[test]
+    fn ineligible_prefixes_never_touch_the_cache() {
+        let core = core_at("elig");
+        let f = cached(core, "/hot", 1 << 20);
+        let hot = write_via(&f, "/hot/f", b"hot");
+        let cold = write_via(&f, "/cold/g", b"cold");
+
+        for _ in 0..2 {
+            assert_eq!(f.read_by_id(cold, "/cold/g", 0, 10).unwrap(), b"cold");
+        }
+        let s = f.cache().stats();
+        assert_eq!((s.hits, s.misses), (0, 0), "outside the rule: no cache");
+
+        assert_eq!(f.read_by_id(hot, "/hot/f", 0, 10).unwrap(), b"hot");
+        assert_eq!(f.cache().stats().misses, 1, "inside the rule: cached");
+
+        // component boundary: /hot-old is NOT the rule
+        let other = write_via(&f, "/hot-old/x", b"other");
+        assert_eq!(f.read_by_id(other, "/hot-old/x", 0, 10).unwrap(), b"other");
+        assert_eq!(f.cache().stats().misses, 1);
+    }
+
+    /// THE Q3 regression: after another writer advances the version, a
+    /// cached read must not serve the stale bytes. Runs against the real
+    /// commit chain (the writer bypasses the cache exactly like a second
+    /// client's commit bypasses this mount).
+    #[test]
+    fn stale_version_is_never_served_after_a_second_writer() {
+        let core = core_at("stale");
+        let f = cached(core.clone(), "/hot", 1 << 20);
+        let id = write_via(&f, "/hot/f", b"version one");
+
+        assert_eq!(f.read_by_id(id, "/hot/f", 0, 100).unwrap(), b"version one");
+        assert_eq!(f.cache().stats().hits, 0);
+
+        // "client B" commits through the shared authority
+        let mut ws = FsApi::open_write(core.as_ref(), "/hot/f", None).unwrap();
+        ws.write(0, b"version two from B").unwrap();
+        ws.commit().unwrap();
+
+        let now = f.read_by_id(id, "/hot/f", 0, 100).unwrap();
+        assert_eq!(now, b"version two from B", "the stale entry must lose");
+        let s = f.cache().stats();
+        assert_eq!(s.stale_skip, 1, "the version check caught the old entry");
+        assert_eq!(s.hits, 0, "nothing stale was served");
+        // and the fresh entry now hits
+        assert_eq!(f.read_by_id(id, "/hot/f", 0, 100).unwrap(), now);
+        assert_eq!(f.cache().stats().hits, 1);
+    }
+
+    /// Q3 race: a commit lands BETWEEN the version pre-lookup and the
+    /// content read, so the bytes that come back belong to the NEW version.
+    /// The insert-time recheck must refuse to cache them. Deterministic:
+    /// the racing commit happens inside the inner read, exactly once.
+    struct RaceFs {
+        inner: Arc<Core>,
+        path: String,
+        armed: AtomicBool,
+    }
+    impl FsApi for RaceFs {
+        fn lookup(&self, p: &str) -> Result<Node> {
+            self.inner.lookup(p)
+        }
+        fn readdir(&self, p: &str) -> Result<Vec<Node>> {
+            self.inner.readdir(p)
+        }
+        fn mkdir(&self, p: &str, m: u32) -> Result<Node> {
+            self.inner.mkdir(p, m)
+        }
+        fn create(&self, p: &str, m: u32) -> Result<Node> {
+            self.inner.create(p, m)
+        }
+        fn open(&self, p: &str) -> Result<Node> {
+            self.inner.open(p)
+        }
+        fn read(&self, p: &str, o: u64, s: u64) -> Result<Vec<u8>> {
+            self.inner.read(p, o, s)
+        }
+        fn open_write(&self, p: &str, e: Option<i64>) -> Result<Box<dyn WriteSession + '_>> {
+            // trait form: Core's inherent open_write returns a bare handle
+            FsApi::open_write(self.inner.as_ref(), p, e)
+        }
+        fn rename(&self, o: &str, n: &str) -> Result<()> {
+            self.inner.rename(o, n)
+        }
+        fn unlink(&self, p: &str) -> Result<()> {
+            self.inner.unlink(p)
+        }
+        fn rmdir(&self, p: &str) -> Result<()> {
+            self.inner.rmdir(p)
+        }
+        fn setattr(&self, p: &str, m: Option<u32>, t: Option<i64>) -> Result<Node> {
+            self.inner.setattr(p, m, t)
+        }
+        fn symlink(&self, t: &str, p: &str) -> Result<Node> {
+            self.inner.symlink(t, p)
+        }
+        fn readlink(&self, p: &str) -> Result<String> {
+            self.inner.readlink(p)
+        }
+        fn lookup_by_id(&self, id: i64, h: &str) -> Result<Node> {
+            FsApi::lookup_by_id(self.inner.as_ref(), id, h)
+        }
+        fn read_by_id(&self, id: i64, _hint: &str, o: u64, s: u64) -> Result<Vec<u8>> {
+            // the race, once: another client's commit completes while "the
+            // read is on the wire", so the authority serves the NEW version
+            if self.armed.swap(false, Ordering::SeqCst) {
+                let mut ws = FsApi::open_write(self.inner.as_ref(), &self.path, None).unwrap();
+                ws.write(0, b"raced past the pre-lookup").unwrap();
+                ws.commit().unwrap();
+            }
+            FsApi::read_by_id(self.inner.as_ref(), id, "", o, s)
+        }
+    }
+
+    #[test]
+    fn read_raced_by_a_commit_is_returned_but_not_cached() {
+        let core = core_at("race");
+        let id = write_via(core.as_ref(), "/hot/f", b"version one");
+        let inner: Arc<dyn FsApi> = Arc::new(RaceFs {
+            inner: core.clone(),
+            path: "/hot/f".to_string(),
+            armed: AtomicBool::new(true),
+        });
+        let f = CacheFs::with_cache(
+            inner,
+            "/hot".to_string(),
+            Arc::new(MemoryReadCache::new(1 << 20)),
+        );
+
+        let got = f.read_by_id(id, "/hot/f", 0, 100).unwrap();
+        assert_eq!(got, b"raced past the pre-lookup", "caller keeps the bytes");
+        let s = f.cache().stats();
+        assert_eq!(s.unconfirmed, 1, "version moved under the read: no insert");
+        assert_eq!(f.cache().occupied_bytes(), 0, "poison never stored");
+
+        // a follow-up read (race disarmed) observes the new version, caches
+        // cleanly, and the read after THAT hits
+        assert_eq!(f.read_by_id(id, "/hot/f", 0, 100).unwrap(), got);
+        assert_eq!(f.read_by_id(id, "/hot/f", 0, 100).unwrap(), got);
+        assert_eq!(f.cache().stats().hits, 1);
+    }
+
+    /// Q4: a poisoned entry (wrong bytes under the CURRENT version) cannot
+    /// reach the commit chain — the authoritative read bypasses structurally.
+    #[test]
+    fn poisoned_cache_never_reaches_the_authoritative_read_or_the_commit() {
+        let core = core_at("poison");
+        let f = cached(core.clone(), "/hot", 1 << 20);
+        let id = write_via(&f, "/hot/f", b"clean authoritative bytes");
+        let v = core.lookup("/hot/f").unwrap().version;
+
+        // adversarial injection: wrong bytes under the current version
+        assert!(f.cache().insert(id, v, 0, 6, Arc::new(b"POISON".to_vec())));
+        // probe proves the poison would hit a plain read (this probe is
+        // itself the only hit the cache ever records in this test)
+        assert_eq!(f.cache().get(id, v, 0, 6).unwrap().as_slice(), b"POISON");
+        let after_setup = f.cache().stats();
+
+        // the commit chain's base read ignores it
+        let base = f.read_by_id_authoritative(id, "/hot/f", 0, 100).unwrap();
+        assert_eq!(base, b"clean authoritative bytes");
+        assert_eq!(f.cache().stats(), after_setup, "no cache traffic");
+
+        // and the whole flush-shaped commit (overlay assembly + CAS) lands
+        // on authority bytes, exactly as it would without any cache
+        let mut ws = f.open_write_by_id(id, "/hot/f", Some(v)).unwrap();
+        ws.write(0, b"clean authoritative bytes+overlay").unwrap();
+        let committed = ws.commit().unwrap();
+        assert!(committed.version > v);
+        assert_eq!(
+            core.read("/hot/f", 0, 100).unwrap(),
+            b"clean authoritative bytes+overlay"
+        );
+        let s = f.cache().stats();
+        assert_eq!(
+            (s.hits, s.misses),
+            (after_setup.hits, after_setup.misses),
+            "the commit chain is not a cache client"
+        );
+    }
+
+    /// Q4: a deleted identity must fail through the cache exactly as it
+    /// would without one — cached bytes must not resurrect IDENTITY_GONE.
+    #[test]
+    fn deleted_identity_is_never_served_from_the_cache() {
+        let core = core_at("gone");
+        let f = cached(core.clone(), "/hot", 1 << 20);
+        let id = write_via(&f, "/hot/f", b"soon gone");
+        assert_eq!(f.read_by_id(id, "/hot/f", 0, 100).unwrap(), b"soon gone");
+        assert_eq!(f.cache().stats().hits, 0); // first read: miss
+
+        core.unlink("/hot/f").unwrap();
+
+        let err = f.read_by_id(id, "/hot/f", 0, 100).unwrap_err();
+        assert!(
+            matches!(err, crate::error::Error::IdentityGone(_)),
+            "the identity error must surface, got {err:?}"
+        );
+        assert_eq!(f.cache().stats().hits, 0, "no cached bytes were served");
+    }
+
+    /// Q2: a read larger than the whole budget bypasses without failing.
+    #[test]
+    fn oversize_read_bypasses_and_still_succeeds() {
+        let core = core_at("big");
+        let f = cached(core, "/hot", 16);
+        let big = vec![b'x'; 1024];
+        let id = write_via(&f, "/hot/f", &big);
+
+        let got = f.read_by_id(id, "/hot/f", 0, 1024).unwrap();
+        assert_eq!(got, big);
+        let s = f.cache().stats();
+        assert_eq!(s.oversize_bypass, 1);
+        assert_eq!(f.cache().occupied_bytes(), 0);
+        // and again: still correct, still bypassing
+        assert_eq!(f.read_by_id(id, "/hot/f", 0, 1024).unwrap(), big);
+        assert_eq!(f.cache().stats().oversize_bypass, 2);
+    }
+
+    /// Q5: the authoritative bypass is not a cache client — no hit/miss
+    /// accounting, so the numbers stay attributable.
+    #[test]
+    fn authoritative_read_leaves_no_cache_traces() {
+        let core = core_at("auth");
+        let f = cached(core, "/hot", 1 << 20);
+        let id = write_via(&f, "/hot/f", b"data");
+        let before = f.cache().stats();
+        assert_eq!(
+            f.read_by_id_authoritative(id, "/hot/f", 0, 100).unwrap(),
+            b"data"
+        );
+        assert_eq!(f.cache().stats(), before);
+    }
+}
+
+#[cfg(test)]
+mod perf {
+    //! Q5 evidence: cold vs hot ranged reads on the embedded engine, with
+    //! REAL S3-GET and metadata-query counters (Core::metrics). Run with
+    //! `cargo test --lib readcache::perf -- --nocapture` to see the table;
+    //! the asserts pin the structural facts (hot pass does zero object
+    //! reads, the hit rate is exact, occupancy stays under budget).
+
+    use super::tests::core_at;
+    use super::*;
+    use crate::api::FsApi;
+
+    const CHUNK: u64 = 128 * 1024;
+    const FILE: u64 = 4 * 1024 * 1024;
+
+    #[test]
+    fn cold_vs_hot_ranged_reads() {
+        let core = core_at("perf");
+        let f = CacheFs::new(core.clone(), "/hot".to_string(), 8 << 20);
+        f.mkdir("/hot", 0o755).unwrap();
+        f.create("/hot/f", 0o644).unwrap();
+        let mut ws = f.open_write("/hot/f", None).unwrap();
+        ws.write(0, &vec![0xA5u8; FILE as usize]).unwrap();
+        ws.commit().unwrap();
+        let id = f.lookup("/hot/f").unwrap().id;
+
+        let ranges: Vec<(u64, u64)> = (0..(FILE / CHUNK)).map(|i| (i * CHUNK, CHUNK)).collect();
+
+        let gets0 = core.metrics.s3_get.load(Ordering::Relaxed);
+        let _meta0 = core.metrics.metadata_tx.load(Ordering::Relaxed);
+        let lookups0 = f.cache().stats().authority_lookups;
+        let t0 = std::time::Instant::now();
+        for &(off, len) in &ranges {
+            let got = f.read_by_id(id, "/hot/f", off, len).unwrap();
+            assert_eq!(got.len() as u64, len);
+        }
+        let cold = t0.elapsed();
+        let gets1 = core.metrics.s3_get.load(Ordering::Relaxed);
+        let _meta1 = core.metrics.metadata_tx.load(Ordering::Relaxed);
+        let lookups1 = f.cache().stats().authority_lookups;
+
+        let t1 = std::time::Instant::now();
+        for &(off, len) in &ranges {
+            let got = f.read_by_id(id, "/hot/f", off, len).unwrap();
+            assert_eq!(got.len() as u64, len);
+        }
+        let hot = t1.elapsed();
+        let gets2 = core.metrics.s3_get.load(Ordering::Relaxed);
+        let _meta2 = core.metrics.metadata_tx.load(Ordering::Relaxed);
+
+        let s = f.cache().stats();
+        println!(
+            "\nQ5 cold-vs-hot (embedded engine, {} x {} KiB ranges over {} MiB file):\n  cold: {:>10.1?}  (s3_get +{}, authority lookups +{})\n  hot:  {:>10.1?}  (s3_get +{}, authority lookups +{})\n  speedup: {:.1}x  hits={} misses={} stale={} unconfirmed={} occupied={}/{}",
+            ranges.len(),
+            CHUNK / 1024,
+            FILE >> 20,
+            cold,
+            gets1 - gets0,
+            lookups1 - lookups0,
+            hot,
+            gets2 - gets1,
+            s.authority_lookups - lookups1,
+            cold.as_nanos() as f64 / hot.as_nanos() as f64,
+            s.hits,
+            s.misses,
+            s.stale_skip,
+            s.unconfirmed,
+            f.cache().occupied_bytes() >> 10,
+            f.cache().max_bytes() >> 10,
+        );
+
+        // structural facts
+        assert_eq!(gets2 - gets1, 0, "hot pass must not touch the object store");
+        assert_eq!(s.hits as usize, ranges.len(), "every hot read hits");
+        assert_eq!(s.misses as usize, ranges.len(), "every cold read misses");
+        // the honest cost model: 2 authority lookups per cached miss
+        // (pre-lookup + insert recheck), 1 per hit
+        assert_eq!(s.authority_lookups - lookups1, 32, "one lookup per hit");
+        assert_eq!(
+            (lookups1 - lookups0) as usize,
+            2 * ranges.len(),
+            "two lookups per cached miss"
+        );
+        assert!(
+            f.cache().occupied_bytes() <= f.cache().max_bytes(),
+            "hard budget holds"
+        );
+    }
+}

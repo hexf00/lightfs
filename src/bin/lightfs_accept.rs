@@ -2064,6 +2064,131 @@ fn section_e(ctx: &mut Ctx, root: &Path) {
     println!("  OK  E: policy mounts torn down");
 }
 
+/// Q: the single-tier memory read cache over an s3 rule (Phase Q).
+/// Q1 unimplemented shapes refuse BY NAME; Q2 the opened combination mounts
+/// (no local rules at all - the router exists to own the CacheFs) and warm
+/// reads are byte-exact; Q3/Q4 a second client's committed writes are
+/// observed immediately and a deleted identity is not resurrected; the
+/// unmount metrics dump carries the hit/miss/stale evidence.
+#[cfg(unix)]
+fn section_q(ctx: &mut Ctx, root: &Path) {
+    println!("--- Q: memory read cache over an s3 rule ---");
+    let base_cfg = std::fs::read_to_string(&ctx.config).expect("read base config");
+    let target_q = format!("{}q", ctx.mount_target);
+
+    let cache_rule = "[policy.limits]\nmemory_budget = \"64MiB\"\n\n[[policy.rule]]\nprefix = \"/hot\"\nstorage = \"s3\"\ncache = \"memory\"\nmemory_budget = \"8MiB\"";
+
+    // Q1a: lifecycle = "persistent" has no distinct single-tier semantics
+    let bad_persistent = policy_config(
+        &base_cfg,
+        &ctx.workdir,
+        "cfg-q-persistent.toml",
+        &format!("{cache_rule}\nlifecycle = \"persistent\""),
+    );
+    ctx.assert_mount_refused(&bad_persistent, format!("{target_q}1"));
+
+    // Q1b: a second cached rule refuses the mount
+    let two_cached = "[policy.limits]\nmemory_budget = \"64MiB\"\n\n[[policy.rule]]\nprefix = \"/h1\"\nstorage = \"s3\"\ncache = \"memory\"\nmemory_budget = \"1MiB\"\n\n[[policy.rule]]\nprefix = \"/h2\"\nstorage = \"s3\"\ncache = \"memory\"\nmemory_budget = \"1MiB\"";
+    let bad_two = policy_config(&base_cfg, &ctx.workdir, "cfg-q-two.toml", two_cached);
+    ctx.assert_mount_refused(&bad_two, format!("{target_q}2"));
+
+    // Q2: the opened combination mounts and serves byte-exact reads.
+    let pol = policy_config(&base_cfg, &ctx.workdir, "cfg-q.toml", cache_rule);
+    let metrics_path = ctx.workdir.join("mount-q.metrics");
+    let _ = std::fs::remove_file(&metrics_path);
+    std::fs::create_dir_all(&target_q).expect("Q mountpoint");
+    let qm = ctx.spawn_mount_cfg(
+        target_q.clone(),
+        &pol,
+        &[
+            ("LIGHTFS_FUSE_ATTR_TTL_SECS", "0"),
+            ("LIGHTFS_METRICS", "1"),
+            (
+                "LIGHTFS_METRICS_FILE",
+                metrics_path.to_string_lossy().as_ref(),
+            ),
+        ],
+        "mount-q",
+    );
+    let q_root = PathBuf::from(&target_q);
+    std::fs::create_dir_all(q_root.join("hot")).expect("Q mkdir /hot on the cached mount");
+
+    write_strong(&q_root.join("hot/f.bin"), &[0x5Au8; 200_000], "Q2 seed");
+    assert_bytes(
+        "Q2 cold read",
+        &q_root.join("hot/f.bin"),
+        &[0x5Au8; 200_000],
+    );
+    assert_bytes(
+        "Q2 warm read (cache hit)",
+        &q_root.join("hot/f.bin"),
+        &[0x5Au8; 200_000],
+    );
+
+    // Q3/Q4: the BASE mount is a second client. Its committed write must be
+    // observed by the cached mount immediately (every read validates the
+    // version against a live lookup; attr TTL is 0), and the deleted
+    // identity must not resurrect from cached bytes.
+    let other = root.join("hot");
+    std::fs::create_dir_all(&other).expect("Q other-client dir");
+    write_strong(
+        &other.join("g.txt"),
+        b"written by the other mount",
+        "Q4 seed",
+    );
+    assert_bytes(
+        "Q4 first read (cold)",
+        &q_root.join("hot/g.txt"),
+        b"written by the other mount",
+    );
+    write_strong(
+        &other.join("g.txt"),
+        b"OVERWRITTEN by the other mount",
+        "Q4 update",
+    );
+    assert_bytes(
+        "Q4 re-read sees the new version",
+        &q_root.join("hot/g.txt"),
+        b"OVERWRITTEN by the other mount",
+    );
+    std::fs::remove_file(other.join("g.txt")).expect("Q4 unlink via the other client");
+    assert!(
+        !q_root.join("hot/g.txt").exists(),
+        "Q4 deleted identity must vanish on the cached mount"
+    );
+    let err = std::fs::read(q_root.join("hot/g.txt")).unwrap_err();
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::ENOENT),
+        "Q4 deleted read must ENOENT, not cached bytes: {err}"
+    );
+
+    // teardown, then the metrics dump carries the evidence (written by the
+    // FUSE destroy callback; allow the unmount a moment to flush it)
+    drop(qm);
+    ctx.unmount_at(&target_q);
+    let mut dump = String::new();
+    for _ in 0..20 {
+        dump = std::fs::read_to_string(&metrics_path).unwrap_or_default();
+        if dump.contains("client.cache.read.hit") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    for row in [
+        "client.cache.read.hit",
+        "client.cache.read.miss",
+        "client.cache.read.stale",
+    ] {
+        assert!(dump.contains(row), "Q metrics must carry {row}:\n{dump}");
+    }
+    println!("  OK  Q: metrics dump carries hit/miss/stale rows");
+
+    std::fs::remove_dir_all(&target_q).ok();
+    std::fs::remove_dir_all(root.join("hot")).ok();
+    println!("  OK  Q: policy cache section complete");
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut lightfs = PathBuf::from("lightfs");
@@ -2215,6 +2340,14 @@ fn main() {
         ctx.ensure_running();
         let root = PathBuf::from(&ctx.mount_target);
         section_e(&mut ctx, &root);
+    }
+    #[cfg(unix)]
+    if ctx.sections_want("q") {
+        // Q needs the base mount alive: it plays the second client whose
+        // commits the cached mount must observe.
+        ctx.ensure_running();
+        let root = PathBuf::from(&ctx.mount_target);
+        section_q(&mut ctx, &root);
     }
     #[cfg(unix)]
     if ctx.sections_want("stress") {

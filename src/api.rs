@@ -69,6 +69,22 @@ pub trait FsApi: Send + Sync {
         self.read(path_hint, offset, size)
     }
 
+    /// Read a byte range by id DIRECTLY from the authority, bypassing any
+    /// read cache (Phase Q). This is the commit chain's base read: overlay
+    /// assembly (flush, truncate) must observe committed content through
+    /// the store, never through a cache — the K3 doctrine is structural,
+    /// not advisory. The default is the plain read (no cache exists in
+    /// that implementation); cache-carrying layers override the bypass.
+    fn read_by_id_authoritative(
+        &self,
+        node_id: i64,
+        path_hint: &str,
+        offset: u64,
+        size: u64,
+    ) -> Result<Vec<u8>> {
+        self.read_by_id(node_id, path_hint, offset, size)
+    }
+
     /// start a buffered write session anchored on the id (the session's
     /// commit must then carry the id end-to-end).
     fn open_write_by_id(

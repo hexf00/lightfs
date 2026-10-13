@@ -167,3 +167,75 @@ fn shell_runs_over_client_backend() {
     let out = shell.exec("tree /").unwrap();
     assert!(out.iter().any(|l| l.contains("shelled")));
 }
+
+// ---------------------------------------------------------------------------
+// Phase Q: the memory read cache in NETWORK mode. The embedded tests in
+// src/readcache.rs prove the mechanics; this one proves the version check
+// under the DEFAULT metadata TTL on the real client (Q3: "测试应覆盖默认
+// 属性缓存设置,不能只靠将 TTL 设为 0"), plus identity-gone surfacing.
+// ---------------------------------------------------------------------------
+
+use lightfs::readcache::CacheFs;
+
+/// The mount's default attribute-cache setting: the config default
+/// (`cache.metadata.ttl_seconds = 5`), NOT zero — the version validation on
+/// cache hits must not depend on disabling the TTL.
+fn default_ttl() -> Option<Duration> {
+    Some(Duration::from_secs(
+        Config::load_or_defaults(None)
+            .unwrap()
+            .cache
+            .metadata
+            .ttl_seconds,
+    ))
+}
+
+#[test]
+fn read_cache_stays_authoritative_under_default_metadata_ttl() {
+    let srv = TestServer::start("q3-cache").unwrap();
+    let ttl = default_ttl();
+    let a = CacheFs::new(client(&srv.url, ttl), "/hot".to_string(), 1 << 20);
+    let b = client(&srv.url, ttl);
+
+    use lightfs::api::FsApi;
+    a.mkdir("/hot", 0o755).unwrap();
+    a.create("/hot/f", 0o644).unwrap();
+    let mut ws = a.open_write("/hot/f", None).unwrap();
+    ws.write(0, b"version one").unwrap();
+    ws.commit().unwrap();
+    let id = a.lookup("/hot/f").unwrap().id;
+
+    // A populates its read cache.
+    assert_eq!(a.read_by_id(id, "/hot/f", 0, 100).unwrap(), b"version one");
+    assert_eq!(a.cache().stats().misses, 1);
+
+    // B (second client, default TTL) commits a new version.
+    b.write_full("/hot/f", b"version two from B", false)
+        .unwrap();
+
+    // A's very next read must observe it: the hit validation is a LIVE
+    // lookup (lookup_by_id never consults the MetaCache), the stale entry
+    // is dropped, and B's bytes come from the authority.
+    assert_eq!(
+        a.read_by_id(id, "/hot/f", 0, 100).unwrap(),
+        b"version two from B"
+    );
+    let s = a.cache().stats();
+    assert_eq!(s.stale_skip, 1, "the version check caught the stale entry");
+    assert_eq!(s.hits, 0, "nothing stale was served");
+
+    // the fresh entry now hits, with B's bytes
+    assert_eq!(
+        a.read_by_id(id, "/hot/f", 0, 100).unwrap(),
+        b"version two from B"
+    );
+    assert_eq!(a.cache().stats().hits, 1);
+
+    // deleted identity: the error surfaces; cached bytes never resurrect it
+    b.unlink("/hot/f").unwrap();
+    assert!(
+        a.read_by_id(id, "/hot/f", 0, 100).is_err(),
+        "IDENTITY_GONE must not be served from the cache"
+    );
+    assert_eq!(a.cache().stats().hits, 1, "no hit happened for the dead id");
+}

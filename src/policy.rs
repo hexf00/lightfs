@@ -194,6 +194,17 @@ pub enum PolicyError {
     /// `authority_life = "task"` (TaskScoped cleanup) has no implementation
     /// yet (P-R2).
     TaskScopedUnavailable { prefix: String },
+    /// A cache eviction (`lifecycle`) value whose semantics are not
+    /// implemented for the single-tier memory read cache (Q1): for a purely
+    /// in-memory cache there is no distinguishable, testable behavior
+    /// between "persistent" (evict only under pressure) and the default
+    /// capacity LRU — both can only evict LRU-first when the hard budget is
+    /// hit. Rejected rather than silently running the LRU anyway.
+    EvictionUnavailable { prefix: String, kind: &'static str },
+    /// More than one rule enables the memory read cache. The first cache
+    /// implementation carries exactly one (Q1): a second cached rule must
+    /// refuse the mount, never silently share or skip the cache.
+    TooManyCachedRules { prefixes: Vec<String> },
 }
 
 impl std::fmt::Display for PolicyError {
@@ -217,7 +228,7 @@ impl std::fmt::Display for PolicyError {
             PolicyError::CommitReserved { storage } => write!(
                 f,
                 "commit = \"write-back\" is reserved and rejected in this version ({storage} rule); \
-                 use \"strict\" — the write-back design is a separate, unmerged proposal"
+                 the write-back design is a separate, unmerged proposal"
             ),
             PolicyError::LocalWithCache { prefix } => write!(
                 f,
@@ -244,6 +255,20 @@ impl std::fmt::Display for PolicyError {
                 "rule {prefix:?}: authority_life = \"task\" (TaskScoped cleanup) has no \
                  implementation yet — the mount is refused rather than leaking local \
                  files past their promised scope"
+            ),
+            PolicyError::EvictionUnavailable { prefix, kind } => write!(
+                f,
+                "rule {prefix:?}: lifecycle = {kind:?} has no distinct implementation for the \
+                 single-tier memory read cache (only the default capacity LRU exists; a purely \
+                 in-memory cache can only ever evict LRU-first under budget pressure) — \
+                 the mount is refused rather than running the default while claiming otherwise"
+            ),
+            PolicyError::TooManyCachedRules { prefixes } => write!(
+                f,
+                "policy: at most one memory-cached rule is supported in this version (got {}: \
+                 {}) — set cache = \"none\" on the extra rules",
+                prefixes.len(),
+                prefixes.join(", ")
             ),
             PolicyError::RootOnRemote { prefix } => {
                 write!(
@@ -320,7 +345,7 @@ pub fn normalize_path(path: &str) -> Result<String, PolicyError> {
 
 /// True when `path` is `prefix` itself or anywhere inside it, comparing by
 /// path COMPONENTS: `/work/cache` does not match `/work/cache-old`.
-fn prefix_matches(prefix: &str, path: &str) -> bool {
+pub(crate) fn prefix_matches(prefix: &str, path: &str) -> bool {
     if prefix == "/" {
         return true;
     }
@@ -438,29 +463,65 @@ impl ResolvedPolicy {
             }
         }
 
-        // Availability gate (P-R2): everything above validates CONFIG
-        // SHAPE; a well-formed request for something that does not exist
-        // must still be refused, never mounted as if it were active.
-        // Placed AFTER the model validation so malformed cache configs
-        // keep their specific errors; placed BEFORE matching so no
+        // Availability gate (P-R2, narrowed by Q1): everything above
+        // validates CONFIG SHAPE; a well-formed request for something that
+        // does not exist must still be refused, never mounted as if it were
+        // active. Placed AFTER the model validation so malformed cache
+        // configs keep their specific errors; placed BEFORE matching so no
         // resolved view can ever carry an unimplemented feature.
+        //
+        // Q1 opens exactly one combination: `storage = "s3"` +
+        // `cache = "memory"` + strict commit + the default capacity-LRU
+        // eviction, on ONE rule per mount. Everything else keeps its named
+        // refusal.
+        let mut cached: Vec<&str> = Vec::new();
         for r in &rules {
-            if r.view.read_cache != CacheKind::None {
-                return Err(PolicyError::CacheUnavailable {
-                    prefix: r.prefix.clone(),
-                    kind: match r.view.read_cache {
-                        CacheKind::Memory => "memory",
-                        CacheKind::Disk => "disk",
-                        CacheKind::MemoryAndDisk => "memory+disk",
-                        CacheKind::None => unreachable!(),
-                    },
-                });
+            match r.view.read_cache {
+                CacheKind::None => {}
+                CacheKind::Memory => {
+                    // The single-tier memory cache has exactly one eviction
+                    // behavior: LRU under the hard budget. "persistent" has
+                    // no distinguishable, testable meaning without a second
+                    // (disk) tier to protect, and "task" (TaskScoped
+                    // cleanup) does not exist — both refuse by name.
+                    match r.view.cache_eviction {
+                        Some(CacheEviction::CapacityLru) => cached.push(&r.prefix),
+                        Some(CacheEviction::Persistent) => {
+                            return Err(PolicyError::EvictionUnavailable {
+                                prefix: r.prefix.clone(),
+                                kind: "persistent",
+                            });
+                        }
+                        Some(CacheEviction::TaskScoped) => {
+                            return Err(PolicyError::EvictionUnavailable {
+                                prefix: r.prefix.clone(),
+                                kind: "task",
+                            });
+                        }
+                        None => unreachable!("cache rules always resolve an eviction value"),
+                    }
+                }
+                kind @ (CacheKind::Disk | CacheKind::MemoryAndDisk) => {
+                    return Err(PolicyError::CacheUnavailable {
+                        prefix: r.prefix.clone(),
+                        kind: match kind {
+                            CacheKind::Disk => "disk",
+                            CacheKind::MemoryAndDisk => "memory+disk",
+                            _ => unreachable!(),
+                        },
+                    });
+                }
             }
             if r.view.authority_life == AuthorityLife::TaskScoped {
                 return Err(PolicyError::TaskScopedUnavailable {
                     prefix: r.prefix.clone(),
                 });
             }
+        }
+        if cached.len() > 1 {
+            return Err(PolicyError::TooManyCachedRules {
+                prefixes: cached.into_iter().map(str::to_string).collect(),
+            });
         }
 
         // Longest prefix first; equal lengths are unambiguous (distinct
@@ -675,6 +736,23 @@ impl ResolvedPolicy {
     /// backend) without re-implementing the matching.
     pub fn rules(&self) -> impl Iterator<Item = (&str, &PolicyView)> {
         self.rules.iter().map(|r| (r.prefix.as_str(), &r.view))
+    }
+
+    /// The single memory-cached rule as `(prefix, budget bytes)`, or None.
+    /// The build gate guarantees at most one cached rule and a mandatory
+    /// positive budget for it, so this is total — no silent default.
+    pub fn memory_cache(&self) -> Option<(&str, u64)> {
+        self.rules.iter().find_map(|r| {
+            if r.view.read_cache == CacheKind::Memory {
+                Some((
+                    r.prefix.as_str(),
+                    r.memory_budget
+                        .expect("memory cache rule has a budget (build enforces)"),
+                ))
+            } else {
+                None
+            }
+        })
     }
 
     /// Resolve `path` to its PolicyView. Unknown → the default rule (which
@@ -978,17 +1056,18 @@ mod tests {
             ResolvedPolicy::build(&s),
             Err(PolicyError::BudgetOvercommit { kind: "memory" })
         ));
-        // ceiling fits: shape validation passes, the availability gate
-        // fires (budget machinery revives with CacheStore)
+        // ceiling fits: shape validation passes, and since Q1 the memory
+        // read cache is implemented — the config now BUILDS (the gate only
+        // refuses unimplemented kinds/evictions)
         let mut ok = section(vec![r]);
         ok.limits = Some(PolicyLimits {
             memory_budget: Some("128MiB".into()),
             disk_budget: None,
         });
-        assert!(matches!(
-            ResolvedPolicy::build(&ok),
-            Err(PolicyError::CacheUnavailable { kind: "memory", .. })
-        ));
+        assert!(
+            ResolvedPolicy::build(&ok).is_ok(),
+            "a well-formed memory-cache config must build (Q1)"
+        );
     }
 
     #[test]
@@ -1194,22 +1273,18 @@ mod tests {
     }
 
     // -- P-R2: unimplemented features are refused, never silently off ------
+    // (Q1 narrowed the gate: cache = "memory" on the default capacity LRU
+    // is now IMPLEMENTED and builds; disk / memory+disk still refuse.)
 
     #[test]
     fn unimplemented_cache_is_named_not_silently_ignored() {
-        for (kind, want) in [
-            ("memory", "memory"),
-            ("disk", "disk"),
-            ("memory+disk", "memory+disk"),
-        ] {
+        for (kind, want) in [("disk", "disk"), ("memory+disk", "memory+disk")] {
             let mut r = cached_s3("/hot", kind);
-            if kind != "disk" {
+            if kind == "memory+disk" {
                 r.memory_budget = Some("64MiB".into());
             }
-            if kind != "memory" {
-                r.disk_budget = Some("1GiB".into());
-                r.cache_root = Some("~/cache/hot".into());
-            }
+            r.disk_budget = Some("1GiB".into());
+            r.cache_root = Some("~/cache/hot".into());
             let mut s = section(vec![r]);
             s.limits = Some(PolicyLimits {
                 memory_budget: Some("128MiB".into()),
@@ -1234,16 +1309,116 @@ mod tests {
         }
     }
 
+    // -- Q1: the opened combination and its named boundaries ----------------
+
+    fn cached_mem(prefix: &str) -> RawRule {
+        let mut r = cached_s3(prefix, "memory");
+        r.memory_budget = Some("1MiB".into());
+        r
+    }
+
+    /// A section with the mount-wide memory ceiling the cached rules need.
+    fn mem_section(rules: Vec<RawRule>) -> PolicySection {
+        let mut s = section(rules);
+        s.limits = Some(PolicyLimits {
+            memory_budget: Some("8MiB".into()),
+            disk_budget: None,
+        });
+        s
+    }
+
+    #[test]
+    fn memory_cache_default_and_explicit_capacity_build() {
+        // default (no lifecycle) and explicit "capacity" are the SAME open
+        // combination; the resolved view carries the implemented eviction
+        // and the accessor exposes (prefix, budget) for the mount wiring.
+        for lifecycle in [None, Some("capacity".to_string())] {
+            let mut r = cached_mem("/hot");
+            r.lifecycle = lifecycle;
+            let p = ResolvedPolicy::build(&mem_section(vec![r])).expect("memory cache builds");
+            let (prefix, budget) = p.memory_cache().expect("accessor sees the cached rule");
+            assert_eq!(prefix, "/hot");
+            assert_eq!(budget, 1 << 20);
+            let v = p.resolve("/hot/f").unwrap();
+            assert_eq!(v.read_cache, CacheKind::Memory);
+            assert_eq!(v.cache_eviction, Some(CacheEviction::CapacityLru));
+            assert_eq!(v.commit, CommitMode::StrictSync);
+        }
+    }
+
+    #[test]
+    fn memory_cache_without_global_limit_is_still_refused() {
+        // the budget mechanism survives the gate unchanged: a rule budget
+        // with no mount-wide ceiling stays an error (O-era check, not the
+        // availability gate).
+        let s = section(vec![cached_mem("/hot")]);
+        match ResolvedPolicy::build(&s) {
+            Err(PolicyError::MissingGlobalLimit { kind }) => assert_eq!(kind, "memory"),
+            other => panic!("expected MissingGlobalLimit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unimplemented_eviction_is_named_not_silently_lru() {
+        for (lifecycle, want) in [("persistent", "persistent"), ("task", "task")] {
+            let mut r = cached_mem("/hot");
+            r.lifecycle = Some(lifecycle.to_string());
+            match ResolvedPolicy::build(&mem_section(vec![r])) {
+                Err(PolicyError::EvictionUnavailable { prefix, kind }) => {
+                    assert_eq!(prefix, "/hot");
+                    assert_eq!(kind, want);
+                    let msg = PolicyError::EvictionUnavailable {
+                        prefix: "/hot".into(),
+                        kind,
+                    }
+                    .to_string();
+                    assert!(
+                        msg.contains("single-tier memory read cache"),
+                        "message must say WHY the LRU is not a silent downgrade: {msg}"
+                    );
+                }
+                other => {
+                    panic!("lifecycle {lifecycle}: expected EvictionUnavailable, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn second_cached_rule_refuses_the_mount() {
+        let a = cached_mem("/a");
+        let b = cached_mem("/b");
+        // declaration order must not matter (same gate discipline as P-R2)
+        let e1 = ResolvedPolicy::build(&mem_section(vec![a.clone(), b.clone()])).unwrap_err();
+        let e2 = ResolvedPolicy::build(&mem_section(vec![b, a])).unwrap_err();
+        for e in [e1, e2] {
+            match &e {
+                PolicyError::TooManyCachedRules { prefixes } => {
+                    assert_eq!(prefixes.len(), 2);
+                    assert!(prefixes.contains(&"/a".to_string()));
+                    assert!(prefixes.contains(&"/b".to_string()));
+                }
+                other => panic!("expected TooManyCachedRules, got {other:?}"),
+            }
+            assert!(
+                e.to_string().contains("at most one memory-cached rule"),
+                "message must say the limit: {e}"
+            );
+        }
+    }
+
     #[test]
     fn availability_gate_is_order_independent() {
         // the same two rules in both orders: the gate fires identically
-        let mut a = cached_s3("/a", "memory");
-        a.memory_budget = Some("1MiB".into());
+        // (Q1: "memory" now BUILDS, so the unavailable kind here is "disk")
+        let mut a = cached_s3("/a", "disk");
+        a.disk_budget = Some("1GiB".into());
+        a.cache_root = Some("~/cache/a".into());
         let b = local("/b", "~/r-b");
         let mut s1 = section(vec![a.clone(), b.clone()]);
         s1.limits = Some(PolicyLimits {
             memory_budget: Some("8MiB".into()),
-            disk_budget: None,
+            disk_budget: Some("2GiB".into()),
         });
         let mut s2 = section(vec![b, a]);
         s2.limits = s1.limits.clone();

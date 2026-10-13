@@ -40,7 +40,9 @@ struct LocalBackend {
 
 pub struct RoutingFs {
     /// The s3-authority backend: whatever the mount would have used
-    /// without a policy (embedded Core or network client).
+    /// without a policy (embedded Core or network client). When the
+    /// policy enables the memory read cache (Phase Q), this is the
+    /// CacheFs decorator in front of that backend.
     remote: Arc<dyn FsApi>,
     policy: ResolvedPolicy,
     locals: Vec<LocalBackend>,
@@ -116,6 +118,20 @@ impl RoutingFs {
         }
         let policy =
             ResolvedPolicy::build(section).map_err(|e| Error::Config(format!("policy: {e}")))?;
+
+        // Phase Q: install the single-tier memory read cache between the
+        // router and the s3 backend when the policy asks for it. The policy
+        // build gate guarantees at most one cached rule with a validated
+        // budget, so this is a single unconditional wrap.
+        let cached_rule = policy.memory_cache();
+        let remote: Arc<dyn FsApi> = match cached_rule {
+            Some((prefix, budget)) => Arc::new(crate::readcache::CacheFs::new(
+                remote,
+                prefix.to_string(),
+                budget,
+            )),
+            None => remote,
+        };
 
         let mnt = canon_or_abs(mountpoint);
         let seq = Arc::new(AtomicU64::new(1));
@@ -210,7 +226,17 @@ impl RoutingFs {
         }
 
         if locals.is_empty() {
-            return Ok(None); // only s3 rules: the remote alone IS the policy
+            if cached_rule.is_none() {
+                return Ok(None); // only s3 rules: the remote alone IS the policy
+            }
+            // Q: a memory-cached s3 policy has no local backends but still
+            // needs this wrapper (it owns the CacheFs) - an all-remote
+            // router with an empty locals list routes everything forward.
+            return Ok(Some(Self {
+                remote,
+                policy,
+                locals,
+            }));
         }
         Ok(Some(Self {
             remote,
@@ -409,6 +435,23 @@ impl FsApi for RoutingFs {
             return self.local_by_id(node_id, |fs, id| fs.read_by_id(id, offset, size));
         }
         self.remote.read_by_id(node_id, path_hint, offset, size)
+    }
+
+    /// The commit chain's base read: negatives have no cache anywhere
+    /// (local backends don't cache), positives must NOT hit the CacheFs —
+    /// delegate to its structural bypass.
+    fn read_by_id_authoritative(
+        &self,
+        node_id: i64,
+        path_hint: &str,
+        offset: u64,
+        size: u64,
+    ) -> Result<Vec<u8>> {
+        if node_id < 0 {
+            return self.local_by_id(node_id, |fs, id| fs.read_by_id(id, offset, size));
+        }
+        self.remote
+            .read_by_id_authoritative(node_id, path_hint, offset, size)
     }
 
     fn open_write_by_id(
@@ -840,23 +883,27 @@ mod tests {
         assert_eq!(counting.count(), probe + 1);
     }
 
-    // P-R2: the mount entry refuses unimplemented features with the SAME
+    // P-R2/Q1: the mount entry refuses unimplemented features with the SAME
     // errors the parser produces - parser and mount gate are one surface.
+    // Q1 opened `cache = "memory"` (default capacity LRU, one rule): that
+    // config now MOUNTS and reads work through the cache; the refusals
+    // below keep their exact shape.
     #[test]
     fn unimplemented_features_refuse_the_mount() {
         let t = tmpdir("pr2");
         let core = mem_core("pr2");
 
-        // cache = memory: model-valid, feature-unbuilt -> named refusal
+        // cache = disk: model-valid, feature-unbuilt -> named refusal
         let mut r = local_rule("/p", &t.join("root"));
         r.storage = "s3".into();
         r.root = None;
-        r.cache = Some("memory".into());
-        r.memory_budget = Some("1MiB".into());
+        r.cache = Some("disk".into());
+        r.disk_budget = Some("1GiB".into());
+        r.cache_root = Some("~/cache/p".into());
         let mut sec = section(vec![r]);
         sec.limits = Some(crate::policy::PolicyLimits {
-            memory_budget: Some("8MiB".into()),
-            disk_budget: None,
+            memory_budget: None,
+            disk_budget: Some("2GiB".into()),
         });
         let err = match RoutingFs::build(core.clone(), Some(&sec), &t.join("mnt")) {
             Err(e) => e,
@@ -865,6 +912,29 @@ mod tests {
         assert!(
             err.to_string().contains("no implementation"),
             "mount error must name the reason: {err}"
+        );
+
+        // two memory-cached rules: the one-cached-rule limit refuses
+        let mk = |p: &str| crate::policy::RawRule {
+            prefix: p.into(),
+            storage: "s3".into(),
+            cache: Some("memory".into()),
+            memory_budget: Some("1MiB".into()),
+            ..Default::default()
+        };
+        let sec = section(vec![mk("/a"), mk("/b")]);
+        let mut sec_limits = sec;
+        sec_limits.limits = Some(crate::policy::PolicyLimits {
+            memory_budget: Some("8MiB".into()),
+            disk_budget: None,
+        });
+        let err = match RoutingFs::build(core.clone(), Some(&sec_limits), &t.join("mnt")) {
+            Err(e) => e,
+            Ok(_) => panic!("two cached rules must refuse the mount"),
+        };
+        assert!(
+            err.to_string().contains("at most one memory-cached rule"),
+            "mount error must name the one-rule limit: {err}"
         );
 
         // authority_life = task on a local rule: same surface
@@ -877,6 +947,62 @@ mod tests {
         assert!(
             err.to_string().contains("TaskScoped"),
             "mount error must name the reason: {err}"
+        );
+    }
+
+    // Q1/Q2: a memory-cached s3 policy with NO local rules still mounts
+    // (the router exists to own the CacheFs) and reads work through it.
+    #[test]
+    fn memory_cached_s3_policy_mounts_and_reads() {
+        let core = mem_core("q2");
+        let mut r = crate::policy::RawRule {
+            prefix: "/hot".into(),
+            storage: "s3".into(),
+            cache: Some("memory".into()),
+            memory_budget: Some("1MiB".into()),
+            ..Default::default()
+        };
+        r.lifecycle = Some("capacity".into());
+        let mut sec = section(vec![r]);
+        sec.limits = Some(crate::policy::PolicyLimits {
+            memory_budget: Some("8MiB".into()),
+            disk_budget: None,
+        });
+        let rf = RoutingFs::build(core.clone(), Some(&sec), &tmpdir("q2").join("mnt"))
+            .unwrap()
+            .expect("the cached policy mounts even without local rules");
+
+        rf.mkdir("/hot", 0o755).unwrap();
+        rf.create("/hot/f", 0o644).unwrap();
+        write_via(&rf, "/hot/f", b"cached bytes");
+        assert_eq!(rf.read("/hot/f", 0, 100).unwrap(), b"cached bytes");
+        let id = rf.lookup("/hot/f").unwrap().id;
+        // by-id twice: the read path under test (FUSE reads by id)
+        assert_eq!(
+            rf.read_by_id(id, "/hot/f", 0, 100).unwrap(),
+            b"cached bytes"
+        );
+        assert_eq!(
+            rf.read_by_id(id, "/hot/f", 0, 100).unwrap(),
+            b"cached bytes"
+        );
+
+        // the commit chain keeps its authority guarantee through the router
+        let mut ws = rf.open_write_by_id(id, "/hot/f", None).unwrap();
+        ws.write(0, b"committed through the router").unwrap();
+        ws.commit().unwrap();
+        assert_eq!(
+            rf.read_by_id(id, "/hot/f", 0, 100).unwrap(),
+            b"committed through the router"
+        );
+        // a second rule prefix resolves to the default (no-cache) policy
+        core.mkdir("/cold", 0o755).unwrap();
+        core.create("/cold/g", 0o644).unwrap();
+        write_via(&rf, "/cold/g", b"cold");
+        assert_eq!(
+            rf.read_by_id(rf.lookup("/cold/g").unwrap().id, "/cold/g", 0, 10)
+                .unwrap(),
+            b"cold"
         );
     }
 

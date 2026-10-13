@@ -562,11 +562,18 @@ impl FuseAdapter {
             Ok(n) => n,
             Err(e) => return Err(fail(e, None)),
         };
-        let mut content = match self.fs.read_by_id(node_id, &path, 0, node_now.size as u64) {
-            Ok(c) => c,
-            Err(Error::ObjectMissing(_)) => Vec::new(),
-            Err(e) => return Err(fail(e, Some(node_now.version))),
-        };
+        // Authoritative base read (Phase Q): the overlay assembly is the
+        // commit chain - it must observe the store directly, never a cache
+        // entry (K3 doctrine, now structural via read_by_id_authoritative).
+        let mut content =
+            match self
+                .fs
+                .read_by_id_authoritative(node_id, &path, 0, node_now.size as u64)
+            {
+                Ok(c) => c,
+                Err(Error::ObjectMissing(_)) => Vec::new(),
+                Err(e) => return Err(fail(e, Some(node_now.version))),
+            };
         drained_overlay(&drained, &mut content);
         let mut session = match self.fs.open_write_by_id(node_id, &path, Some(expected)) {
             Ok(s) => s,
@@ -768,9 +775,11 @@ impl Filesystem for FuseAdapter {
                 Err(e) => return reply.error(errno(&e)),
             };
             let cur_len = (node_now.size as u64).min(new_size);
+            // truncate is a read-rewrite under CAS: its base read is commit-
+            // chain traffic and must bypass the read cache (Phase Q).
             let commit = self
                 .fs
-                .read_by_id(ino.0 as i64, &path, 0, cur_len)
+                .read_by_id_authoritative(ino.0 as i64, &path, 0, cur_len)
                 .and_then(|mut content| {
                     if new_size > content.len() as u64 {
                         // extension: zero-fill (ftruncate semantics)

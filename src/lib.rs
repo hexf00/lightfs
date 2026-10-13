@@ -22,6 +22,7 @@ pub mod metadata;
 pub mod metrics;
 pub mod object_store;
 pub mod policy;
+pub mod readcache;
 pub mod rpc;
 pub mod server;
 pub mod shell;
