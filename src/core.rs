@@ -751,23 +751,27 @@ impl Core {
     pub fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
         let src = self.lookup(old_path)?;
         let (dest_parent, dest_name) = self.parent_and_name(new_path)?;
+        let dest = self.meta.get_child(dest_parent.id, &dest_name)?;
 
-        if let Some(dest) = self.meta.get_child(dest_parent.id, &dest_name)? {
+        if let Some(dest) = &dest {
+            // POSIX: renaming a node onto itself succeeds and changes
+            // nothing — no delete, no move, no retire. Equivalent path
+            // forms (`//f`, `/./f`) resolve to this same check.
+            if dest.id == src.id {
+                return Ok(());
+            }
+            // Overwriting requires same-kind file->file; a directory
+            // target must not exist (POSIX allows empty-dir overwrite,
+            // which v1 does not need).
             if src.is_dir() || dest.is_dir() {
-                // Overwriting requires same-kind file->file; a directory
-                // target must not exist (POSIX allows empty-dir overwrite,
-                // which v1 does not need).
                 return Err(Error::AlreadyExists(new_path.to_string()));
             }
-            // file -> file overwrite: retire the destination first.
-            if let Some(key) = &dest.object_key {
-                self.retire_object(key);
-            }
-            self.meta.delete_node(dest.id)?;
         }
 
         // Moving a directory below itself would orphan the subtree. The
-        // destination parent itself is the first candidate ancestor.
+        // destination parent itself is the first candidate ancestor. This
+        // runs BEFORE any mutation: a refused rename must leave both nodes
+        // and both objects exactly as they were.
         if src.is_dir() {
             let mut anc = Some(dest_parent.id);
             while let Some(a) = anc {
@@ -779,7 +783,26 @@ impl Core {
         }
 
         self.metrics.metadata_tx.fetch_add(1, Ordering::Relaxed);
-        self.meta.rename_node(src.id, dest_parent.id, &dest_name)
+        match dest {
+            Some(dest) => {
+                // File-over-file overwrite in ONE metadata transaction:
+                // move the source and remove the target, or leave both
+                // standing. The old target object is retired only AFTER
+                // the transaction committed, using the key the target had
+                // at replacement time — a failed rename can therefore
+                // never retire (let alone delete) an object a live row
+                // still points at, and retire itself stays best-effort:
+                // its failure leaves a leftover, not a broken pointer.
+                let replaced =
+                    self.meta
+                        .rename_node_overwrite(src.id, dest.id, dest_parent.id, &dest_name)?;
+                if let Some(key) = replaced.object_key {
+                    self.retire_object(&key);
+                }
+                Ok(())
+            }
+            None => self.meta.rename_node(src.id, dest_parent.id, &dest_name),
+        }
     }
 
     /// Remove a file. With retention the object is RECORDED (bytes stay for
@@ -1156,6 +1179,122 @@ mod tests {
             c.rename("/f2", "/dir"),
             Err(Error::AlreadyExists(_))
         ));
+    }
+
+    /// S1b: renaming a file onto ITS OWN path is a successful no-op —
+    /// node id, content, version, object_key and superseded records all
+    /// stand, and the object is neither retired nor deleted.
+    #[test]
+    fn rename_same_path_is_a_noop() {
+        let c = core();
+        c.create("/f", 0o644).unwrap();
+        let h = c.open_write("/f", None).unwrap();
+        c.write(&h, 0, b"self").unwrap();
+        c.commit_write(&h).unwrap();
+        let before = c.lookup("/f").unwrap();
+
+        c.rename("/f", "/f").unwrap();
+
+        let after = c.lookup("/f").unwrap();
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.size, before.size);
+        assert_eq!(after.object_key, before.object_key);
+        assert_eq!(c.read("/f", 0, 10).unwrap(), b"self");
+        assert!(c.metadata().all_superseded().unwrap().is_empty());
+    }
+
+    /// Equivalent path forms (`//f`, `/./f`) resolve to the same node and
+    /// must not be misjudged as overwriting a different file.
+    #[test]
+    fn rename_equivalent_paths_are_a_noop() {
+        let c = core();
+        c.create("/f", 0o644).unwrap();
+        let h = c.open_write("/f", None).unwrap();
+        c.write(&h, 0, b"same").unwrap();
+        c.commit_write(&h).unwrap();
+        let before = c.lookup("/f").unwrap();
+
+        c.rename("/f", "//f").unwrap();
+        c.rename("/f", "/./f").unwrap();
+
+        let after = c.lookup("/f").unwrap();
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.object_key, before.object_key);
+        assert_eq!(c.read("/f", 0, 10).unwrap(), b"same");
+        assert!(c.metadata().all_superseded().unwrap().is_empty());
+    }
+
+    /// A directory renamed onto itself is also a no-op (POSIX). A
+    /// file-over-file overwrite moves the SOURCE node: its id and
+    /// object_key are stable, the old target disappears, and the old
+    /// target object is retired only AFTER the namespace operation
+    /// succeeded.
+    #[test]
+    fn rename_file_over_file_moves_the_source_node() {
+        let c = core();
+        c.mkdir("/d", 0o755).unwrap();
+        c.rename("/d", "/d").unwrap();
+        assert!(c.lookup("/d").is_ok());
+
+        for (name, body) in [("/src", &b"SRC"[..]), ("/dst", &b"DST"[..])] {
+            c.create(name, 0o644).unwrap();
+            let h = c.open_write(name, None).unwrap();
+            c.write(&h, 0, body).unwrap();
+            c.commit_write(&h).unwrap();
+        }
+        let src = c.lookup("/src").unwrap();
+        let key_src = src.object_key.clone().unwrap();
+        let key_dst = c.lookup("/dst").unwrap().object_key.clone().unwrap();
+        assert_ne!(src.id, c.lookup("/dst").unwrap().id);
+
+        c.rename("/src", "/dst").unwrap();
+
+        let moved = c.lookup("/dst").unwrap();
+        assert_eq!(moved.id, src.id, "the source node itself moved");
+        assert_eq!(moved.object_key.as_deref(), Some(key_src.as_str()));
+        assert_eq!(c.read("/dst", 0, 10).unwrap(), b"SRC");
+        assert!(c.lookup("/src").is_err());
+        // the replaced object is recorded only after the successful rename
+        assert!(c.metadata().all_superseded().unwrap().contains(&key_dst));
+        // the moved live pointer targets an existing object
+        c.objects.head(&key_src).unwrap();
+    }
+
+    /// Directory semantics must not regress: overwriting a directory (from
+    /// either kind) is refused, both files still stand after the refusals,
+    /// plain moves work, and moving a directory below itself is refused.
+    #[test]
+    fn rename_dir_semantics_do_not_regress() {
+        let c = core();
+        c.mkdir("/d1", 0o755).unwrap();
+        c.mkdir("/d2", 0o755).unwrap();
+        c.create("/f", 0o644).unwrap();
+
+        assert!(matches!(
+            c.rename("/d1", "/d2"),
+            Err(Error::AlreadyExists(_))
+        ));
+        assert!(matches!(
+            c.rename("/d1", "/f"),
+            Err(Error::AlreadyExists(_))
+        ));
+        assert!(matches!(
+            c.rename("/f", "/d2"),
+            Err(Error::AlreadyExists(_))
+        ));
+        assert!(c.lookup("/d1").is_ok());
+        assert!(c.lookup("/d2").is_ok());
+        assert!(c.lookup("/f").is_ok());
+
+        c.rename("/d1", "/d3").unwrap();
+        assert!(c.lookup("/d3").is_ok());
+        assert!(c.lookup("/d1").is_err());
+
+        assert!(matches!(c.rename("/d3", "/d3/sub"), Err(Error::Cycle(_))));
+        assert!(c.lookup("/d3").is_ok());
+        assert!(c.lookup("/d3/sub").is_err());
     }
 
     #[test]

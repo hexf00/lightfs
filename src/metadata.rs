@@ -102,6 +102,21 @@ pub trait MetadataStore: Send + Sync {
     /// Move a node within the namespace. Transactionally re-checks that the
     /// destination slot is free.
     fn rename_node(&self, id: i64, new_parent_id: i64, new_name: &str) -> Result<()>;
+    /// File-over-file rename-overwrite in ONE transaction: move `source_id`
+    /// to (new_parent_id, new_name) and delete the node `target_id`, or
+    /// change nothing. The target must still live exactly where the caller
+    /// resolved it (same parent, same name) or the call fails without
+    /// mutating anything. Returns the replaced target row AS READ INSIDE
+    /// the transaction — the caller retires its object only AFTER this
+    /// returns Ok, so a failed rename can never leave a live metadata
+    /// pointer to a removed object, and neither file can vanish.
+    fn rename_node_overwrite(
+        &self,
+        source_id: i64,
+        target_id: i64,
+        new_parent_id: i64,
+        new_name: &str,
+    ) -> Result<Node>;
     /// Remove a node. Caller guarantees no children (rmdir check lives in Core).
     fn delete_node(&self, id: i64) -> Result<()>;
     /// Full table scan for fsck/reconciliation.

@@ -420,6 +420,70 @@ impl MetadataStore for SqliteMetadataStore {
         Ok(())
     }
 
+    fn rename_node_overwrite(
+        &self,
+        source_id: i64,
+        target_id: i64,
+        new_parent_id: i64,
+        new_name: &str,
+    ) -> Result<Node> {
+        let mut conn = self.conn.lock().unwrap();
+        if source_id == target_id {
+            return Err(Error::InvalidArgument(
+                "cannot overwrite a node with itself".into(),
+            ));
+        }
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // The target must still live exactly where the caller resolved it;
+        // anything else means the namespace drifted, and we must not touch
+        // anything.
+        let target: Option<Node> = tx
+            .query_row(
+                &format!(
+                    "SELECT {NODE_COLS} FROM nodes WHERE id = ?1 AND parent_id = ?2 AND name = ?3"
+                ),
+                params![target_id, new_parent_id, new_name],
+                row_to_node,
+            )
+            .optional()?;
+        let Some(target) = target else {
+            return Err(Error::NotFound(format!("id {target_id}")));
+        };
+        // The destination parent must still exist and be a directory.
+        let dest_parent: Option<String> = tx
+            .query_row(
+                "SELECT kind FROM nodes WHERE id = ?1",
+                params![new_parent_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(pk) = dest_parent else {
+            return Err(Error::ParentNotFound(format!("id {new_parent_id}")));
+        };
+        if pk != "dir" {
+            return Err(Error::KindMismatch {
+                path: format!("id {new_parent_id}"),
+                expected: "dir",
+                actual: pk,
+            });
+        }
+        // Free the slot, then move: both statements sit in this one
+        // transaction, so the UNIQUE(parent_id, name) window never exists
+        // outside it and any failure rolls BOTH halves back.
+        tx.execute("DELETE FROM nodes WHERE id = ?1", params![target_id])?;
+        let moved = tx.execute(
+            "UPDATE nodes SET parent_id = ?2, name = ?3, mtime = ?4 WHERE id = ?1",
+            params![source_id, new_parent_id, new_name, now()],
+        )?;
+        if moved == 0 {
+            // The source vanished under us; the transaction rolls back and
+            // the target stands.
+            return Err(Error::NotFound(format!("id {source_id}")));
+        }
+        tx.commit()?;
+        Ok(target)
+    }
+
     fn delete_node(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         if id == 1 {

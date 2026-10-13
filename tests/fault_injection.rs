@@ -40,6 +40,7 @@ struct FaultFlags {
     fail_put_stream: AtomicBool,
     fail_put_stream_midway: AtomicBool,
     fail_put_stream_at_complete: AtomicBool,
+    fail_delete: AtomicBool,
 }
 
 /// ObjectStore wrapper that injects failures at the selected commit points.
@@ -98,6 +99,9 @@ impl ObjectStore for InjectingStore {
     }
 
     fn delete(&self, key: &str) -> Result<()> {
+        if self.faults.fail_delete.load(Ordering::SeqCst) {
+            return Err(Error::Storage("injected: delete failure".into()));
+        }
         self.inner.delete(key)
     }
 
@@ -114,6 +118,7 @@ impl ObjectStore for InjectingStore {
 struct FaultyMeta {
     inner: SqliteMetadataStore,
     fail_cas: AtomicBool,
+    fail_rename_overwrite: AtomicBool,
     cas_calls: AtomicU64,
 }
 
@@ -166,6 +171,19 @@ impl MetadataStore for FaultyMeta {
     fn rename_node(&self, id: i64, new_parent_id: i64, new_name: &str) -> Result<()> {
         self.inner.rename_node(id, new_parent_id, new_name)
     }
+    fn rename_node_overwrite(
+        &self,
+        source_id: i64,
+        target_id: i64,
+        new_parent_id: i64,
+        new_name: &str,
+    ) -> Result<Node> {
+        if self.fail_rename_overwrite.load(Ordering::SeqCst) {
+            return Err(Error::Storage("injected: rename-overwrite failure".into()));
+        }
+        self.inner
+            .rename_node_overwrite(source_id, target_id, new_parent_id, new_name)
+    }
     fn delete_node(&self, id: i64) -> Result<()> {
         self.inner.delete_node(id)
     }
@@ -194,6 +212,7 @@ fn setup(faults: Arc<FaultFlags>) -> (Arc<Core>, Arc<FaultyMeta>, Arc<InjectingS
     let meta: Arc<FaultyMeta> = Arc::new(FaultyMeta {
         inner: SqliteMetadataStore::open_in_memory().unwrap(),
         fail_cas: AtomicBool::new(false),
+        fail_rename_overwrite: AtomicBool::new(false),
         cas_calls: AtomicU64::new(0),
     });
     let core = Arc::new(Core::new(
@@ -421,4 +440,81 @@ fn complete_failure_never_commits_and_cleans_landed_key() {
         .collect();
     assert_eq!(unrecorded.len(), 1, "{}", remaining.len());
     assert_eq!(unrecorded[0], after.object_key.as_ref().unwrap());
+}
+
+/// 7. rename-overwrite with the metadata transaction failing: source and
+///    target files (content, version, object_key) are both untouched, and
+///    the old target object is not retired while its node still stands.
+///    S1b red: the old two-step delete+rename lost the target file and
+///    retired its object before the move.
+#[test]
+fn rename_overwrite_meta_failure_keeps_both_files() {
+    let faults = Arc::new(FaultFlags::default());
+    let (core, meta, _objects) = setup(faults);
+    for (name, body) in [("/src", &b"SRC"[..]), ("/dst", &b"DST"[..])] {
+        core.create(name, 0o644).unwrap();
+        let h = core.open_write(name, None).unwrap();
+        core.write(&h, 0, body).unwrap();
+        core.commit_write(&h).unwrap();
+    }
+    let src = core.lookup("/src").unwrap();
+    let dst = core.lookup("/dst").unwrap();
+
+    meta.fail_rename_overwrite.store(true, Ordering::SeqCst);
+    core.rename("/src", "/dst").unwrap_err();
+
+    let after_src = core.lookup("/src").unwrap();
+    assert_eq!(after_src.id, src.id);
+    assert_eq!(after_src.version, src.version);
+    assert_eq!(after_src.object_key, src.object_key);
+    assert_eq!(core.read("/src", 0, 10).unwrap(), b"SRC");
+    let after_dst = core.lookup("/dst").unwrap();
+    assert_eq!(after_dst.id, dst.id);
+    assert_eq!(after_dst.version, dst.version);
+    assert_eq!(after_dst.object_key, dst.object_key);
+    assert_eq!(core.read("/dst", 0, 10).unwrap(), b"DST");
+    // no live node lost its object: nothing superseded, nothing deleted
+    assert!(meta.inner.all_superseded().unwrap().is_empty());
+}
+
+/// 8. the namespace operation succeeded but retiring the old target object
+///    failed (retention disabled, delete errors): the rename stands, the
+///    new target path is intact, and the failed retire leaves a
+///    recoverable leftover object — never a broken live pointer.
+#[test]
+fn rename_overwrite_retire_failure_keeps_rename() {
+    let faults = Arc::new(FaultFlags::default());
+    faults.fail_delete.store(true, Ordering::SeqCst);
+    let objects: Arc<InjectingStore> = Arc::new(InjectingStore {
+        inner: Arc::new(MemObjectStore::new()),
+        faults,
+    });
+    let core = Arc::new(Core::with_retention(
+        Arc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+        objects as Arc<dyn ObjectStore>,
+        0,
+    ));
+    for (name, body) in [("/src", &b"SRC"[..]), ("/dst", &b"DST"[..])] {
+        core.create(name, 0o644).unwrap();
+        let h = core.open_write(name, None).unwrap();
+        core.write(&h, 0, body).unwrap();
+        core.commit_write(&h).unwrap();
+    }
+    let src = core.lookup("/src").unwrap();
+    let key_src = src.object_key.clone().unwrap();
+    let key_dst = core.lookup("/dst").unwrap().object_key.clone().unwrap();
+
+    core.rename("/src", "/dst").unwrap();
+
+    let moved = core.lookup("/dst").unwrap();
+    assert_eq!(moved.id, src.id);
+    assert_eq!(moved.object_key.as_deref(), Some(key_src.as_str()));
+    assert_eq!(core.read("/dst", 0, 10).unwrap(), b"SRC");
+    assert!(core.lookup("/src").is_err());
+    // the live pointer targets an existing object
+    core.objects().head(&key_src).unwrap();
+    // the failed retire left the old object in place: a leftover without
+    // a live reference — not a dangling live pointer
+    core.objects().head(&key_dst).unwrap();
+    assert!(core.metadata().all_superseded().unwrap().is_empty());
 }
