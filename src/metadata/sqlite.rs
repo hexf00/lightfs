@@ -3,6 +3,13 @@
 //! Root node is
 //! fixed at id=1 (parent NULL). All operations take BEGIN IMMEDIATE so a
 //! process sharing this store (the single server) sees serialized writes.
+//!
+//! Stable identity (R4.2c): `nodes.id` is AUTOINCREMENT, so a deleted
+//! node's id is NEVER handed to a later node — (id, version) identifies
+//! content for the whole lifetime of the database. This holds from CREATE
+//! time on; a database written before this schema cannot satisfy the
+//! guarantee and is rejected at open (never auto-migrated): re-initialize
+//! the store instead.
 
 use std::sync::Mutex;
 
@@ -17,7 +24,7 @@ pub struct SqliteMetadataStore {
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS nodes (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     parent_id INTEGER,
     name TEXT NOT NULL,
     kind TEXT NOT NULL,
@@ -81,22 +88,38 @@ const NODE_COLS: &str =
 
 impl SqliteMetadataStore {
     /// Open (creating if needed) the store and ensure schema + root.
+    ///
+    /// A database whose `nodes` table predates AUTOINCREMENT cannot satisfy
+    /// the stable-identity guarantee and is rejected BEFORE anything is
+    /// written (even the journal-mode pragma) — the legacy file is left
+    /// byte-for-byte alone. There is deliberately no migration: the store
+    /// must be re-initialized (stop the service, unmount all clients,
+    /// discard the metadata database and the object namespace).
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
+        let nodes_sql: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'nodes'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(sql) = nodes_sql {
+            if !sql.contains("AUTOINCREMENT") {
+                return Err(Error::Storage(
+                    "nodes table predates AUTOINCREMENT id allocation: stable identity \
+                     is not satisfiable on this database. Re-initialize the store \
+                     (stop the service, unmount all clients, discard the metadata \
+                     database and the test object namespace, then start fresh); \
+                     automatic migration is intentionally not supported"
+                        .into(),
+                ));
+            }
+        }
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
-        // Migration: stores created before symlinks lack the target column
-        // (CREATE TABLE IF NOT EXISTS does not add columns). Idempotent.
-        let has_target: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('nodes') WHERE name = 'target'",
-            [],
-            |r| r.get(0),
-        )?;
-        if has_target == 0 {
-            conn.execute_batch("ALTER TABLE nodes ADD COLUMN target TEXT;")?;
-        }
         // Root: id 1, no parent. Ignore conflict on reopen.
         conn.execute(
             "INSERT OR IGNORE INTO nodes (id, parent_id, name, kind, size, mtime, mode) VALUES (1, NULL, '', 'dir', 0, ?1, ?2)",
@@ -608,5 +631,87 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path}-wal"));
         let _ = std::fs::remove_file(format!("{path}-shm"));
+    }
+
+    // --- R4.2c: stable identity starts at CREATE time -----------------------
+
+    #[test]
+    fn fresh_databases_get_autoincrement_identity() {
+        let dir = std::env::temp_dir().join(format!("lightfs-ra-schema-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fresh.db");
+        SqliteMetadataStore::open(path.to_str().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'nodes'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("AUTOINCREMENT"),
+            "nodes must allocate ids without reuse from CREATE time: {sql}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A database written before AUTOINCREMENT cannot satisfy the identity
+    /// guarantee: open refuses LOUDLY and leaves the legacy file untouched —
+    /// no migration, no journal-mode switch, no rows added. The test
+    /// environment is reinitialized by hand, never automatically.
+    #[test]
+    fn legacy_databases_are_rejected_loudly_and_left_unmodified() {
+        let dir = std::env::temp_dir().join(format!("lightfs-ra-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE nodes (
+                    id INTEGER PRIMARY KEY, parent_id INTEGER, name TEXT NOT NULL,
+                    kind TEXT NOT NULL, size INTEGER NOT NULL DEFAULT 0,
+                    mtime INTEGER NOT NULL, mode INTEGER, object_key TEXT,
+                    version TEXT, etag TEXT, target TEXT, UNIQUE(parent_id, name)
+                );
+                INSERT INTO nodes (id, parent_id, name, kind, size, mtime, mode)
+                VALUES (1, NULL, '', 'dir', 0, 0, 493);",
+            )
+            .unwrap();
+        }
+        let snapshot = |p: &std::path::Path| {
+            let conn = rusqlite::Connection::open(p).unwrap();
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'nodes'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+                .unwrap();
+            (sql, rows)
+        };
+        let before = snapshot(&path);
+
+        let err = match SqliteMetadataStore::open(path.to_str().unwrap()) {
+            Ok(_) => panic!("a legacy database must be rejected at open"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("AUTOINCREMENT") && msg.contains("Re-initialize"),
+            "the rejection must say what is wrong and what to do: {msg}"
+        );
+
+        let after = snapshot(&path);
+        assert_eq!(
+            before, after,
+            "a rejected open must not touch the legacy file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -239,3 +239,41 @@ fn read_cache_stays_authoritative_under_default_metadata_ttl() {
     );
     assert_eq!(a.cache().stats().hits, 1, "no hit happened for the dead id");
 }
+
+/// R4.2c (RPC): stable id allocation end to end — a deleted file's id is
+/// never re-issued, so by-id reads through the old identity fail, a stale
+/// session opened before the delete cannot commit, and the recreated file
+/// is untouched (bytes, version).
+#[test]
+fn recycled_identity_rpc_old_sessions_cannot_touch_recreated_file() {
+    let srv = TestServer::start("r4stable").unwrap();
+    let a = client(&srv.url, None);
+
+    // A at version 1; open a second session on it (expected version 1).
+    a.write_full("/f", b"first bytes", true).unwrap();
+    let node = a.lookup("/f").unwrap();
+    let mut stale = a.open_write("/f", Some(node.version)).unwrap();
+    stale.write(0, b"POISON").unwrap();
+
+    // delete + recreate + one commit: the new file gets a FRESH id.
+    a.unlink("/f").unwrap();
+    a.write_full("/f", b"reborn bytes", true).unwrap();
+    let reborn = a.lookup("/f").unwrap();
+    assert_ne!(
+        reborn.id, node.id,
+        "AUTOINCREMENT never re-issues the deleted id"
+    );
+
+    // by-id read via the old identity is an error, never the new bytes
+    assert!(
+        a.read_by_id(node.id, "/f", 0, 64).is_err(),
+        "the old identity must be gone"
+    );
+
+    // the stale session's commit is rejected; the new file is untouched
+    assert!(stale.commit().is_err(), "stale session must not commit");
+    assert_eq!(a.read("/f", 0, 64).unwrap(), b"reborn bytes");
+    let after = a.lookup("/f").unwrap();
+    assert_eq!(after.version, 1, "recreated file untouched");
+    assert_eq!(after.id, reborn.id);
+}

@@ -1085,22 +1085,18 @@ mod r1 {
         ws.commit().unwrap()
     }
 
-    /// R0.1 CONFIRMED RISK: SQLite rowids are reused (`id INTEGER PRIMARY
-    /// KEY`, no AUTOINCREMENT): unlinking the highest-id file hands its id
-    /// to the NEXT created node. If the dead and the recreated file each
-    /// have one commit (version 1 - the overwhelmingly common recreate
-    /// shape), the version check alone cannot tell the entries apart and
-    /// the DEAD file's cached bytes would be served for the LIVE file.
-    /// The guard is the etag — a content fingerprint computed locally on
-    /// the embedded store, taken from the storage service on S3 (see the
-    /// module docs for the exact strength of each).
+    /// R4.2c update: id reuse is structurally dead (AUTOINCREMENT), so the
+    /// cache can never alias a recreated file onto a dead file's entries:
+    /// the new file gets a fresh id (fresh slots), the dead id resolves to
+    /// nothing, and every identity reads its own bytes. The etag guard
+    /// (version+fingerprint on every hit) remains as defense in depth.
     #[test]
-    fn recreated_identity_never_serves_the_dead_files_bytes() {
+    fn recreated_identity_never_aliases_the_dead_files_cache_entries() {
         let core = core_at("reuse");
         let f = cached(core.clone(), "/hot", 1 << 20);
         f.mkdir("/hot", 0o755).unwrap();
 
-        // file A: the highest rowid at unlink time; one commit -> version 1
+        // file A: one commit -> version 1, read into the cache
         f.create("/hot/f", 0o644).unwrap();
         commit_bytes(&f, "/hot/f", b"the DEAD file's bytes");
         let dead_id = f.lookup("/hot/f").unwrap().id;
@@ -1108,26 +1104,24 @@ mod r1 {
             f.read_by_id(dead_id, "/hot/f", 0, 100).unwrap(),
             b"the DEAD file's bytes"
         );
-        assert_eq!(f.cache().stats().misses, 1, "dead file's bytes are cached");
 
-        // unlink (row dies, still the highest rowid) + recreate: the NEW
-        // node inherits the id, and one commit again lands on version 1
+        // unlink + recreate: the NEW node gets a fresh id
         f.unlink("/hot/f").unwrap();
         f.create("/hot/g", 0o644).unwrap();
         commit_bytes(&f, "/hot/g", b"the LIVE file's bytes");
         let live = f.lookup("/hot/g").unwrap();
-        assert_eq!(live.id, dead_id, "precondition: SQLite reused the rowid");
-        assert_eq!(
-            live.version, 1,
-            "precondition: version collision (one commit each)"
+        assert_ne!(
+            live.id, dead_id,
+            "stable allocation: the recreated file never inherits the id"
         );
 
-        // THE assertion: the live identity must serve live bytes
-        let got = f.read_by_id(live.id, "/hot/g", 0, 100).unwrap();
-        assert_eq!(
-            got, b"the LIVE file's bytes",
-            "the cache served the DEAD file's bytes for the recreated identity"
+        // the dead identity is gone; the live identity reads its OWN bytes
+        assert!(
+            f.read_by_id(dead_id, "/hot/g", 0, 100).is_err(),
+            "the dead id must not resolve to the new file"
         );
+        let got = f.read_by_id(live.id, "/hot/g", 0, 100).unwrap();
+        assert_eq!(got, b"the LIVE file's bytes");
     }
 
     /// R4.3 unit: an entry can never FORM for an empty etag — no insert,
@@ -1239,27 +1233,27 @@ mod r1 {
             "etagless data is never cached"
         );
 
-        // LIVE: unlink + recreate; rowid and version collide, and no etag
-        // exists to tell the two identities apart.
+        // LIVE: unlink + recreate. The new file gets a fresh id (stable
+        // allocation), and this backend STILL provides no etags for it.
         f.unlink("/hot/f").unwrap();
         f.create("/hot/g", 0o644).unwrap();
         commit_bytes(&f, "/hot/g", b"the LIVE file's bytes");
         let live = f.lookup("/hot/g").unwrap();
-        assert_eq!(live.id, dead_id, "precondition: SQLite reused the rowid");
-        assert_eq!(
-            live.version, 1,
-            "precondition: version collision (one commit each)"
+        assert_ne!(
+            live.id, dead_id,
+            "stable allocation: the recreated file never inherits the id"
         );
         assert_eq!(
             live.etag, "",
             "precondition: this backend provides no etags"
         );
 
-        // THE assertion: the recreated file reads its OWN bytes.
+        // THE assertion: etagless data stays uncached, and the recreated
+        // file reads its OWN bytes through the cold path.
         let got = f.read_by_id(live.id, "/hot/g", 0, 100).unwrap();
         assert_eq!(
             got, b"the LIVE file's bytes",
-            "the cache served the DEAD file's bytes for an etagless backend"
+            "an etagless backend must never serve another file's bytes"
         );
         assert_eq!(f.cache().stats().hits, 0, "nothing was ever cacheable");
         assert_eq!(f.cache().occupied_bytes(), 0);

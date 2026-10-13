@@ -1528,31 +1528,117 @@ mod symlink_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- R4.2c: stable identity (AUTOINCREMENT from CREATE time) ------------
+
+    /// R4.2c acceptance: a deleted file's id is NEVER handed to the next
+    /// created file, so the old identity resolves to nothing — a read
+    /// through it reports an error, never another file's bytes.
     #[test]
-    fn migration_adds_target_column_to_legacy_db() {
-        let dir = std::env::temp_dir().join(format!("lightfs-sym-mig-{}", std::process::id()));
+    fn recycled_id_read_must_report_identity_gone() {
+        let c = core();
+        c.create("/a", 0o644).unwrap();
+        let h = c.open_write("/a", None).unwrap();
+        c.write(&h, 0, b"A's bytes").unwrap();
+        let a = c.commit_write(&h).unwrap();
+        c.unlink("/a").unwrap();
+        c.create("/b", 0o644).unwrap();
+        let hb = c.open_write("/b", None).unwrap();
+        c.write(&hb, 0, b"B's bytes").unwrap();
+        let b = c.commit_write(&hb).unwrap();
+        // AUTOINCREMENT: the recreated file got a fresh id.
+        assert_ne!(b.id, a.id, "ids must never be reused");
+        assert!(c.lookup_by_id(a.id).is_err());
+        assert!(c.open_read_by_id(a.id, 0, 64).is_err());
+        assert_eq!(c.read("/b", 0, 64).unwrap(), b"B's bytes");
+    }
+
+    /// R4.2c acceptance: a write session opened before the delete can never
+    /// pass its CAS against a different file — the recreated file's bytes,
+    /// version, and object key stay exactly as the new writer left them.
+    #[test]
+    fn stale_session_commit_must_not_touch_recreated_file() {
+        let c = core();
+        c.create("/a", 0o644).unwrap();
+        let h = c.open_write("/a", None).unwrap();
+        c.write(&h, 0, b"A's bytes").unwrap();
+        let a = c.commit_write(&h).unwrap();
+        let stale = c.open_write("/a", None).unwrap();
+        c.write(&stale, 0, b"POISON").unwrap();
+        c.unlink("/a").unwrap();
+        c.create("/b", 0o644).unwrap();
+        let hb = c.open_write("/b", None).unwrap();
+        c.write(&hb, 0, b"B's bytes").unwrap();
+        let b = c.commit_write(&hb).unwrap();
+        assert_ne!(b.id, a.id);
+        // The stale session's target no longer exists: the commit fails.
+        assert!(c.commit_write(&stale).is_err());
+        // B is untouched: bytes, version, object key.
+        assert_eq!(c.read("/b", 0, 64).unwrap(), b"B's bytes");
+        assert_eq!(b.version, 1);
+        let live = c.lookup("/b").unwrap();
+        assert_eq!(live.id, b.id);
+        assert_eq!(live.object_key, b.object_key, "object key unchanged");
+    }
+
+    /// R4.2c: after deleting the highest allocated id, churn (create +
+    /// commit + delete, repeatedly) never re-issues an id this database has
+    /// already used; closing and reopening the store continues upward and
+    /// the surviving data is intact. Plain restarts never reset anything.
+    #[test]
+    fn ids_never_repeat_within_or_across_restarts() {
+        let dir = std::env::temp_dir().join(format!("lightfs-ra-churn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let db = dir.join("legacy.db");
-        // Build a PRE-symlink database with the old schema text.
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS nodes (
-                id INTEGER PRIMARY KEY, parent_id INTEGER, name TEXT NOT NULL,
-                kind TEXT NOT NULL, size INTEGER NOT NULL DEFAULT 0,
-                mtime INTEGER NOT NULL, mode INTEGER, object_key TEXT,
-                version TEXT, etag TEXT, UNIQUE(parent_id, name)
+        let db = dir.join("meta.db");
+        let open = |p: &std::path::Path| {
+            Core::new(
+                Arc::new(SqliteMetadataStore::open(p.to_str().unwrap()).unwrap()),
+                Arc::new(MemObjectStore::new()),
+            )
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        {
+            let c = open(&db);
+            // a survivor proves data integrity across the restart below
+            c.create("/keep", 0o644).unwrap();
+            let hk = c.open_write("/keep", None).unwrap();
+            c.write(&hk, 0, b"kept bytes").unwrap();
+            let keep = c.commit_write(&hk).unwrap();
+            seen.insert(keep.id);
+            // churn: every file is deleted at its highest allocated id
+            for i in 0..40u32 {
+                let name = format!("/f{i}");
+                c.create(&name, 0o644).unwrap();
+                let h = c.open_write(&name, None).unwrap();
+                c.write(&h, 0, format!("bytes {i}").as_bytes()).unwrap();
+                let n = c.commit_write(&h).unwrap();
+                assert!(seen.insert(n.id), "id {id} reused", id = n.id);
+                c.unlink(&name).unwrap();
+            }
+        }
+        {
+            // plain restart: guarantees continue, nothing is reset. The
+            // in-memory object store starts empty here (real deployments
+            // keep objects in S3), so integrity is asserted on metadata.
+            let c = open(&db);
+            let keep = c.lookup("/keep").unwrap();
+            assert_eq!(keep.version, 1);
+            assert_eq!(keep.size, 10);
+            assert!(
+                keep.object_key.is_some(),
+                "committed object key survives the restart"
             );
-            INSERT INTO nodes (id, parent_id, name, kind, size, mtime, mode)
-            VALUES (1, NULL, '', 'dir', 0, 0, 493);",
-        )
-        .unwrap();
-        drop(conn);
-        // Opening migrates; the store then works with symlinks.
-        let store = SqliteMetadataStore::open(db.to_str().unwrap()).unwrap();
-        let c = Core::new(Arc::new(store), Arc::new(MemObjectStore::new()));
-        c.symlink("/x", "/y").unwrap();
-        assert_eq!(c.readlink("/y").unwrap(), "/x");
+            c.create("/after", 0o644).unwrap();
+            let h = c.open_write("/after", None).unwrap();
+            c.write(&h, 0, b"after restart").unwrap();
+            let n = c.commit_write(&h).unwrap();
+            let prev_max = *seen.iter().next_back().unwrap();
+            assert!(seen.insert(n.id), "id reused across restart");
+            assert!(
+                n.id > prev_max,
+                "allocation continues above everything seen before the restart"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
