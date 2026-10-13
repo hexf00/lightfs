@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::{Error, Result};
 use crate::object_store::{ListPage, ObjectData, ObjectInfo, ObjectStore, Range, range_to_header};
 use crate::sigv4::{SigV4, uri_encode, xml_extract_all, xml_extract_first};
+use quick_xml::events::Event;
 
 #[derive(Debug, Clone)]
 pub struct S3Config {
@@ -475,33 +476,244 @@ impl S3ObjectStore {
 /// ETag. S3 does not guarantee that every failure is a non-2xx status: a
 /// complete may answer HTTP 200 with an `<Error>` document in the body. On
 /// `Ok` the caller commits a metadata pointer to this object, so this fails
-/// CLOSED: only a well-formed success document — a
-/// `<CompleteMultipartUploadResult>` open AND close tag (the xmlns attribute
-/// is tolerated) plus a non-empty `<ETag>` — is success. Embedded error
-/// documents, gateway HTML, truncated bodies, and missing/empty ETags are
-/// all errors. A result-unknown complete is never retried here; cleanup
-/// (abort the upload, remove the uncommitted version key) stays with the
-/// caller's existing error path.
+/// CLOSED on structural grounds (quick-xml parse): the document must be
+/// well-formed XML with exactly ONE root named `CompleteMultipartUploadResult`
+/// (namespace prefix or default xmlns tolerated), nothing but whitespace
+/// outside that root, and a direct child `<ETag>` element with non-empty
+/// text. Embedded `<Error>`/`<Code>` elements, error roots, comments, CDATA,
+/// truncation, mismatched or multiple roots, and missing/empty ETags are all
+/// errors. A result-unknown complete is never retried here; cleanup (abort
+/// the upload, remove the uncommitted version key) stays with the caller's
+/// existing error path.
 fn parse_multipart_complete(body: &str) -> Result<String> {
-    // A success document never contains a <Code> element, so its presence
-    // marks an embedded error — the way S3 reports complete failures under
-    // HTTP 200.
-    if let Some(code) = xml_extract_first(body, "Code") {
-        return Err(Error::Storage(format!(
-            "store rejected multipart complete: {code}"
-        )));
+    const ROOT: &str = "CompleteMultipartUploadResult";
+    #[derive(PartialEq)]
+    enum Stage {
+        /// Before the root element: only the XML declaration, comments and
+        /// whitespace are tolerated.
+        Prolog,
+        /// Inside the success root; `depth` counts open child elements.
+        InRoot,
+        /// Inside an `<Error>` root: capture `<Code>` for the error message.
+        InError,
+        /// Root closed: only comments and whitespace until EOF.
+        Epilog,
     }
-    let well_formed = body.contains("<CompleteMultipartUploadResult")
-        && body.contains("</CompleteMultipartUploadResult>");
-    let etag = xml_extract_first(body, "ETag").unwrap_or_default();
-    if well_formed && !etag.is_empty() {
-        return Ok(etag);
+    let malformed = |what: String| Error::Storage(format!("multipart complete response: {what}"));
+    let mut stage = Stage::Prolog;
+    let mut depth = 0usize;
+    let mut in_etag = false;
+    let mut etag = String::new();
+    let mut in_code = false;
+    let mut code = String::new();
+
+    // quick-xml 0.41 reports entity references (`&quot;`, `&#34;`) as their
+    // own GeneralRef events, so text absorption is shared between Text and
+    // resolved GeneralRef events.
+    fn absorb(
+        stage: &Stage,
+        depth: usize,
+        in_etag: bool,
+        in_code: bool,
+        etag: &mut String,
+        code: &mut String,
+        s: &str,
+    ) -> Result<()> {
+        match stage {
+            Stage::Prolog | Stage::Epilog => {
+                if !s.trim().is_empty() {
+                    return Err(Error::Storage(
+                        "multipart complete response: has content outside the root element".into(),
+                    ));
+                }
+            }
+            Stage::InRoot => {
+                if in_etag && depth == 1 {
+                    etag.push_str(s);
+                } else if depth == 0 && !s.trim().is_empty() {
+                    return Err(Error::Storage(
+                        "multipart complete response: has stray text directly inside the root element"
+                            .into(),
+                    ));
+                }
+            }
+            Stage::InError => {
+                if in_code && depth == 1 {
+                    code.push_str(s);
+                }
+            }
+        }
+        Ok(())
     }
-    Err(Error::Storage(
-        "multipart complete response is not a well-formed \
-         CompleteMultipartUploadResult with a non-empty ETag"
-            .into(),
-    ))
+
+    let mut reader = quick_xml::Reader::from_str(body);
+    loop {
+        let ev = reader
+            .read_event()
+            .map_err(|e| malformed(format!("is not well-formed XML: {e}")))?;
+        match ev {
+            Event::Start(bs) => {
+                let name = element_local_name(&bs);
+                match stage {
+                    Stage::Prolog => {
+                        if name == ROOT {
+                            stage = Stage::InRoot;
+                        } else if name == "Error" {
+                            stage = Stage::InError;
+                        } else {
+                            return Err(malformed(format!("root is <{name}>, not <{ROOT}>")));
+                        }
+                    }
+                    Stage::InRoot => {
+                        depth += 1;
+                        if name == "Error" || name == "Code" {
+                            return Err(malformed("embeds an <Error>/<Code> element".into()));
+                        }
+                        if depth == 1 && name == "ETag" {
+                            in_etag = true;
+                        }
+                    }
+                    Stage::InError => {
+                        depth += 1;
+                        if depth == 1 && name == "Code" {
+                            in_code = true;
+                        }
+                    }
+                    Stage::Epilog => {
+                        return Err(malformed("has content after the root element".into()));
+                    }
+                }
+            }
+            Event::Empty(bs) => {
+                let name = element_local_name(&bs);
+                match stage {
+                    Stage::Prolog => {
+                        if name == ROOT {
+                            // Self-closing root: no ETag child can exist.
+                            stage = Stage::Epilog;
+                        } else if name == "Error" {
+                            return Err(malformed(
+                                "store rejected multipart complete: <Error/>".into(),
+                            ));
+                        } else {
+                            return Err(malformed(format!("root is <{name}>, not <{ROOT}>")));
+                        }
+                    }
+                    Stage::InRoot => {
+                        if name == "Error" || name == "Code" {
+                            return Err(malformed("embeds an <Error>/<Code> element".into()));
+                        }
+                        // A self-closing <ETag/> has empty content: nothing
+                        // to absorb, the final non-empty check fails it.
+                    }
+                    Stage::InError => {}
+                    Stage::Epilog => {
+                        return Err(malformed("has content after the root element".into()));
+                    }
+                }
+            }
+            Event::End(_) => match stage {
+                Stage::InRoot => {
+                    if in_etag && depth == 1 {
+                        in_etag = false;
+                    }
+                    if depth == 0 {
+                        stage = Stage::Epilog;
+                    } else {
+                        depth -= 1;
+                    }
+                }
+                Stage::InError => {
+                    if in_code && depth == 1 {
+                        in_code = false;
+                    }
+                    if depth == 0 {
+                        return Err(malformed(format!(
+                            "store rejected multipart complete: {}",
+                            if code.trim().is_empty() {
+                                "<Error> without a Code".to_string()
+                            } else {
+                                code.trim().to_string()
+                            }
+                        )));
+                    }
+                    depth -= 1;
+                }
+                _ => return Err(malformed("is not well-formed XML".into())),
+            },
+            Event::Text(t) => {
+                let s = t
+                    .decode()
+                    .map_err(|e| malformed(format!("has undecodable text: {e}")))?;
+                absorb(&stage, depth, in_etag, in_code, &mut etag, &mut code, &s)?;
+            }
+            Event::GeneralRef(r) => {
+                let raw = r.into_inner();
+                let name = std::str::from_utf8(raw.as_ref())
+                    .map_err(|_| malformed("has a malformed entity reference".into()))?;
+                let resolved = resolve_xml_entity(name).ok_or_else(|| {
+                    malformed(format!("has an undefined entity reference &{name};"))
+                })?;
+                absorb(
+                    &stage, depth, in_etag, in_code, &mut etag, &mut code, &resolved,
+                )?;
+            }
+            // Comments are legal XML and are never read: an ETag inside a
+            // comment simply does not exist as a field.
+            Event::Comment(_) => {}
+            Event::Decl(_) => {
+                if stage != Stage::Prolog {
+                    return Err(malformed("has an XML declaration after the root".into()));
+                }
+            }
+            Event::CData(_) => return Err(malformed("has unexpected CDATA".into())),
+            Event::PI(_) | Event::DocType(_) => {
+                return Err(malformed("has unexpected document content".into()));
+            }
+            Event::Eof => match stage {
+                Stage::Epilog => {
+                    let etag = etag.trim();
+                    if etag.is_empty() {
+                        return Err(malformed(
+                            "is a complete result without a non-empty ETag".into(),
+                        ));
+                    }
+                    return Ok(etag.to_string());
+                }
+                Stage::InRoot | Stage::InError => {
+                    return Err(malformed("is truncated (root never closed)".into()));
+                }
+                Stage::Prolog => {
+                    return Err(malformed(
+                        "does not contain a CompleteMultipartUploadResult document".into(),
+                    ));
+                }
+            },
+        }
+    }
+}
+
+/// Local name of an element event, namespace prefix stripped. The input is
+/// UTF-8 by construction (`Reader::from_str`), so the lossy conversion never
+/// actually loses.
+fn element_local_name(bs: &quick_xml::events::BytesStart<'_>) -> String {
+    String::from_utf8_lossy(bs.name().local_name().into_inner()).into_owned()
+}
+
+/// Resolve an XML entity reference body (`quot`, `#34`, `#x22`) to its
+/// content. Predefined entities via quick-xml; numeric character references
+/// decoded here. Undefined names return None -> caller fails closed.
+fn resolve_xml_entity(name: &str) -> Option<String> {
+    if let Some(rest) = name.strip_prefix('#') {
+        let n = if let Some(hex) = rest.strip_prefix('x').or_else(|| rest.strip_prefix('X')) {
+            u32::from_str_radix(hex, 16).ok()?
+        } else {
+            rest.parse::<u32>().ok()?
+        };
+        char::from_u32(n).map(|c| c.to_string())
+    } else {
+        quick_xml::escape::resolve_predefined_entity(name).map(str::to_string)
+    }
 }
 
 impl ObjectStore for S3ObjectStore {
@@ -1217,6 +1429,99 @@ mod tests {
         // An explicitly empty ETag is just as missing.
         let empty = complete_success_body().replace("\"abc123\"", "");
         assert!(parse_multipart_complete(&empty).is_err());
+    }
+
+    #[test]
+    fn complete_aws_style_escaped_etag_resolves() {
+        // AWS escapes the ETag quotes as &quot; — the entity must resolve
+        // to the same literal value as an unescaped body.
+        let escaped = "<CompleteMultipartUploadResult>\
+                       <ETag>&quot;abc123&quot;</ETag>\
+                       </CompleteMultipartUploadResult>";
+        assert_eq!(parse_multipart_complete(escaped).unwrap(), "\"abc123\"");
+        // Numeric character references resolve the same way.
+        let numeric = "<CompleteMultipartUploadResult>\
+                       <ETag>&#34;abc&#x22;</ETag>\
+                       </CompleteMultipartUploadResult>";
+        assert_eq!(parse_multipart_complete(numeric).unwrap(), "\"abc\"");
+        // An undefined entity reference fails closed.
+        let undef = "<CompleteMultipartUploadResult><ETag>&bogus;</ETag>\
+                     </CompleteMultipartUploadResult>";
+        assert!(parse_multipart_complete(undef).is_err());
+    }
+
+    // --------------------------------------------- S1a-review-fix: structure
+    // The success decision is XML-STRUCTURAL, not substring: a well-formed
+    // document with exactly one CompleteMultipartUploadResult root, nothing
+    // outside it, and a real (non-comment) non-empty ETag child field.
+
+    #[test]
+    fn complete_root_complete_but_garbage_appended_is_an_error() {
+        let ok = complete_success_body();
+        // extra element after the root close
+        let with_elem = ok.clone() + "<Extra><ETag>\"x\"</ETag></Extra>";
+        assert!(parse_multipart_complete(&with_elem).is_err());
+        // raw trailing garbage
+        let with_text = ok.clone() + "trailing garbage";
+        assert!(parse_multipart_complete(&with_text).is_err());
+        // an unclosed tag appended after the root
+        let with_unclosed = ok + "<Extra";
+        assert!(parse_multipart_complete(&with_unclosed).is_err());
+    }
+
+    #[test]
+    fn complete_etag_in_comment_or_outside_root_is_not_an_etag() {
+        // A commented-out ETag is NOT an ETag field: the document must fail.
+        let commented = "<CompleteMultipartUploadResult>\
+                         <!-- <ETag>\"abc\"</ETag> -->\
+                         </CompleteMultipartUploadResult>";
+        assert!(parse_multipart_complete(commented).is_err());
+        // An ETag element after the root close lies outside the result.
+        let outside = "<CompleteMultipartUploadResult></CompleteMultipartUploadResult>\
+                       <ETag>\"abc\"</ETag>";
+        assert!(parse_multipart_complete(outside).is_err());
+    }
+
+    #[test]
+    fn complete_wrong_or_multiple_roots_are_errors() {
+        // A root whose name merely STARTS WITH the result name is a
+        // different element; substring matching would accept it.
+        let prefixed = "<CompleteMultipartUploadResultX><ETag>\"x\"</ETag>\
+                        </CompleteMultipartUploadResultX>";
+        assert!(parse_multipart_complete(prefixed).is_err());
+        // A completely different root carrying an ETag.
+        assert!(parse_multipart_complete("<Foo><ETag>\"x\"</ETag></Foo>").is_err());
+        // Two result documents in one body: no single root.
+        let two = "<CompleteMultipartUploadResult><ETag>\"x\"</ETag>\
+                   </CompleteMultipartUploadResult>\
+                   <CompleteMultipartUploadResult><ETag>\"y\"</ETag>\
+                   </CompleteMultipartUploadResult>";
+        assert!(parse_multipart_complete(two).is_err());
+        // Root opens but never closes (truncated document).
+        assert!(
+            parse_multipart_complete("<CompleteMultipartUploadResult><ETag>\"x\"</ETag>").is_err()
+        );
+        // Mismatched close tag.
+        assert!(parse_multipart_complete("<CompleteMultipartUploadResult></Wrong>").is_err());
+    }
+
+    #[test]
+    fn complete_empty_error_root_and_namespaced_variants() {
+        assert!(parse_multipart_complete("").is_err());
+        // An error root without a Code element is still an error.
+        assert!(parse_multipart_complete("<Error><Message>boom</Message></Error>").is_err());
+        // An error root WITH an ETag must never succeed.
+        assert!(
+            parse_multipart_complete("<Error><Code>X</Code><ETag>\"x\"</ETag></Error>").is_err()
+        );
+        // Self-closing root: no ETag child is possible.
+        assert!(parse_multipart_complete("<CompleteMultipartUploadResult/>").is_err());
+        // A namespace PREFIX resolves to the same root local name.
+        let ns = "<s3:CompleteMultipartUploadResult \
+                  xmlns:s3=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                  <s3:ETag>\"x\"</s3:ETag>\
+                  </s3:CompleteMultipartUploadResult>";
+        assert_eq!(parse_multipart_complete(ns).unwrap(), "\"x\"");
     }
 }
 

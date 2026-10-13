@@ -17,6 +17,7 @@ hmac = "0.12"
 hex = "0.4"
 tiny_http = "0.12"
 base64 = "0.22"
+quick-xml = { version = "0.41.0", default-features = false }
 
 # fuser builds only where FUSE exists (Linux); mounting needs /dev/fuse at runtime.
 [target.'cfg(target_os = "linux")'.dependencies]
