@@ -1375,6 +1375,71 @@ fn section_c(ctx: &mut Ctx, root: &Path) {
             panic!("C6f: rename directory onto file must fail");
         }
 
+        // h) S1b: a no-op rename (same parent, same name) with an open
+        //    write handle must not lose any accepted write. NOTE: the
+        //    Linux VFS short-circuits a same-dentry rename before it ever
+        //    reaches the daemon (verified by the FUSE-RENAME trace), so
+        //    this pins the END-TO-END observable contract; the daemon-side
+        //    no-op/orphan guard is exercised on Windows and by the direct
+        //    core-level tests.
+        let fh = d.join("noop.txt");
+        let mut hh = open_create(&fh);
+        write_at(&mut hh, 0, b"NOOP-BEFORE");
+        flush_strong(&mut hh, "C6h seed fsync");
+        std::fs::rename(&fh, &fh).expect("C6h: same-path rename failed");
+        write_at(&mut hh, 11, b"+AFTER");
+        flush_strong(&mut hh, "C6h fsync after no-op rename");
+        drop(hh);
+        assert_bytes("C6h content after no-op rename", &fh, b"NOOP-BEFORE+AFTER");
+
+        // i) S1b: a rename the VFS refuses (directory onto an open file)
+        //    must leave the file's handle untouched and its accepted
+        //    writes intact. NOTE: this failure is raised by the VFS before
+        //    reaching the daemon (also trace-verified); it pins the
+        //    observable contract. The daemon-internal failure that DOES
+        //    reach the adapter's rename handler is covered by E6.
+        let fi = d.join("fail-target.txt");
+        let mut hi = open_create(&fi);
+        write_at(&mut hi, 0, b"FAIL-KEEP");
+        flush_strong(&mut hi, "C6i seed fsync");
+        std::fs::create_dir(d.join("faildir")).expect("C6i mkdir");
+        let failed = std::fs::rename(d.join("faildir"), &fi);
+        assert!(failed.is_err(), "C6i: dir->file rename must fail");
+        write_at(&mut hi, 9, b"+AFTER-FAILED-RENAME");
+        flush_strong(&mut hi, "C6i fsync after failed rename");
+        drop(hi);
+        assert!(fi.exists(), "C6i: target must survive a failed rename");
+        assert_bytes(
+            "C6i target content after failed rename",
+            &fi,
+            b"FAIL-KEEP+AFTER-FAILED-RENAME",
+        );
+
+        // j) S1b: the overwritten destination's ACCEPTED bytes stay
+        //    readable through the old handle (detached entry), while the
+        //    recycled name carries only the source's data. Extends d:
+        //    d proves isolation of post-rename strays, j proves the
+        //    pre-rename accepted writes are not lost prematurely.
+        let fj = d.join("ovr2-target.txt");
+        let fsj = d.join("ovr2-src.txt");
+        let mut hj = open_create(&fj);
+        write_at(&mut hj, 0, b"OLD-ACCEPTED");
+        let mut hsj = open_create(&fsj);
+        write_at(&mut hsj, 0, b"NEW-DATA-2");
+        std::fs::rename(&fsj, &fj).expect("C6j: rename over open destination failed");
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        hj.seek(SeekFrom::Start(0)).expect("C6j seek");
+        let mut got = Vec::new();
+        hj.read_to_end(&mut got)
+            .expect("C6j read through old handle");
+        assert_eq!(
+            got, b"OLD-ACCEPTED",
+            "C6j: accepted bytes lost from the old handle"
+        );
+        drop(hsj); // commits NEW-DATA-2 under ovr2-target.txt
+        drop(hj); // detached entry reaped with the last handle
+        assert_bytes("C6j recycled name carries the source", &fj, b"NEW-DATA-2");
+
         // g) unmount + remount: every C6 outcome survives restart byte-exact.
         ctx.kill_mount();
         ctx.start_mount();
@@ -1390,7 +1455,14 @@ fn section_c(ctx: &mut Ctx, root: &Path) {
         if fe.exists() {
             panic!("C6g: unlinked name appeared after remount");
         }
-        println!("  OK  C6 rename/unlink with open write handles (a-g)");
+        assert_bytes("C6g noop.txt after remount", &fh, b"NOOP-BEFORE+AFTER");
+        assert_bytes(
+            "C6g fail-target.txt after remount",
+            &fi,
+            b"FAIL-KEEP+AFTER-FAILED-RENAME",
+        );
+        assert_bytes("C6g ovr2-target.txt after remount", &fj, b"NEW-DATA-2");
+        println!("  OK  C6 rename/unlink with open write handles (a-j)");
     }
 
     // C7 detached-handle semantics, two-handle and read-path coverage.
@@ -2050,6 +2122,27 @@ fn section_e(ctx: &mut Ctx, root: &Path) {
         !server_names.iter().any(|n| n == "a" || n == "b"),
         "E5 server saw local prefixes: {server_names:?}"
     );
+
+    // E6 (S1b): a rename that FAILS INSIDE THE DAEMON (cross-rule EXDEV —
+    // the VFS cannot pre-filter policy failures, so this reaches the
+    // adapter) with an open write handle on the DESTINATION must leave
+    // that handle and its file untouched: writes accepted after the
+    // failed rename must still commit. Pre-fix, the adapter detached the
+    // destination's sessions BEFORE the rename's outcome was known — the
+    // handle then silently lost every later write while its flush kept
+    // reporting success.
+    let e6dst = pp_root.join("b/t.txt");
+    {
+        let mut hb = open_create(&e6dst);
+        write_at(&mut hb, 0, b"E6-KEEP");
+        flush_strong(&mut hb, "E6 seed fsync");
+        let err = std::fs::rename(pp_root.join("a/x"), &e6dst).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(E_EXDEV), "E6 cross-root: {err}");
+        write_at(&mut hb, 7, b"+POST-FAIL");
+        flush_strong(&mut hb, "E6 post-failure fsync");
+    }
+    assert_bytes("E6 destination content", &e6dst, b"E6-KEEP+POST-FAIL");
+    assert_bytes("E6 source intact", &pp_root.join("a/x"), b"AAA");
 
     // cleanup (d-style, but the server stays for the main teardown)
     drop(pm3);
