@@ -427,6 +427,73 @@ impl FuseAdapter {
         }
     }
 
+    /// Apply a PREPARED rename-over detach (S1b): the rename has already
+    /// succeeded, so it is now safe to turn the destination's open handles
+    /// into detached ones. `base` is the snapshot taken before the rename
+    /// through the then-live name (possibly empty - e.g. no handle existed
+    /// at prepare time, or the file had no committed content).
+    ///
+    /// Ordering constraint: the detached entry must exist BEFORE any
+    /// session is marked orphaned - an orphaned write with a missing entry
+    /// is an EIO (data loss), and between the two locks a write callback
+    /// can interleave.
+    fn apply_detach(&self, path: &str, ino: u64, base: Vec<u8>) {
+        // Read-only scan first: nothing to do (and nothing to mutate) when
+        // every earlier handle closed between prepare and apply.
+        let any = self
+            .writes
+            .lock()
+            .unwrap()
+            .values()
+            .any(|st| st.path == path && !st.orphaned);
+        if !any {
+            return;
+        }
+        self.detached
+            .lock()
+            .unwrap()
+            .entry(ino)
+            .or_insert_with(|| Detached {
+                base: Vec::new(),
+                chunks: crate::writeback::ChunkMap::new(),
+                refs: 0,
+            });
+        let mut folded: Vec<std::collections::BTreeMap<u64, Vec<u8>>> = Vec::new();
+        let victims = {
+            let mut writes = self.writes.lock().unwrap();
+            let mut fhs: Vec<u64> = writes
+                .iter()
+                .filter(|(_, st)| st.path == path && !st.orphaned)
+                .map(|(fh, _)| *fh)
+                .collect();
+            fhs.sort_unstable();
+            for fh in &fhs {
+                if let Some(st) = writes.get_mut(fh) {
+                    st.orphaned = true;
+                    st.path.clear();
+                    st.detached_ino = Some(ino);
+                    folded.push(st.chunks.drain());
+                }
+            }
+            fhs.len()
+        };
+        let mut det = self.detached.lock().unwrap();
+        match det.get_mut(&ino) {
+            Some(d) => {
+                if d.base.is_empty() {
+                    d.base = base;
+                }
+                for batch in folded {
+                    for (off, data) in batch {
+                        d.chunks.insert(off, data);
+                    }
+                }
+                d.refs += victims;
+            }
+            None => {} // unreachable: created (or pre-existing) above
+        }
+    }
+
     /// Read from a detached inode (name gone, handles alive): base snapshot
     /// + every surviving handle's writes.
     fn detached_read(&self, ino: u64, offset: u64, size: u64) -> Option<Vec<u8>> {
@@ -1367,13 +1434,43 @@ impl Filesystem for FuseAdapter {
         };
         let old_path = Self::child_path(&old_parent, name);
         let new_path = Self::child_path(&new_parent, newname);
-        // An overwritten destination loses its name with open handles
-        // possibly held: detach BEFORE the rename moves the name away
-        // (base snapshot + chunk fold happen through the live name).
-        let dest_ino = self.ino_of_path(&new_path);
-        if let Some(dino) = dest_ino {
-            self.detach_sessions(&new_path, dino);
+        // S1b: nothing about any write session may change before the
+        // rename's outcome is known. A same-name request is the no-op it
+        // looks like (Linux short-circuits it in the VFS and never sends
+        // it; WinFsp may - core's own same-node guard is the authority).
+        if old_path == new_path {
+            return match self.fs.rename(&old_path, &new_path) {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(errno(&e)),
+            };
         }
+        // READ-ONLY prepare: if a destination name exists, snapshot the
+        // base bytes while the name still resolves to the OLD file (after
+        // a successful overwrite it resolves to the mover). No session is
+        // touched here: a failed rename (cross-policy EXDEV, races, meta
+        // errors) must leave every handle exactly as it was.
+        let dest_ino = self.ino_of_path(&new_path);
+        let detached_base = match dest_ino {
+            Some(_) => {
+                let victims = self
+                    .writes
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .any(|st| st.path == new_path && !st.orphaned);
+                if victims {
+                    let size = self
+                        .fs
+                        .lookup(&new_path)
+                        .map(|n| n.size as u64)
+                        .unwrap_or(0);
+                    Some(self.fs.read(&new_path, 0, size).unwrap_or_default())
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
         match self.fs.rename(&old_path, &new_path) {
             Ok(()) => {
                 self.dirent_invalidate();
@@ -1382,8 +1479,10 @@ impl Filesystem for FuseAdapter {
                 // K1: the overwritten inode must NOT resolve to the new
                 // name any more - its stale mapping would alias reads of
                 // the incoming file (detached handles are served from the
-                // detached entry, not from path lookups).
+                // detached entry, not from path lookups). The prepared
+                // detach applies only NOW that success is certain.
                 if let Some(dino) = dest_ino {
+                    self.apply_detach(&new_path, dino, detached_base.unwrap_or_default());
                     self.inodes.lock().unwrap().remove(&dino);
                 }
                 // Open write handles ride along: repoint their paths so
