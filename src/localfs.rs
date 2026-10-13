@@ -29,6 +29,8 @@
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -69,6 +71,10 @@ pub struct LocalFs {
     /// gate makes {commit, mutation} pairs linearizable. Local commits
     /// are fsync-dominated, so the serialization costs ~nothing.
     commit_gate: Mutex<()>,
+    /// Test-only fault injection for the parent-dir fsync (P-R addendum):
+    /// flipped by tests to exercise the applied-but-unconfirmed path.
+    #[cfg(test)]
+    dir_fsync_fault: AtomicBool,
 }
 
 fn io_err(e: std::io::Error, rel: &str) -> Error {
@@ -147,6 +153,8 @@ impl LocalFs {
                     ids: Mutex::new(IdMap::default()),
                     seq,
                     commit_gate: Mutex::new(()),
+                    #[cfg(test)]
+                    dir_fsync_fault: AtomicBool::new(false),
                 },
                 canon,
             ))
@@ -719,6 +727,32 @@ impl LocalFs {
     fn scratch(&self) -> PathBuf {
         self.root.join(RESERVED)
     }
+
+    /// The parent-directory fsync that makes a committed rename durable.
+    /// A separate seam so the failure path is exercisable by the test-only
+    /// fault switch, which sits EXACTLY where real EIO would surface.
+    fn sync_dir_after_commit(&self, parent: &Path) -> Result<()> {
+        #[cfg(test)]
+        if self.dir_fsync_fault.load(Ordering::SeqCst) {
+            return Err(Error::Io("injected parent-dir fsync failure".into()));
+        }
+        #[cfg(unix)]
+        {
+            let dir = std::fs::File::open(parent)
+                .map_err(|e| Error::Io(format!("parent dir open after commit: {e}")))?;
+            dir.sync_all()
+                .map_err(|e| Error::Io(format!("parent dir fsync after commit: {e}")))?;
+        }
+        #[cfg(not(unix))]
+        let _ = parent;
+        Ok(())
+    }
+
+    /// Test-only: force the parent-dir fsync step to fail.
+    #[cfg(test)]
+    pub(crate) fn inject_dir_fsync_failure(&self, on: bool) {
+        self.dir_fsync_fault.store(on, Ordering::SeqCst);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -785,12 +819,9 @@ impl WriteSession for LocalWriteSession<'_> {
                 actual,
             });
         }
-        // The escape gate runs on every platform; the handle is only
-        // needed for the unix parent-fsync below.
-        #[cfg(unix)]
+        // The escape gate runs on every platform; the handle feeds the
+        // parent-fsync seam below.
         let parent = fs.checked_parent(&rel)?;
-        #[cfg(not(unix))]
-        fs.checked_parent(&rel)?;
         // Atomic strict-sync commit: temp file inside the reserved scratch
         // dir, fsync, rename into place, fsync the parent directory. The
         // temp name draws from the shared id sequence: unique per commit.
@@ -799,28 +830,47 @@ impl WriteSession for LocalWriteSession<'_> {
             std::process::id(),
             fs.seq.fetch_add(1, Ordering::Relaxed)
         ));
-        {
+        // Failure ledger up to (and including) the rename: dest untouched,
+        // version untouched, scratch cleaned, plain Err. The caller's file
+        // keeps its exact pre-commit content and version.
+        let staged = (|| -> Result<()> {
             let mut f = std::fs::File::create(&tmp)
                 .map_err(|e| Error::Io(format!("scratch {}: {e}", tmp.display())))?;
             f.write_all(&content)
                 .map_err(|e| Error::Io(e.to_string()))?;
             f.sync_all().map_err(|e| Error::Io(e.to_string()))?;
+            Ok(())
+        })();
+        if let Err(e) = staged {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
         }
         let dest = fs.abs(&rel);
-        std::fs::rename(&tmp, dest).map_err(|e| {
+        if let Err(e) = std::fs::rename(&tmp, dest) {
             let _ = std::fs::remove_file(&tmp);
-            io_err(e, &rel)
-        })?;
-        // Parent-directory fsync: strict sync means "durable" includes the
-        // rename, so a failed directory sync must NOT be reported as a
-        // successful commit. (A retry is safe: the version is not bumped
-        // on this path, the CAS re-arms, the rewrite is idempotent.)
-        #[cfg(unix)]
-        {
-            let dir = std::fs::File::open(&parent)
-                .map_err(|e| Error::Io(format!("parent dir open after commit: {e}")))?;
-            dir.sync_all()
-                .map_err(|e| Error::Io(format!("parent dir fsync after commit: {e}")))?;
+            return Err(io_err(e, &rel));
+        }
+        // PAST THE RENAME: the new content is now the VISIBLE content.
+        // From here the version must move WITH the content - leaving the
+        // anchor at the old version would let a stale session armed on it
+        // overwrite an update that already took effect (content/version
+        // split). A parent-fsync failure therefore ADVANCES the version
+        // and reports "applied but durability UNCONFIRMED": the caller
+        // sees an error (never a fake Ok), a retry re-arms on the advanced
+        // version (idempotent rewrite), and a stale session loses the CAS
+        // instead of clobbering. If the host crashed right here, the map
+        // dies with the mount - no persistent lie either way.
+        if let Err(e) = fs.sync_dir_after_commit(&parent) {
+            fs.ids
+                .lock()
+                .unwrap()
+                .versions
+                .insert(self.id, self.expected_version + 1);
+            return Err(Error::Io(format!(
+                "commit applied but durability is UNCONFIRMED (parent dir fsync \
+                 failed: {e}); the version has advanced - retry by opening a \
+                 fresh session, do not assume the old content"
+            )));
         }
         // Durability confirmed: now the version moves.
         fs.ids
@@ -1242,5 +1292,163 @@ mod pr1_tests {
         assert!(!t.join("root").join("d").exists());
         // the directory identity survived too
         assert_eq!(fs.lookup("d2").unwrap().id, dir_id);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P-R addendum: commit-failure atomicity (parent-dir fsync)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod pr_fsync_tests {
+    use super::*;
+    use crate::error::Error;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "lightfs-prfsync-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn fs_at(root: &Path) -> LocalFs {
+        let (fs, _) = LocalFs::new(root, Arc::new(AtomicU64::new(1))).unwrap();
+        fs
+    }
+
+    /// The injected failure sits exactly where the real parent-dir EIO
+    /// would surface, so this exercises the same error arm the kernel
+    /// would take. Three states are asserted SEPARATELY:
+    ///   1. content applied     - the file bytes are the new ones (visible)
+    ///   2. version advanced    - the anchor moved WITH the content
+    ///   3. durability UNCONFIRMED - the caller got an error, not a fake Ok
+    #[test]
+    fn parent_fsync_failure_applies_version_and_is_observable() {
+        let t = tmpdir("inject");
+        let fs = fs_at(&t.join("root"));
+        fs.create("f", 0o644).unwrap();
+        assert_eq!(fs.lookup("f").unwrap().version, 1);
+
+        // A and B both armed on V1
+        let mut a = fs.open_write("f", None).unwrap();
+        let mut b = fs.open_write("f", None).unwrap();
+        a.write(0, b"A-content").unwrap();
+        b.write(0, b"B-content").unwrap();
+
+        // A commits; the rename succeeds, the parent fsync FAILS.
+        fs.inject_dir_fsync_failure(true);
+        match Box::new(a).commit() {
+            Err(Error::Io(msg)) => {
+                assert!(
+                    msg.contains("UNCONFIRMED") && msg.contains("advanced"),
+                    "the error must state the semantics: {msg}"
+                );
+            }
+            other => panic!("expected the unconfirmed-durability error, got {other:?}"),
+        }
+
+        // (1) content applied: the rename's bytes ARE the visible file
+        assert_eq!(
+            std::fs::read(t.join("root").join("f")).unwrap(),
+            b"A-content".to_vec()
+        );
+        // (2) version advanced WITH the content: no anchor/content split
+        assert_eq!(fs.lookup("f").unwrap().version, 2);
+        // the scratch dir holds no leftovers from the failed commit
+        let scratch: Vec<_> = std::fs::read_dir(t.join("root").join(RESERVED))
+            .unwrap()
+            .collect();
+        assert!(scratch.is_empty(), "scratch leaked temp files");
+
+        // B, still armed on V1, must NOT overwrite the applied update:
+        // the anchor moved, so the CAS refuses it.
+        assert!(matches!(
+            Box::new(b).commit(),
+            Err(Error::Conflict {
+                expected: 1,
+                actual: 2,
+                ..
+            })
+        ));
+        // B's refusal changed nothing
+        assert_eq!(
+            std::fs::read(t.join("root").join("f")).unwrap(),
+            b"A-content".to_vec()
+        );
+        assert_eq!(fs.lookup("f").unwrap().version, 2);
+
+        // Retry: A re-arms on the live version (fresh session, same
+        // content) - idempotent, succeeds, version pairs with content.
+        fs.inject_dir_fsync_failure(false);
+        // A fresh session arms on whatever the live version is: after the
+        // failure that is 2 (the advanced anchor), never the spent 1.
+        let mut a2 = fs.open_write("f", Some(1)).unwrap();
+        a2.write(0, b"A-content").unwrap();
+        assert!(matches!(Box::new(a2).commit(), Err(Error::Conflict { .. })));
+        let mut a2 = fs.open_write("f", None).unwrap();
+        a2.write(0, b"A-content").unwrap();
+        let n = Box::new(a2).commit().unwrap();
+        assert_eq!(n.version, 3);
+        assert_eq!(
+            std::fs::read(t.join("root").join("f")).unwrap(),
+            b"A-content".to_vec()
+        );
+        assert_eq!(fs.lookup("f").unwrap().version, 3);
+    }
+
+    /// Same scenario, but the retry re-arms and writes DIFFERENT content:
+    /// the advanced anchor (2) is what makes the retry's CAS legitimate -
+    /// no third party armed on V1 can interleave anymore.
+    #[test]
+    fn failure_then_divergent_retry_stays_consistent() {
+        let t = tmpdir("diverge");
+        let fs = fs_at(&t.join("root"));
+        fs.create("f", 0o644).unwrap();
+        let mut a = fs.open_write("f", None).unwrap();
+        a.write(0, b"first-try").unwrap();
+
+        fs.inject_dir_fsync_failure(true);
+        assert!(matches!(Box::new(a).commit(), Err(Error::Io(_))));
+        assert_eq!(fs.lookup("f").unwrap().version, 2);
+
+        // a DIFFERENT writer armed on V1 (opened before the failure):
+        // refused - the V1 anchor is spent
+        let mut c = fs.open_write("f", Some(1)).unwrap();
+        c.write(0, b"armed-on-v1").unwrap();
+        assert!(matches!(Box::new(c).commit(), Err(Error::Conflict { .. })));
+
+        fs.inject_dir_fsync_failure(false);
+        let mut a2 = fs.open_write("f", None).unwrap();
+        a2.write(0, b"final-content").unwrap();
+        let n = Box::new(a2).commit().unwrap();
+        assert_eq!(n.version, 3);
+        assert_eq!(
+            std::fs::read(t.join("root").join("f")).unwrap(),
+            b"final-content".to_vec()
+        );
+    }
+
+    /// Sanity for the injection seam itself: with the fault OFF, the same
+    /// path is the success path (the seam does not divert normal commits).
+    #[test]
+    fn seam_off_is_the_plain_success_path() {
+        let t = tmpdir("seamoff");
+        let fs = fs_at(&t.join("root"));
+        fs.create("f", 0o644).unwrap();
+        fs.inject_dir_fsync_failure(false);
+        let mut s = fs.open_write("f", None).unwrap();
+        s.write(0, b"plain").unwrap();
+        let n = Box::new(s).commit().unwrap();
+        assert_eq!(n.version, 2);
+        assert_eq!(
+            std::fs::read(t.join("root").join("f")).unwrap(),
+            b"plain".to_vec()
+        );
     }
 }
