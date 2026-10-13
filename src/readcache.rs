@@ -8,12 +8,17 @@
 //!
 //! What is cached: COMMITTED bytes of remote files only, read through
 //! [`CacheFs::read_by_id`] (the FUSE read path). Entry identity is the
-//! logical key (rule, node_id, authoritative version, offset, len):
+//! logical key (rule, node_id, authoritative version, etag, offset, len):
 //! - the RULE is the cache instance itself (one cached rule per mount;
 //!   the instance records the prefix for diagnostics),
-//! - the VERSION is validated on EVERY hit against a live authoritative
-//!   lookup — an entry whose version no longer matches is dropped, never
-//!   served,
+//! - the VERSION and the ETAG are validated on EVERY hit against a live
+//!   authoritative lookup — an entry that no longer matches is dropped,
+//!   never served. The etag is not decoration: SQLite reuses rowids (no
+//!   AUTOINCREMENT), so a deleted file's id is handed to the next created
+//!   file, and two one-commit files both sit at version 1 — version alone
+//!   cannot tell them apart, the content fingerprint can (the etag is a
+//!   content hash on both backends, so id+version+etag equal implies the
+//!   bytes equal, which keeps every hit correct within this model),
 //! - (node_id, offset, len) is the physical slot key, so a version bump
 //!   replaces the stale entry in O(log n) instead of accumulating.
 //!
@@ -97,6 +102,15 @@ struct SlotKey {
 
 struct Entry {
     version: i64,
+    /// Content fingerprint of the version object (sha256 prefix on the
+    /// embedded store, the storage service's ETag on S3). The (node_id,
+    /// version) pair alone does NOT identify content: SQLite reuses rowids
+    /// (no AUTOINCREMENT), so a deleted file's id can be handed to a newly
+    /// created file, and two one-commit files both sit at version 1. Same
+    /// id + same version + same etag implies the same bytes (the etag is a
+    /// fingerprint of the content), which makes the extra check complete
+    /// within this threat model - and free of any protocol change.
+    etag: Box<str>,
     bytes: Arc<Vec<u8>>,
     seq: u64,
 }
@@ -178,10 +192,18 @@ impl MemoryReadCache {
         }
     }
 
-    /// Version-validated lookup. A slot whose version no longer matches
-    /// the authority's current version is dropped on the spot (counted as
-    /// `stale_skip`), never served.
-    pub fn get(&self, node_id: i64, version: i64, offset: u64, len: u64) -> Option<Arc<Vec<u8>>> {
+    /// Version-AND-etag-validated lookup. A slot whose version or etag no
+    /// longer matches the authority's current node is dropped on the spot
+    /// (counted as `stale_skip`), never served. The etag catches the id
+    /// reuse + version collision case (see [`Entry::etag`]).
+    pub fn get(
+        &self,
+        node_id: i64,
+        version: i64,
+        etag: &str,
+        offset: u64,
+        len: u64,
+    ) -> Option<Arc<Vec<u8>>> {
         let key = SlotKey {
             node_id,
             offset,
@@ -197,7 +219,9 @@ impl MemoryReadCache {
         let found = {
             let st = self.state.lock().unwrap();
             match st.slots.get(&key) {
-                Some(e) if e.version == version => Found::Hit(e.bytes.clone()),
+                Some(e) if e.version == version && e.etag.as_ref() == etag => {
+                    Found::Hit(e.bytes.clone())
+                }
                 Some(_) => Found::Stale,
                 None => Found::Miss,
             }
@@ -256,6 +280,7 @@ impl MemoryReadCache {
         &self,
         node_id: i64,
         version: i64,
+        etag: &str,
         offset: u64,
         len: u64,
         bytes: Arc<Vec<u8>>,
@@ -300,6 +325,7 @@ impl MemoryReadCache {
             key,
             Entry {
                 version,
+                etag: etag.to_string().into_boxed_str(),
                 bytes,
                 seq,
             },
@@ -360,15 +386,18 @@ impl CacheFs {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // one call site; the shape IS the protocol
     fn consider_insert(
         &self,
         node_id: i64,
         version: i64,
+        etag: &str,
         offset: u64,
         requested_len: u64,
         bytes: &[u8],
         hint: &str,
     ) {
+        let insert_etag = etag.to_string();
         if bytes.len() as u64 > self.cache.max_bytes() {
             // larger than the whole budget: skip the recheck RPC too —
             // there is nothing to insert
@@ -381,10 +410,14 @@ impl CacheFs {
         // bytes were in flight. Only a re-confirmable pairing is cacheable.
         self.cache.note_lookup();
         match self.inner.lookup_by_id(node_id, hint) {
-            Ok(n) if n.version == version => {
+            // the etag in the recheck closes the same reuse window on the
+            // insert side: a recreated identity can reproduce the version
+            // but not the dead file's content fingerprint
+            Ok(n) if n.version == version && n.etag == insert_etag => {
                 self.cache.insert(
                     node_id,
                     version,
+                    &insert_etag,
                     offset,
                     requested_len,
                     Arc::new(bytes.to_vec()),
@@ -464,11 +497,22 @@ impl FsApi for CacheFs {
         if !node.is_file() {
             return self.inner.read_by_id(node_id, path_hint, offset, size);
         }
-        if let Some(bytes) = self.cache.get(node_id, node.version, offset, size) {
+        if let Some(bytes) = self
+            .cache
+            .get(node_id, node.version, &node.etag, offset, size)
+        {
             return Ok((*bytes).clone());
         }
         let bytes = self.inner.read_by_id(node_id, path_hint, offset, size)?;
-        self.consider_insert(node_id, node.version, offset, size, &bytes, path_hint);
+        self.consider_insert(
+            node_id,
+            node.version,
+            &node.etag,
+            offset,
+            size,
+            &bytes,
+            path_hint,
+        );
         Ok(bytes)
     }
 
@@ -559,38 +603,44 @@ mod tests {
     fn slot_is_version_validated_and_stale_entries_are_dropped() {
         let c = MemoryReadCache::new(1 << 20);
         let b: Arc<Vec<u8>> = Arc::new(b"one".to_vec());
-        assert!(c.insert(7, 1, 0, 3, b));
+        assert!(c.insert(7, 1, "eA", 0, 3, b));
         assert_eq!(
-            c.get(7, 1, 0, 3).unwrap().as_slice(),
+            c.get(7, 1, "eA", 0, 3).unwrap().as_slice(),
             b"one",
-            "same version hits"
+            "same version + same etag hits"
         );
         // version moved on: the slot must never serve, and it is dropped
-        assert!(c.get(7, 2, 0, 3).is_none());
+        assert!(c.get(7, 2, "eA", 0, 3).is_none());
         let s = c.stats();
         assert_eq!(s.stale_skip, 1);
         assert_eq!(c.occupied_bytes(), 0, "stale slot released");
-        assert!(c.get(7, 1, 0, 3).is_none(), "dropped means dropped");
+        assert!(c.get(7, 1, "eA", 0, 3).is_none(), "dropped means dropped");
+        // an etag mismatch on the same slot is equally stale (R0.1)
+        assert!(c.insert(8, 1, "eX", 0, 3, Arc::new(b"two".to_vec())));
+        assert!(
+            c.get(8, 1, "eY", 0, 3).is_none(),
+            "etag mismatch never serves"
+        );
     }
 
     #[test]
     fn lru_eviction_respects_touch_order_and_budget() {
         let c = MemoryReadCache::new(10);
-        assert!(c.insert(1, 1, 0, 4, Arc::new(vec![0u8; 4]))); // A
-        assert!(c.insert(2, 1, 0, 4, Arc::new(vec![0u8; 4]))); // B
-        assert!(c.get(1, 1, 0, 4).is_some(), "touch A");
-        assert!(c.insert(3, 1, 0, 4, Arc::new(vec![0u8; 4]))); // needs 4: B evicted
+        assert!(c.insert(1, 1, "e", 0, 4, Arc::new(vec![0u8; 4]))); // A
+        assert!(c.insert(2, 1, "e", 0, 4, Arc::new(vec![0u8; 4]))); // B
+        assert!(c.get(1, 1, "e", 0, 4).is_some(), "touch A");
+        assert!(c.insert(3, 1, "e", 0, 4, Arc::new(vec![0u8; 4]))); // needs 4: B evicted
         let s = c.stats();
         assert_eq!(s.evictions, 1, "exactly the LRU (untouched B) evicted");
-        assert!(c.get(1, 1, 0, 4).is_some(), "touched A survives");
-        assert!(c.get(2, 1, 0, 4).is_none(), "B was the LRU victim");
+        assert!(c.get(1, 1, "e", 0, 4).is_some(), "touched A survives");
+        assert!(c.get(2, 1, "e", 0, 4).is_none(), "B was the LRU victim");
         assert!(c.occupied_bytes() <= 10);
     }
 
     #[test]
     fn oversize_read_is_refused_by_the_store_and_counted() {
         let c = MemoryReadCache::new(8);
-        assert!(!c.insert(1, 1, 0, 9, Arc::new(vec![0u8; 9])));
+        assert!(!c.insert(1, 1, "e", 0, 9, Arc::new(vec![0u8; 9])));
         assert_eq!(c.stats().oversize_bypass, 1);
         assert_eq!(c.occupied_bytes(), 0);
     }
@@ -598,10 +648,10 @@ mod tests {
     #[test]
     fn same_slot_new_version_replaces_without_leaking_budget() {
         let c = MemoryReadCache::new(16);
-        assert!(c.insert(5, 1, 0, 8, Arc::new(vec![b'a'; 8])));
-        assert!(c.insert(5, 2, 0, 8, Arc::new(vec![b'b'; 8])));
+        assert!(c.insert(5, 1, "e1", 0, 8, Arc::new(vec![b'a'; 8])));
+        assert!(c.insert(5, 2, "e2", 0, 8, Arc::new(vec![b'b'; 8])));
         assert_eq!(c.occupied_bytes(), 8, "replacement, not accumulation");
-        assert_eq!(c.get(5, 2, 0, 8).unwrap().as_slice(), &[b'b'; 8]);
+        assert_eq!(c.get(5, 2, "e2", 0, 8).unwrap().as_slice(), &[b'b'; 8]);
         assert_eq!(c.stats().evictions, 0);
     }
 
@@ -610,9 +660,9 @@ mod tests {
         // the reader holds an Arc clone; dropping the entry only drops the
         // cache's reference (Q4: eviction vs in-flight reads)
         let c = MemoryReadCache::new(4);
-        assert!(c.insert(1, 1, 0, 4, Arc::new(vec![7u8; 4])));
-        let held = c.get(1, 1, 0, 4).unwrap();
-        assert!(c.insert(2, 1, 0, 4, Arc::new(vec![9u8; 4]))); // evicts entry 1
+        assert!(c.insert(1, 1, "e", 0, 4, Arc::new(vec![7u8; 4])));
+        let held = c.get(1, 1, "e", 0, 4).unwrap();
+        assert!(c.insert(2, 1, "e", 0, 4, Arc::new(vec![9u8; 4]))); // evicts entry 1
         assert_eq!(c.stats().evictions, 1);
         assert_eq!(held.as_slice(), &[7u8; 4], "reader's bytes are its own");
         assert_eq!(c.occupied_bytes(), 4);
@@ -796,13 +846,20 @@ mod tests {
         let core = core_at("poison");
         let f = cached(core.clone(), "/hot", 1 << 20);
         let id = write_via(&f, "/hot/f", b"clean authoritative bytes");
-        let v = core.lookup("/hot/f").unwrap().version;
+        let now = core.lookup("/hot/f").unwrap();
+        let (v, etag) = (now.version, now.etag.clone());
 
-        // adversarial injection: wrong bytes under the current version
-        assert!(f.cache().insert(id, v, 0, 6, Arc::new(b"POISON".to_vec())));
+        // adversarial injection: wrong bytes under the CURRENT version+etag
+        assert!(
+            f.cache()
+                .insert(id, v, &etag, 0, 6, Arc::new(b"POISON".to_vec()))
+        );
         // probe proves the poison would hit a plain read (this probe is
         // itself the only hit the cache ever records in this test)
-        assert_eq!(f.cache().get(id, v, 0, 6).unwrap().as_slice(), b"POISON");
+        assert_eq!(
+            f.cache().get(id, v, &etag, 0, 6).unwrap().as_slice(),
+            b"POISON"
+        );
         let after_setup = f.cache().stats();
 
         // the commit chain's base read ignores it
@@ -968,6 +1025,442 @@ mod perf {
         assert!(
             f.cache().occupied_bytes() <= f.cache().max_bytes(),
             "hard budget holds"
+        );
+    }
+}
+
+#[cfg(test)]
+mod r1 {
+    //! Phase R: boundary tests for the audit findings. Deterministic only:
+    //! barriers and controlled doubles, no random stress.
+
+    use super::tests::core_at;
+    use super::*;
+    use crate::api::FsApi;
+    use crate::core::Core;
+
+    fn cached(core: Arc<Core>, prefix: &str, budget: u64) -> CacheFs {
+        CacheFs::new(core, prefix.to_string(), budget)
+    }
+
+    fn commit_bytes(fs: &CacheFs, path: &str, data: &[u8]) -> Node {
+        let mut ws = FsApi::open_write(fs, path, None).unwrap();
+        ws.write(0, data).unwrap();
+        ws.commit().unwrap()
+    }
+
+    /// R0.1 CONFIRMED RISK: SQLite rowids are reused (`id INTEGER PRIMARY
+    /// KEY`, no AUTOINCREMENT): unlinking the highest-id file hands its id
+    /// to the NEXT created node. If the dead and the recreated file each
+    /// have one commit (version 1 - the overwhelmingly common recreate
+    /// shape), the version check alone cannot tell the entries apart and
+    /// the DEAD file's cached bytes would be served for the LIVE file.
+    /// The guard is the etag (a content fingerprint on both backends).
+    #[test]
+    fn recreated_identity_never_serves_the_dead_files_bytes() {
+        let core = core_at("reuse");
+        let f = cached(core.clone(), "/hot", 1 << 20);
+        f.mkdir("/hot", 0o755).unwrap();
+
+        // file A: the highest rowid at unlink time; one commit -> version 1
+        f.create("/hot/f", 0o644).unwrap();
+        commit_bytes(&f, "/hot/f", b"the DEAD file's bytes");
+        let dead_id = f.lookup("/hot/f").unwrap().id;
+        assert_eq!(
+            f.read_by_id(dead_id, "/hot/f", 0, 100).unwrap(),
+            b"the DEAD file's bytes"
+        );
+        assert_eq!(f.cache().stats().misses, 1, "dead file's bytes are cached");
+
+        // unlink (row dies, still the highest rowid) + recreate: the NEW
+        // node inherits the id, and one commit again lands on version 1
+        f.unlink("/hot/f").unwrap();
+        f.create("/hot/g", 0o644).unwrap();
+        commit_bytes(&f, "/hot/g", b"the LIVE file's bytes");
+        let live = f.lookup("/hot/g").unwrap();
+        assert_eq!(live.id, dead_id, "precondition: SQLite reused the rowid");
+        assert_eq!(
+            live.version, 1,
+            "precondition: version collision (one commit each)"
+        );
+
+        // THE assertion: the live identity must serve live bytes
+        let got = f.read_by_id(live.id, "/hot/g", 0, 100).unwrap();
+        assert_eq!(
+            got, b"the LIVE file's bytes",
+            "the cache served the DEAD file's bytes for the recreated identity"
+        );
+    }
+}
+
+#[cfg(test)]
+mod r1b {
+    //! R1 continued: concurrency, capacity and boundary edges. All
+    //! deterministic (barriers, exact counters); no random stress.
+
+    use super::tests::core_at;
+    use super::*;
+    use crate::api::FsApi;
+    use crate::core::Core;
+    use std::sync::Barrier;
+    use std::sync::atomic::AtomicBool;
+    use std::thread;
+
+    fn cached(core: Arc<Core>, budget: u64) -> CacheFs {
+        CacheFs::new(core, "/hot".to_string(), budget)
+    }
+
+    fn setup_file(f: &CacheFs, size: usize) -> i64 {
+        f.mkdir("/hot", 0o755).unwrap();
+        f.create("/hot/f", 0o644).unwrap();
+        let mut ws = FsApi::open_write(f, "/hot/f", None).unwrap();
+        ws.write(0, &vec![0x77u8; size]).unwrap();
+        ws.commit().unwrap();
+        f.lookup("/hot/f").unwrap().id
+    }
+
+    /// R0.2: concurrent cold reads of the SAME range all read the object
+    /// (no single-flight in v1 - quantified here) and all serve identical
+    /// bytes; the store stays consistent under the race.
+    #[test]
+    fn concurrent_cold_reads_of_one_range() {
+        const N: usize = 8;
+        let core = core_at("ccold");
+        let gets0 = core.metrics.s3_get.load(Ordering::Relaxed);
+        let f = cached(core.clone(), 1 << 20);
+        let id = setup_file(&f, 256 * 1024);
+
+        let barrier = Arc::new(Barrier::new(N));
+        let f = Arc::new(f);
+        let mut joins = Vec::new();
+        for _ in 0..N {
+            let b = barrier.clone();
+            let f = f.clone();
+            joins.push(thread::spawn(move || {
+                b.wait();
+                f.read_by_id(id, "/hot/f", 0, 128 * 1024).unwrap()
+            }));
+        }
+        let mut results = Vec::new();
+        for j in joins {
+            results.push(j.join().unwrap());
+        }
+        let gets = core.metrics.s3_get.load(Ordering::Relaxed) - gets0;
+        for r in &results {
+            assert_eq!(r, &results[0], "every racing reader sees identical bytes");
+            assert_eq!(r.len(), 128 * 1024);
+        }
+        let s = f.cache().stats();
+        // the barrier starts the readers together but thread SCHEDULING
+        // decides how many actually race the miss: later readers may hit
+        // the entry an earlier reader inserted. Data-wise everything is
+        // exact (asserted above); cost-wise the repeat-read bound is:
+        assert!(
+            s.misses >= 1 && s.misses as usize <= N,
+            "misses must be in [1, {N}]: {}",
+            s.misses
+        );
+        assert_eq!(
+            gets, s.misses,
+            "exactly one object GET per miss (embedded: no other GET source)"
+        );
+        println!(
+            "R1 concurrent cold reads: {N} readers -> {} misses/GETs, {} hits (repeat-read cost bounded by N, 1x-({N}x))",
+            s.misses, s.hits
+        );
+        assert_eq!(
+            f.cache().occupied_bytes(),
+            128 * 1024,
+            "one slot, last writer wins with identical bytes"
+        );
+    }
+
+    /// R0.3: concurrent inserts of DIFFERENT slots never exceed the budget
+    /// (the accounting is entirely inside the critical section) and the
+    /// LRU counters stay consistent (occupied == sum of live entries).
+    #[test]
+    fn concurrent_inserts_respect_budget_and_lru() {
+        const N: usize = 8;
+        const ENTRY: u64 = 100;
+        let c = Arc::new(MemoryReadCache::new(ENTRY * 4)); // fits 4 of 8
+        let barrier = Arc::new(Barrier::new(N));
+        let mut joins = Vec::new();
+        for i in 0..N {
+            let b = barrier.clone();
+            let c = c.clone();
+            joins.push(thread::spawn(move || {
+                b.wait();
+                c.insert(
+                    1000 + i as i64,
+                    1,
+                    "e",
+                    0,
+                    ENTRY,
+                    Arc::new(vec![0u8; ENTRY as usize]),
+                );
+            }));
+        }
+        for j in joins {
+            j.join().unwrap();
+        }
+        assert!(
+            c.occupied_bytes() <= ENTRY * 4,
+            "occupied {} exceeds budget {}",
+            c.occupied_bytes(),
+            ENTRY * 4
+        );
+        // capacity consistency: the residue is exact (no partial accounting)
+        let s = c.stats();
+        assert_eq!(c.occupied_bytes() % ENTRY, 0, "no partial accounting");
+        assert!(
+            s.evictions >= 4,
+            "at least the overflow entries were evicted: {}",
+            s.evictions
+        );
+        assert_eq!(s.oversize_bypass, 0);
+    }
+
+    /// R0.1: version advance racing a hit loop. Every returned byte vector
+    /// must be EXACTLY one of the committed versions - never a mix - and
+    /// after the writer settles, reads converge to the new version.
+    #[test]
+    fn version_advance_racing_hit_loop_never_mixes_bytes() {
+        let core = core_at("vrace");
+        let f = Arc::new(cached(core.clone(), 1 << 20));
+        let id = super::tests::write_via(f.as_ref(), "/hot/f", &vec![b'A'; 4096]);
+        assert_eq!(
+            f.read_by_id(id, "/hot/f", 0, 4096).unwrap(),
+            vec![b'A'; 4096]
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(Barrier::new(2));
+        let reader_stop = stop.clone();
+        let reader_barrier = barrier.clone();
+        let reader_f = f.clone();
+        let reader = thread::spawn(move || {
+            let mut seen_a = false;
+            let mut seen_b = false;
+            reader_barrier.wait();
+            while !reader_stop.load(Ordering::Relaxed) {
+                let got = reader_f.read_by_id(id, "/hot/f", 0, 4096).unwrap();
+                if got == vec![b'A'; 4096] {
+                    seen_a = true;
+                } else if got == vec![b'B'; 4096] {
+                    seen_b = true;
+                } else {
+                    panic!("read returned bytes that match NEITHER committed version");
+                }
+            }
+            (seen_a, seen_b)
+        });
+        barrier.wait();
+        let mut ws = FsApi::open_write(core.as_ref(), "/hot/f", None).unwrap();
+        ws.write(0, &vec![b'B'; 4096]).unwrap();
+        ws.commit().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        let (seen_a, seen_b) = reader.join().unwrap();
+        assert!(seen_a, "some reads hit the pre-commit version");
+        assert_eq!(
+            f.read_by_id(id, "/hot/f", 0, 4096).unwrap(),
+            vec![b'B'; 4096],
+            "converges to the new version"
+        );
+        // seen_b is possible but timing-dependent; never assert it
+        let _ = seen_b;
+    }
+
+    /// R0.3: an oversize read bypasses WITHOUT poisoning later small reads
+    /// (the budget stays usable afterwards).
+    #[test]
+    fn oversize_read_leaves_the_budget_usable() {
+        let core = core_at("big2");
+        let f = cached(core, 64);
+        let big_id = {
+            f.mkdir("/hot", 0o755).unwrap();
+            f.create("/hot/big", 0o644).unwrap();
+            let mut ws = FsApi::open_write(&f, "/hot/big", None).unwrap();
+            ws.write(0, &vec![b'X'; 1024]).unwrap();
+            ws.commit().unwrap();
+            f.lookup("/hot/big").unwrap().id
+        };
+        assert_eq!(
+            f.read_by_id(big_id, "/hot/big", 0, 1024).unwrap().len(),
+            1024
+        );
+        assert_eq!(f.cache().stats().oversize_bypass, 1);
+        assert_eq!(f.cache().occupied_bytes(), 0);
+
+        // a small read still caches and hits normally afterwards
+        let small_id = super::tests::write_via(&f, "/hot/s", b"small");
+        assert_eq!(f.read_by_id(small_id, "/hot/s", 0, 100).unwrap(), b"small");
+        assert_eq!(f.cache().stats().misses, 2);
+        assert_eq!(f.read_by_id(small_id, "/hot/s", 0, 100).unwrap(), b"small");
+        assert_eq!(f.cache().stats().hits, 1);
+        assert_eq!(f.cache().occupied_bytes(), 5);
+    }
+
+    /// R0.3: zero-length reads, huge offsets and huge lengths behave
+    /// EXACTLY like the plain read (no arithmetic in the cache to overflow;
+    /// the range is only a key), and the cached state stays explainable.
+    #[test]
+    fn zero_len_and_extreme_ranges_match_plain_reads() {
+        let core = core_at("edges");
+        let f = cached(core.clone(), 1 << 20);
+        let id = setup_file(&f, 64);
+
+        // zero-length read: cached as an empty slot, consistent on re-read
+        let plain = FsApi::read_by_id(core.as_ref(), id, "", 64, 0).unwrap();
+        let got = f.read_by_id(id, "/hot/f", 64, 0).unwrap();
+        assert_eq!(got, plain);
+        assert_eq!(f.read_by_id(id, "/hot/f", 64, 0).unwrap(), got);
+
+        // offset far beyond EOF: empty result, identical to the plain read
+        let plain = FsApi::read_by_id(core.as_ref(), id, "", u64::MAX / 2, 64).unwrap();
+        let got = f.read_by_id(id, "/hot/f", u64::MAX / 2, 64).unwrap();
+        assert_eq!(got, plain, "huge offset matches plain read");
+
+        // enormous requested length: the authority clamps; the slot keys on
+        // the REQUESTED length, and a re-read hits the same clamped bytes
+        let plain = FsApi::read_by_id(core.as_ref(), id, "", 0, u64::MAX).unwrap();
+        let got = f.read_by_id(id, "/hot/f", 0, u64::MAX).unwrap();
+        assert_eq!(got, plain);
+        assert_eq!(got.len(), 64, "authority clamps at EOF");
+        assert_eq!(f.read_by_id(id, "/hot/f", 0, u64::MAX).unwrap(), got);
+        assert!(f.cache().stats().hits >= 1, "extreme-range re-read hits");
+    }
+}
+
+#[cfg(test)]
+mod r2 {
+    //! R2: performance attribution on the embedded engine. Repeats each
+    //! scenario 5 times and reports the MEDIAN; the divides are measured
+    //! directly (authority lookup, object read, cache lookup, byte copy)
+    //! so the hot-read cost structure is explicit. Run with --nocapture.
+
+    use super::tests::core_at;
+    use super::*;
+    use crate::api::FsApi;
+    use crate::core::Core;
+    use std::time::Instant;
+
+    const CHUNK: u64 = 128 * 1024;
+    const FILE: u64 = 4 * 1024 * 1024;
+
+    fn setup(_core: &Arc<Core>, f: &CacheFs) -> i64 {
+        f.mkdir("/hot", 0o755).unwrap();
+        f.create("/hot/f", 0o644).unwrap();
+        let mut ws = FsApi::open_write(f, "/hot/f", None).unwrap();
+        ws.write(0, &vec![0xA5u8; FILE as usize]).unwrap();
+        ws.commit().unwrap();
+        f.lookup("/hot/f").unwrap().id
+    }
+
+    fn median(v: &mut [u128]) -> f64 {
+        v.sort();
+        v[v.len() / 2] as f64
+    }
+
+    #[test]
+    fn attribution_fits_budget_and_sequential_small_budget() {
+        // ---- scenario A: budget holds the whole file (8MiB > 4MiB) ----
+        let core = core_at("r2a");
+        let f = CacheFs::new(core.clone(), "/hot".to_string(), 8 << 20);
+        let id = setup(&core, &f);
+        let ranges: Vec<(u64, u64)> = (0..(FILE / CHUNK)).map(|i| (i * CHUNK, CHUNK)).collect();
+
+        // one throwaway cold pass (warm the metadata paths too), then 5
+        // measured cold+hot pairs; report medians
+        for &(off, len) in &ranges {
+            f.read_by_id(id, "/hot/f", off, len).unwrap();
+        }
+        let mut cold = Vec::new();
+        let mut hot = Vec::new();
+        let mut lookup_only = Vec::new();
+        let mut clone_only = Vec::new();
+        for _ in 0..5 {
+            // cold pass: bust the cache by bumping the version (one commit),
+            // which is exactly what makes every slot stale
+            let mut ws = FsApi::open_write(core.as_ref(), "/hot/f", None).unwrap();
+            ws.write(0, &vec![0xA5u8; FILE as usize]).unwrap();
+            ws.commit().unwrap();
+            let t = Instant::now();
+            for &(off, len) in &ranges {
+                f.read_by_id(id, "/hot/f", off, len).unwrap();
+            }
+            cold.push(t.elapsed().as_micros());
+
+            let t = Instant::now();
+            for &(off, len) in &ranges {
+                f.read_by_id(id, "/hot/f", off, len).unwrap();
+            }
+            hot.push(t.elapsed().as_micros());
+        }
+        // hot-read divides, measured separately (medians of 5):
+        for _ in 0..5 {
+            let t = Instant::now();
+            for _ in 0..32 {
+                core.lookup_by_id(id).unwrap();
+            }
+            lookup_only.push(t.elapsed().as_micros());
+
+            let bytes = f.cache().get(id, i64::MAX, "", 0, CHUNK); // miss path not needed; measure the copy
+            let _ = bytes;
+            let data = Arc::new(vec![0u8; CHUNK as usize]);
+            let t = Instant::now();
+            for _ in 0..32 {
+                let _copy = (*data).clone();
+            }
+            clone_only.push(t.elapsed().as_micros());
+        }
+        let s = f.cache().stats();
+        println!(
+            "\nR2-A embedded, 32x128KiB over 4MiB, budget 8MiB (medians of 5):\n  cold read pass:  {:>8.1} ms  (miss: lookup + GET + recheck + insert)\n  hot read pass:   {:>8.1} ms  (hit: 1 authority lookup + cache find + copy)\n  hot divides:     32 authority lookups = {:>6.2} ms | 32x128KiB copies = {:>5.2} ms\n  hot total explains as: lookups {:.0}% + copies {:.0}% + cache find (remainder)",
+            median(&mut cold) / 1000.0,
+            median(&mut hot) / 1000.0,
+            median(&mut lookup_only) / 1000.0,
+            median(&mut clone_only) / 1000.0,
+            100.0 * median(&mut lookup_only) / median(&mut hot),
+            100.0 * median(&mut clone_only) / median(&mut hot),
+        );
+        println!(
+            "  stats: hits={} misses={} evictions={} occupied={}KiB/budget={}KiB",
+            s.hits,
+            s.misses,
+            s.evictions,
+            f.cache().occupied_bytes() >> 10,
+            f.cache().max_bytes() >> 10,
+        );
+        assert_eq!(s.evictions, 0, "budget holds the whole file: no evictions");
+
+        // ---- scenario B: sequential re-scan with a HALF-size budget ----
+        // LRU under sequential scans is the WORST case: by the time chunk i
+        // is re-read, it was evicted by the later chunks of the previous
+        // pass. The honest expectation is ~0% hits on pass 2 - the cache
+        // buys nothing for pure sequential re-scans smaller than the file,
+        // and the report must say so.
+        let core = core_at("r2b");
+        let f = CacheFs::new(core.clone(), "/hot".to_string(), 2 << 20);
+        let id = setup(&core, &f);
+        for &(off, len) in &ranges {
+            f.read_by_id(id, "/hot/f", off, len).unwrap();
+        }
+        let misses_after_pass1 = f.cache().stats().misses;
+        for &(off, len) in &ranges {
+            f.read_by_id(id, "/hot/f", off, len).unwrap();
+        }
+        let s = f.cache().stats();
+        let pass2_misses = s.misses - misses_after_pass1;
+        println!(
+            "\nR2-B sequential re-scan, budget 2MiB < file 4MiB (LRU worst case):\n  pass2 misses: {}/{} (hit rate {:.0}%) evictions={} - sequential re-scans below file size get NOTHING from the cache",
+            pass2_misses,
+            ranges.len(),
+            100.0 * (1.0 - pass2_misses as f64 / ranges.len() as f64),
+            s.evictions,
+        );
+        assert!(
+            pass2_misses as f64 > 0.9 * ranges.len() as f64,
+            "sequential re-scan below budget must be near-0% hits (documented worst case)"
         );
     }
 }
