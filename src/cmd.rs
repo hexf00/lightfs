@@ -176,6 +176,16 @@ pub fn mount(cfg: &Config, mountpoint: &str, allow_other: bool) -> Result<()> {
     } else {
         engine::open_embedded(cfg)?.core
     };
+    // Path policy (Phase P): route by rule, or pass the backend through
+    // untouched when no client-local rule is configured.
+    let fs: std::sync::Arc<dyn crate::api::FsApi> = match crate::routing::RoutingFs::build(
+        fs.clone(),
+        cfg.policy.as_ref(),
+        std::path::Path::new(mountpoint),
+    )? {
+        Some(routed) => std::sync::Arc::new(routed),
+        None => fs,
+    };
     crate::fuse::mount(fs, mountpoint, allow_other)
 }
 
@@ -191,6 +201,14 @@ pub fn mount(cfg: &Config, mountpoint: &str, _allow_other: bool) -> Result<()> {
         }))
     } else {
         engine::open_embedded(cfg)?.core
+    };
+    let fs: std::sync::Arc<dyn crate::api::FsApi> = match crate::routing::RoutingFs::build(
+        fs.clone(),
+        cfg.policy.as_ref(),
+        std::path::Path::new(mountpoint),
+    )? {
+        Some(routed) => std::sync::Arc::new(routed),
+        None => fs,
     };
     crate::winfsp::mount(fs, mountpoint)
 }

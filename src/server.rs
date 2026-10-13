@@ -289,7 +289,7 @@ fn handle_request_inner(mut req: tiny_http::Request, core: &Core) {
             // (disk, not RAM), then PUT with a real Content-Length — S3
             // rejects chunked unsigned PUTs (411). True reader-to-reader
             // streaming onto S3 needs multipart upload (documented
-            // follow-up in docs/PERFORMANCE.md).
+            // follow-up in the performance notes).
             let outcome = (|| -> Result<crate::metadata::Node> {
                 // Exclusive creation (atomic, no symlink/target collision),
                 // owner-only permissions: this file holds user data.

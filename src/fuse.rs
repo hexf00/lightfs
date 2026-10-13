@@ -136,6 +136,9 @@ fn errno(e: &Error) -> Errno {
         Error::KindMismatch { .. } => Errno::EISDIR,
         Error::InvalidArgument(m) if m.contains("too many symlink") => Errno::ELOOP,
         Error::DirectoryNotEmpty(_) => Errno::ENOTEMPTY,
+        // POSIX EXDEV: "Improper link" - rename across filesystems. The
+        // policy router refuses renames across storage authorities.
+        Error::Exdev(_) => Errno::EXDEV,
         Error::Cycle(_) | Error::InvalidPath(_) | Error::InvalidArgument(_) => Errno::EINVAL,
         Error::Conflict { .. } => Errno::EIO,
         Error::Storage(_) | Error::Db(_) | Error::Io(_) | Error::Config(_) => Errno::EIO,

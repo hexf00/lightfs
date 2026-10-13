@@ -22,7 +22,7 @@ use serde::Deserialize;
 
 /// `[policy]` section. Absent from the config = `PolicySection::default()`
 /// = today's behavior.
-#[derive(Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct PolicySection {
     /// Mount-wide budget ceilings. Optional; per-rule budgets that reference
@@ -35,7 +35,7 @@ pub struct PolicySection {
     pub rule: Vec<RawRule>,
 }
 
-#[derive(Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyLimits {
     pub memory_budget: Option<String>,
@@ -44,7 +44,7 @@ pub struct PolicyLimits {
 
 /// One `[[policy.rule]]` as written. Strings (not enums) on purpose: each
 /// rejected value gets a specific message, not a generic serde error.
-#[derive(Deserialize, Clone)]
+#[derive(Debug, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct RawRule {
     pub prefix: String,
@@ -624,6 +624,13 @@ impl ResolvedPolicy {
             memory_budget,
             disk_budget,
         })
+    }
+
+    /// Iterate (prefix, view) pairs, longest prefix first. The router uses
+    /// this to find which resolved rules are client-local (and must own a
+    /// backend) without re-implementing the matching.
+    pub fn rules(&self) -> impl Iterator<Item = (&str, &PolicyView)> {
+        self.rules.iter().map(|r| (r.prefix.as_str(), &r.view))
     }
 
     /// Resolve `path` to its PolicyView. Unknown → the default rule (which

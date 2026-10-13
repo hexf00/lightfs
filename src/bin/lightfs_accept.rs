@@ -54,6 +54,8 @@ struct Ctx {
     /// Second FUSE mount on the SAME server: the B client of the
     /// cross-client section D (stable file identity). None elsewhere.
     mount2: Option<Child>,
+    // its path: only section D (unix) ever reads it
+    #[cfg_attr(not(unix), allow(dead_code))]
     mount_target2: String,
     section_list: Vec<String>,
     #[allow(dead_code)] // printed in the env header only on the mount path
@@ -266,6 +268,19 @@ impl Ctx {
     /// Section D uses this for BOTH mounts with ATTR_TTL=0 (a cached attr
     /// would mask cross-client identity changes behind a stale size/inode).
     fn spawn_mount(&mut self, target: String, envs: &[(&str, &str)], name: &str) -> Child {
+        let cfg = self.config.clone();
+        self.spawn_mount_cfg(target, &cfg, envs, name)
+    }
+
+    /// Variant used by the path-policy section (E): a DIFFERENT config
+    /// file (the base config + a [policy] section) on the SAME server.
+    fn spawn_mount_cfg(
+        &mut self,
+        target: String,
+        config: &Path,
+        envs: &[(&str, &str)],
+        name: &str,
+    ) -> Child {
         let root = PathBuf::from(&target);
         // A mount still listed for the target is a stale (possibly DEAD)
         // leftover: mounting over it stacks and fails weirdly on old
@@ -280,9 +295,7 @@ impl Ctx {
             );
         }
         let mut cmd = Command::new(&self.lightfs);
-        cmd.args(["mount", "--config"])
-            .arg(&self.config)
-            .arg(&target);
+        cmd.args(["mount", "--config"]).arg(config).arg(&target);
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -308,6 +321,41 @@ impl Ctx {
 
     /// Kill the mount daemon. Does NOT unmount: an unmount while fds may
     /// still pin the fs degrades to lazy detachment (see unmount_target).
+    /// Spawn a mount that must FAIL at mount-time routing (path policy):
+    /// the process must exit nonzero and leave no mount behind.
+    #[cfg(unix)]
+    fn assert_mount_refused(&mut self, config: &Path, target: String) {
+        std::fs::create_dir_all(&target).ok();
+        let mut cmd = Command::new(&self.lightfs);
+        cmd.args(["mount", "--config"])
+            .arg(config)
+            .arg(&target)
+            .stdout(Stdio::null())
+            .stderr(self.child_stderr("mount-refused"));
+        let mut child = cmd.spawn().expect("spawn refused-mount");
+        let mut refused = false;
+        for _ in 0..100 {
+            if let Some(st) = child.try_wait().expect("try_wait refused-mount") {
+                assert!(
+                    !st.success(),
+                    "a shadowed prefix must refuse the mount (exit 0 is a silent takeover)"
+                );
+                refused = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            refused,
+            "refused mount neither exited nor mounted within 10s"
+        );
+        assert!(
+            !Self::unix_mounted(&target),
+            "a refused mount left a mount behind"
+        );
+        std::fs::remove_dir(&target).ok();
+    }
+
     fn kill_mount_only(&mut self) {
         if let Some(c) = self.mount.as_mut() {
             let _ = c.kill();
@@ -1798,6 +1846,224 @@ fn section_d(ctx: &mut Ctx, root: &Path, root2: &Path) {
     println!("  OK  D: offline fsck clean");
 }
 
+// ---------------------------------------------------------------------------
+// E: path policy (Phase P) - a client-local rule through the REAL kernel
+// mount. Same server as the baseline mount: the local prefix must leave no
+// server trace, cross-backend rename must fail EXDEV, a remote-occupied
+// prefix must refuse the mount unless the config opts in (and then the
+// remote content is hidden, never migrated).
+// ---------------------------------------------------------------------------
+#[cfg(unix)]
+const E_EXDEV: i32 = 18;
+
+#[cfg(unix)]
+fn policy_config(base_cfg: &str, workdir: &Path, name: &str, rules: &str) -> PathBuf {
+    let p = workdir.join(name);
+    std::fs::write(&p, format!("{base_cfg}\n[policy]\n{rules}\n")).expect("write policy cfg");
+    p
+}
+
+#[cfg(unix)]
+fn dir_names_sorted(p: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(p)
+        .expect("E read_dir")
+        .map(|e| {
+            e.expect("E entry")
+                .file_name()
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+#[cfg(unix)]
+fn section_e(ctx: &mut Ctx, root: &Path) {
+    println!("--- E: path policy / client-local authority ---");
+    let base_cfg = std::fs::read_to_string(&ctx.config).expect("read base config");
+    let roots = ctx.workdir.join("e-roots");
+    std::fs::create_dir_all(&roots).expect("E roots dir");
+    let local_root = roots.join("local");
+    let target_p = format!("{}p", ctx.mount_target);
+    std::fs::create_dir_all(&target_p).expect("E mountpoint");
+
+    // E1: a FREE prefix mounts and the file lifecycle is byte-exact; the
+    // configured local dir is the authority (the bytes are there).
+    let pol1 = policy_config(
+        &base_cfg,
+        &ctx.workdir,
+        "cfg-policy-e1.toml",
+        &format!(
+            "[[policy.rule]]\nprefix = \"/local\"\nstorage = \"client-local\"\nroot = {:?}",
+            local_root
+        ),
+    );
+    let pm = ctx.spawn_mount_cfg(
+        target_p.clone(),
+        &pol1,
+        &[("LIGHTFS_FUSE_ATTR_TTL_SECS", "0")],
+        "mount-p",
+    );
+    let p_root = PathBuf::from(&target_p);
+    write_strong(
+        &p_root.join("local/f.txt"),
+        b"hello local",
+        "E1 create+commit",
+    );
+    assert_bytes("E1 read-back", &p_root.join("local/f.txt"), b"hello local");
+    assert_eq!(
+        std::fs::read(local_root.join("f.txt")).unwrap(),
+        b"hello local".to_vec(),
+        "E1: the local root holds the authoritative bytes"
+    );
+    std::fs::rename(p_root.join("local/f.txt"), p_root.join("local/g.txt"))
+        .expect("E1 rename through the mount");
+    assert_bytes(
+        "E1 after rename",
+        &p_root.join("local/g.txt"),
+        b"hello local",
+    );
+    assert!(!p_root.join("local/f.txt").exists(), "E1 old name gone");
+    let names = dir_names_sorted(&p_root.join("local"));
+    assert!(
+        names.contains(&"g.txt".to_string()) && !names.contains(&"f.txt".to_string()),
+        "E1 readdir: {names:?}"
+    );
+
+    // E2: cross-backend rename = EXDEV, both sides byte-intact. The remote
+    // side goes through the policy mount's DEFAULT (s3) rule.
+    let rdir = root.join("e-remote");
+    std::fs::create_dir_all(&rdir).expect("E remote dir");
+    write_strong(&rdir.join("x"), b"remote", "E2 remote seed");
+    let err = std::fs::rename(p_root.join("local/g.txt"), rdir.join("y")).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(E_EXDEV), "E2 local->remote: {err}");
+    let err = std::fs::rename(rdir.join("x"), p_root.join("local/y")).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(E_EXDEV), "E2 remote->local: {err}");
+    assert_bytes(
+        "E2 local intact",
+        &p_root.join("local/g.txt"),
+        b"hello local",
+    );
+    assert_bytes("E2 remote intact", &rdir.join("x"), b"remote");
+
+    // E3: the local prefix leaves NO server trace.
+    let server_names = dir_names_sorted(root);
+    assert!(
+        !server_names.iter().any(|n| n == "local"),
+        "E3 server saw the local prefix: {server_names:?}"
+    );
+
+    // E4: an OCCUPIED prefix refuses the mount by default; with
+    // allow_shadow = true it mounts and the remote content is INVISIBLE
+    // (takeover, not merge) - and the server data is untouched.
+    let sdir = root.join("shadowed");
+    std::fs::create_dir_all(&sdir).expect("E shadow dir");
+    write_strong(&sdir.join("keep.txt"), b"server data", "E4 server seed");
+    let pol4 = policy_config(
+        &base_cfg,
+        &ctx.workdir,
+        "cfg-policy-e4.toml",
+        &format!(
+            "[[policy.rule]]\nprefix = \"/shadowed\"\nstorage = \"client-local\"\nroot = {:?}",
+            roots.join("shadow-root")
+        ),
+    );
+    ctx.assert_mount_refused(&pol4, format!("{target_p}s"));
+    let pol4b = policy_config(
+        &base_cfg,
+        &ctx.workdir,
+        "cfg-policy-e4b.toml",
+        &format!(
+            "[[policy.rule]]\nprefix = \"/shadowed\"\nstorage = \"client-local\"\nroot = {:?}\nallow_shadow = true",
+            roots.join("shadow-root")
+        ),
+    );
+    let target_ps = format!("{target_p}s");
+    std::fs::create_dir_all(&target_ps).expect("E shadow mountpoint");
+    let pm2 = ctx.spawn_mount_cfg(
+        target_ps.clone(),
+        &pol4b,
+        &[("LIGHTFS_FUSE_ATTR_TTL_SECS", "0")],
+        "mount-ps",
+    );
+    let ps_root = PathBuf::from(&target_ps);
+    let names = dir_names_sorted(&ps_root.join("shadowed"));
+    assert!(
+        names.is_empty(),
+        "E4 shadowed prefix must LOOK empty: {names:?}"
+    );
+    assert!(
+        !ps_root.join("shadowed/keep.txt").exists(),
+        "E4 remote content must be hidden under the local rule"
+    );
+    assert_bytes(
+        "E4 server data intact",
+        &sdir.join("keep.txt"),
+        b"server data",
+    );
+    // the WARNING went to the mount's stderr log
+    let warn = std::fs::read_to_string(ctx.workdir.join("mount-ps.err")).unwrap_or_default();
+    assert!(
+        warn.contains("WARNING"),
+        "E4 allow_shadow must warn loudly, got: {warn:?}"
+    );
+
+    // E5: two rules, two roots, independent namespaces and bytes.
+    let pol5 = policy_config(
+        &base_cfg,
+        &ctx.workdir,
+        "cfg-policy-e5.toml",
+        &format!(
+            "[[policy.rule]]\nprefix = \"/a\"\nstorage = \"client-local\"\nroot = {:?}\n[[policy.rule]]\nprefix = \"/b\"\nstorage = \"client-local\"\nroot = {:?}",
+            roots.join("ra"),
+            roots.join("rb")
+        ),
+    );
+    let target_pp = format!("{target_p}p");
+    std::fs::create_dir_all(&target_pp).expect("E multi mountpoint");
+    let pm3 = ctx.spawn_mount_cfg(
+        target_pp.clone(),
+        &pol5,
+        &[("LIGHTFS_FUSE_ATTR_TTL_SECS", "0")],
+        "mount-pp",
+    );
+    let pp_root = PathBuf::from(&target_pp);
+    std::fs::create_dir_all(pp_root.join("a")).expect("E5 mkdir /a");
+    std::fs::create_dir_all(pp_root.join("b")).expect("E5 mkdir /b");
+    write_strong(&pp_root.join("a/x"), b"AAA", "E5 seed a");
+    write_strong(&pp_root.join("b/x"), b"BBB", "E5 seed b");
+    assert_eq!(
+        std::fs::read(roots.join("ra").join("x")).unwrap(),
+        b"AAA".to_vec()
+    );
+    assert_eq!(
+        std::fs::read(roots.join("rb").join("x")).unwrap(),
+        b"BBB".to_vec()
+    );
+    // cross-root rename inside ONE policy mount: still EXDEV (two backends)
+    let err = std::fs::rename(pp_root.join("a/x"), pp_root.join("b/y")).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(E_EXDEV), "E5 cross-root: {err}");
+    // server saw nothing of /a or /b either
+    let server_names = dir_names_sorted(root);
+    assert!(
+        !server_names.iter().any(|n| n == "a" || n == "b"),
+        "E5 server saw local prefixes: {server_names:?}"
+    );
+
+    // cleanup (d-style, but the server stays for the main teardown)
+    drop(pm3);
+    ctx.unmount_at(&target_pp);
+    drop(pm2);
+    ctx.unmount_at(&target_ps);
+    drop(pm);
+    ctx.unmount_at(&target_p);
+    // shadow-root was lazily created by the allow_shadow mount; clean it
+    // so re-runs start fresh (the refused one must NOT have been created)
+    std::fs::remove_dir_all(&roots).ok();
+    println!("  OK  E: policy mounts torn down");
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut lightfs = PathBuf::from("lightfs");
@@ -1941,6 +2207,14 @@ fn main() {
         // section_d ends with both mounts and the server torn down; the
         // suite's other sections must have run BEFORE d.
         println!("MOUNTS TORN DOWN (d)");
+    }
+    #[cfg(unix)]
+    if ctx.sections_want("e") {
+        // E runs its own policy mounts against the SAME server; it works
+        // after d too (ensure_running restarts whatever d tore down).
+        ctx.ensure_running();
+        let root = PathBuf::from(&ctx.mount_target);
+        section_e(&mut ctx, &root);
     }
     #[cfg(unix)]
     if ctx.sections_want("stress") {
@@ -2104,7 +2378,7 @@ fn section_w(ctx: &Ctx, root: &Path) {
     }
 
     // W5 case sensitivity: the mount is case-sensitive (WinFsp
-    // CaseSensitiveSearch, docs/WINDOWS.md section 5). Opening a different
+    // CaseSensitiveSearch, per the Windows adapter notes). Opening a different
     // case must fail, and the two spellings must coexist as two nodes.
     write_strong(&dir.join("CaseFile.txt"), b"upper", "W5 seed");
     match std::fs::File::open(dir.join("casefile.txt")) {

@@ -6,6 +6,8 @@ pub mod core;
 pub mod engine;
 pub mod error;
 pub mod fsck;
+pub mod localfs;
+pub mod routing;
 
 // FUSE exists on Linux; mounting additionally needs /dev/fuse at runtime.
 #[cfg(all(feature = "fuse", target_os = "linux"))]

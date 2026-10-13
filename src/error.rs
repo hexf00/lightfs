@@ -44,6 +44,10 @@ pub enum Error {
     Db(String),
     /// I/O failure.
     Io(String),
+    /// rename/move across two different policy backends (e.g. an s3 rule
+    /// and a client-local rule). Refused outright (Phase P): no implicit
+    /// data migration between authorities.
+    Exdev(String),
     /// Configuration problem.
     Config(String),
 }
@@ -82,6 +86,7 @@ impl fmt::Display for Error {
             Error::IdentityGone(k) => write!(f, "identity gone: node {k} no longer exists"),
             Error::Db(m) => write!(f, "metadata: {m}"),
             Error::Io(m) => write!(f, "io: {m}"),
+            Error::Exdev(m) => write!(f, "cross-device link: {m}"),
             Error::Config(m) => write!(f, "config: {m}"),
         }
     }
@@ -119,6 +124,7 @@ impl Error {
             Error::Storage(_) => "STORAGE",
             Error::Db(_) => "DB",
             Error::Io(_) => "IO",
+            Error::Exdev(_) => "EXDEV",
             Error::Config(_) => "CONFIG",
         }
     }

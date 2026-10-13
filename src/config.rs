@@ -17,6 +17,10 @@ pub struct Config {
     pub server: ServerSection,
     pub cache: CacheSection,
     pub retention: RetentionSection,
+    /// Path policy (Phase P). Absent = no policy = today's routing.
+    /// Strictly validated at mount: unknown fields inside are errors.
+    #[serde(default)]
+    pub policy: Option<crate::policy::PolicySection>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -133,6 +137,7 @@ impl Config {
                     data: DataCacheSection::default(),
                 },
                 retention: RetentionSection::default(),
+                policy: None,
             }),
         }
     }
