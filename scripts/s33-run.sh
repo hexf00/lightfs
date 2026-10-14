@@ -18,7 +18,9 @@ REPO="$PWD"
 export PATH="$HOME/tools/bin:$HOME/.local/bin:$PATH"
 
 BIN="$REPO/target/release/lightfs"
+BENCH="$REPO/target/release/lightfs-bench"
 [[ -x "$BIN" ]] || { echo "FATAL: $BIN missing (cargo build --release --bin lightfs)"; exit 1; }
+[[ -x "$BENCH" ]] || { echo "FATAL: $BENCH missing (cargo build --release --bin lightfs-bench)"; exit 1; }
 MINIO_BIN="${MINIO_BIN:-$HOME/tools/bin/minio}"
 [[ -x "$MINIO_BIN" ]] || { echo "FATAL: minio missing at $MINIO_BIN (see docs/LOCAL_ENV.md)"; exit 1; }
 
@@ -38,11 +40,27 @@ THREADS="${THREADS:-16}"
 BATCH_BYTES=$((8 * 1024 * 1024))
 BATCH_WAIT_MS="${BATCH_WAIT_MS:-200}"
 STAGES="${STAGES:-p1 calib rtt100 rtt1000 reads}"
+VERIFY_SAMPLE="${VERIFY_SAMPLE:-100}"
 CAP1=10
 CAP2=60
 
 MINIO_PID=""; PROXY_PID=""; SRV=""; GDIR=""; BUCKET=""; MANIFEST=""
 WATCHERS=""; S3_ENDPOINT=""
+# HARD WALL CAP: one script invocation must never run longer than this (user
+# directive: no test script runs past 60s). Checked synchronously at every
+# stage/group boundary; the exit fires the cleanup trap.
+WALL_CAP="${WALL_CAP:-60}"
+# proxy parameter that realizes the target RTT (calibration feedback loop);
+# rtt100/rtt1000 read this cross-invocation file instead of the nominal value.
+PROXY_PARAM_FILE="$REPO/.s33-proxy-param.txt"
+DEADLINE=$(( $(date +%s) + WALL_CAP ))
+wall_check(){
+    (( $(date +%s) >= DEADLINE )) && {
+        echo "FATAL: wall cap ${WALL_CAP}s exceeded for this invocation" >&2
+        exit 124
+    }
+    return 0
+}
 
 log(){ echo "[$(date +%H:%M:%S)] $*"; }
 res(){ echo "$*" >> "$RESULTS"; }
@@ -73,6 +91,10 @@ trap cleanup EXIT
 
 start_proxy(){  # $1 = target rtt ms (SIMULATED latency)
     stop_proxy
+    if port_busy "$PROXY_PORT"; then
+        lsof -nP -iTCP:"$PROXY_PORT" | tail -n +2 | sed 's/^/    holder: /' >&2
+        fail "proxy port $PROXY_PORT busy"
+    fi
     python3 "$REPO/scripts/s33-rtt-proxy.py" \
         --listen "127.0.0.1:$PROXY_PORT" \
         --target "127.0.0.1:$MINIO_PORT" \
@@ -86,9 +108,9 @@ start_proxy(){  # $1 = target rtt ms (SIMULATED latency)
 start_minio(){
     stop_minio
     port_busy "$MINIO_PORT" && fail "port $MINIO_PORT busy - refusing to share"
-    MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin2025 \
+    MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
         nohup "$MINIO_BIN" server "$RUN/minio-data" \
-        --address "127.0.0.1:$MINIO_PORT" --console-address "127.0.0.1:$((MINIO_PORT+1))" \
+        --address "127.0.0.1:$MINIO_PORT" --console-address "127.0.0.1:$((MINIO_PORT+9))" \
         > "$OUT/minio.log" 2>&1 &
     MINIO_PID=$!
     for _ in $(seq 1 100); do
@@ -129,7 +151,7 @@ endpoint = "$endpoint"
 region = "us-east-1"
 bucket = "$BUCKET"
 access_key = "minioadmin"
-secret_key = "minioadmin2025"
+secret_key = "minioadmin"
 path_style = true
 service = "s3"
 [metadata]
@@ -145,7 +167,7 @@ EOF
     } > "$GDIR/cfg.toml"
     "$BIN" create-bucket --config "$GDIR/cfg.toml" >>"$EXECLOG" 2>&1 || fail "create-bucket ($label)"
     start_server
-    for d in seq mt conf crash; do rpc_mkdir "/$d"; done
+    for d in seq mt conf crash hot big; do rpc_mkdir "/$d"; done
 }
 stop_stack(){ stop_srv; }
 
@@ -393,8 +415,11 @@ print(f"{wall:.3f}")
 PY
 
 cat > "$RUN/tools/r33.py" <<'PY'
-# RPC-driven verify-read over a manifest slice: POST /data/read per file,
-# sha-verify. TSV: ms<TAB>i. BAD lines to stderr; exit 2 on mismatch.
+# RPC-driven verify-read over a manifest slice, following the FUSE read path:
+# lookup(path) for the node id (outside the timed window, as GETATTR is cached
+# by the kernel dentry cache), then POST /data/read {"node_id",...} — the same
+# call the Q memory cache and the pack cache are keyed on. sha-verify per file.
+# TSV: ms<TAB>i. BAD lines to stderr; exit 2 on mismatch.
 import hashlib, json, sys, time, urllib.request
 
 srv, root, manifest, prefix, start, count, size, out = sys.argv[1:9]
@@ -408,7 +433,14 @@ if not sel:
 rows = []; ok = bad = 0; bytes_read = 0
 for tag, i, _, want in sel:
     path = f"{root}/f{i}.bin"
-    body = json.dumps({"path": path, "offset": 0, "size": size}).encode()
+    body = json.dumps({"id": 1, "method": "lookup",
+                       "params": {"path": path}}).encode()
+    req = urllib.request.Request(f"{srv}/rpc", data=body, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        node = json.loads(r.read())["result"]
+    body = json.dumps({"node_id": node["id"], "offset": 0,
+                       "size": size}).encode()
     req = urllib.request.Request(f"{srv}/data/read", data=body, method="POST",
                                  headers={"Content-Type": "application/json"})
     s = time.perf_counter()
@@ -473,6 +505,22 @@ try:
         sys.exit(2)
 except urllib.error.HTTPError:
     rejected = 1
+
+if mode == "wb":
+    # WB ack-projection: pending staged content is readable before the drain
+    # (close=staged). Wait for the queue to go idle so the final read observes
+    # the COMMITTED terminal state, not a projection.
+    import time as _t
+    deadline = _t.time() + 15
+    while _t.time() < deadline:
+        body = json.dumps({"id": 1, "method": "metrics", "params": {}}).encode()
+        req = urllib.request.Request(f"{srv}/rpc", data=body, method="POST",
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            m = json.loads(r.read())["result"]
+        if m.get("wb_queued", 0) == 0 and m.get("wb_draining", 0) == 0:
+            break
+        _t.sleep(0.1)
 
 ok = True
 h1 = hashlib.sha256((b"one" * 256)[:4096]).hexdigest()
@@ -548,13 +596,16 @@ PY
 ##############################################################################
 run_group(){  # $1=group $2=count $3=label $4=cap_s
     local g=$1 n=$2 rl=$3 cap=$4
+    wall_check
     start_stack "$g"
+    wall_check
     local W="$OUT/w-$g-$rl"; mkdir -p "$W"
     local wall t_drain rc
 
     : > "$W/seq.tsv"; : > "$W/mt.tsv"
     sample_to "$SRV" "$W/srv-seq.samples"
-    log "  $g/$rl: seq $n x ${SIZE}B (cap ${cap}s) endpoint=$S3_ENDPOINT"
+    log "  $g/$rl: seq $n x ${SIZE}B (cap ${cap}s) endpoint=${S3_ENDPOINT:-direct}"
+    metrics_snap "$W/bef.txt"
     qsample "$W/qpeak"
     wall=$(with_timeout "$cap" python3 "$RUN/tools/w33.py" \
         "http://127.0.0.1:$SRV_PORT" "/seq" "$n" "$SIZE" 1 seq "$MANIFEST" "$W/seq.tsv")
@@ -562,25 +613,37 @@ run_group(){  # $1=group $2=count $3=label $4=cap_s
     t_drain=$(wb_wait_drained "$cap" || true)
     qstop
     sample_kill
+    metrics_snap "$W/aft.txt"
     [[ $rc == 0 ]] || fail "seq write $g/$rl rc=$rc (scenario exceeded cap ${cap}s?)"
     [[ "$t_drain" != "-1" ]] || fail "drain timeout $g/$rl"
-    metrics_snap "$W/bef.txt"
-    python3 "$RUN/tools/r33.py" "http://127.0.0.1:$SRV_PORT" "/seq" "$MANIFEST" seq 0 "$n" "$SIZE" "$W/seqr.tsv" 2>"$W/seqr.err" \
-        || fail "seq verify $g/$rl: $(cat "$W/seqr.err")"
-    metrics_snap "$W/aft.txt"
     res "PHASE=seq.$g.$rl endpoint=${S3_ENDPOINT:-direct} delta: $(metrics_delta "$W/bef.txt" "$W/aft.txt") wall_s=$wall"
     res "FRONT=seq group=$g round=$rl wall_s=$wall drain_to_remote_s=$t_drain close_$(percentiles "$W/seq.tsv") $(cat "$W/qpeak")"
+    # verify over a sample under simulated RTT (full-N reads would double the
+    # scenario cost); full N on direct loopback.
+    local vn=$n
+    [[ -n "$S3_ENDPOINT" ]] && vn=$(( n > VERIFY_SAMPLE ? VERIFY_SAMPLE : n ))
+    metrics_snap "$W/bef2.txt"
+    python3 "$RUN/tools/r33.py" "http://127.0.0.1:$SRV_PORT" "/seq" "$MANIFEST" seq 0 "$vn" "$SIZE" "$W/seqr.tsv" 2>"$W/seqr.err" \
+        || fail "seq verify $g/$rl: $(cat "$W/seqr.err")"
+    metrics_snap "$W/aft2.txt"
+    res "VERIFY=seq.$g.$rl n=$vn delta: $(metrics_delta "$W/bef2.txt" "$W/aft2.txt")"
 
     log "  $g/$rl: mt ${THREADS}t"
     sample_to "$SRV" "$W/srv-mt.samples"
+    metrics_snap "$W/bef-mt.txt"
     wall=$(with_timeout "$cap" python3 "$RUN/tools/w33.py" \
         "http://127.0.0.1:$SRV_PORT" "/mt" "$n" "$SIZE" "$THREADS" mt "$MANIFEST" "$W/mt.tsv") \
         || fail "mt write $g/$rl"
     t_drain=$(wb_wait_drained "$cap" || true)
     sample_kill
+    metrics_snap "$W/aft-mt.txt"
     [[ "$t_drain" != "-1" ]] || fail "drain timeout mt $g/$rl"
-    python3 "$RUN/tools/r33.py" "http://127.0.0.1:$SRV_PORT" "/mt" "$MANIFEST" mt 0 "$n" "$SIZE" "$W/mtr.tsv" 2>"$W/mtr.err" \
+    res "PHASE=mt.$g.$rl endpoint=${S3_ENDPOINT:-direct} delta: $(metrics_delta "$W/bef-mt.txt" "$W/aft-mt.txt") wall_s=$wall"
+    local vn=$n
+    [[ -n "$S3_ENDPOINT" ]] && vn=$(( n > VERIFY_SAMPLE ? VERIFY_SAMPLE : n ))
+    python3 "$RUN/tools/r33.py" "http://127.0.0.1:$SRV_PORT" "/mt" "$MANIFEST" mt 0 "$vn" "$SIZE" "$W/mtr.tsv" 2>"$W/mtr.err" \
         || fail "mt verify $g/$rl: $(cat "$W/mtr.err")"
+    res "VERIFY=mt.$g.$rl n=$vn"
     res "FRONT=mt group=$g round=$rl wall_s=$wall drain_to_remote_s=$t_drain close_$(percentiles "$W/mt.tsv")"
     res "RSS group=$g round=$rl seq_srv_$(summarize_sample "$W/srv-seq.samples") mt_srv_$(summarize_sample "$W/srv-mt.samples")"
     stop_stack
@@ -598,9 +661,17 @@ res "# SIMULATED = server's S3 endpoint goes through the userspace delay proxy"
 res "# (scripts/s33-rtt-proxy.py, target ${RTT_MS}ms RTT, calibrated in the CALIB stage);"
 res "# direct = plain loopback. drain_to_remote_s = wall until the write-back queue"
 res "# is idle (queued==0 && draining==0); reported separately from FRONT."
+res "#"
+res "# READS scope note (structural, not a failure): the Q per-file memory cache"
+res "# (R2) is installed in the MOUNT process (RoutingFs, cmd.rs), so plain-RPC"
+res "# reads never traverse it; locally R2 therefore measures the same path as R1."
+res "# R2's true client-cached numbers come from S3.2's ECS FUSE run (hot 0 GET)."
+res "# R3's pack cache lives on the ObjectStore layer and DOES serve plain RPC"
+res "# reads, which is itself a measured difference between the two caches."
 
 # ---------- stage p1: local smoke (direct loopback) ----------
 if [[ " $STAGES " == *" p1 "* ]]; then
+wall_check
 log "== P1: local smoke $N_SMOKE files x (A B C) + conflict + crash =="
 start_minio
 for g in A B C; do
@@ -650,6 +721,7 @@ fi
 
 # ---------- stage calib: proxy delay calibration via lightfs-bench ----------
 if [[ " $STAGES " == *" calib "* ]]; then
+wall_check
 log "== CALIB: bench raw-serial PUT direct vs proxy (target +${RTT_MS}ms RTT) =="
 start_minio
 "$BIN" create-bucket --config <(cat <<EOF
@@ -659,7 +731,7 @@ endpoint = "http://127.0.0.1:$MINIO_PORT"
 region = "us-east-1"
 bucket = "s33-calib"
 access_key = "minioadmin"
-secret_key = "minioadmin2025"
+secret_key = "minioadmin"
 path_style = true
 service = "s3"
 [metadata]
@@ -669,44 +741,51 @@ bind = "127.0.0.1:$SRV_PORT"
 EOF
 ) >>"$EXECLOG" 2>&1 || note "calib bucket (may exist)"
 
-bench_p50(){  # $1 = endpoint label
-    "$BIN" bench --s3-endpoint "$1" --bucket s33-calib \
-        --objects 30 --obj-size 4096 --scenario raw-serial > "$2" 2>>"$EXECLOG" \
-        || fail "bench raw-serial ($1)"
+bench_p50(){  # $1 = s3 endpoint; prints raw-serial GET p50 (ms)
+    "$BENCH" --s3-endpoint "$1" --bucket s33-calib \
+        --objects 30 --obj-size 4096 --large-mb 1 --scenario prepare,raw-serial \
+        > "$2" 2>>"$EXECLOG" || fail "bench prepare,raw-serial ($1)"
     python3 - "$2" <<'PY'
 import re, sys
 txt = open(sys.argv[1]).read()
-m = [l for l in txt.splitlines() if "raw-serial" in l and ("P50" in l or "p50" in l)]
-if not m:
-    # fall back: print whole tail for diagnosis
+line = [l for l in txt.splitlines() if l.startswith("raw-s3 serial")]
+if not line:
     print("PARSE-FAIL", file=sys.stderr); print(txt[-800:], file=sys.stderr); raise SystemExit(1)
-nums = re.findall(r"[Pp]50[=:\s]+([0-9.]+)", " ".join(m))
-print(nums[0] if nums else "PARSE-FAIL")
+m = re.search(r"p50\s+([0-9.]+)", line[-1])
+print(m.group(1) if m else "PARSE-FAIL")
 PY
 }
 direct_p50=$(bench_p50 "http://127.0.0.1:$MINIO_PORT" "$OUT/bench-direct.txt")
-start_proxy "$RTT_MS"
-proxy_p50=$(bench_p50 "http://127.0.0.1:$PROXY_PORT" "$OUT/bench-proxy.txt")
-stop_proxy
-python3 - "$direct_p50" "$proxy_p50" "$RTT_MS" <<'PY' || fail "calibration out of range"
-import sys
-d, p, target = float(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
-delta = p - d
-print(f"direct_put_p50={d:.2f} proxy_put_p50={p:.2f} delta={delta:.2f}ms target={target:.0f}ms")
-ok = 0.5 * target <= delta <= 1.8 * target and delta > 2.0
-sys.exit(0 if ok else 1)
-PY
-calib_line="CALIB direct_put_p50=${direct_p50}ms proxy_put_p50=${proxy_p50}ms delta=$(python3 -c "print(f'{$proxy_p50-$direct_p50:.2f}')")ms target=${RTT_MS}ms VERDICT=within-band"
-res "$calib_line (SIMULATED delay calibration; lightfs-bench raw-serial, 30 PUT)"
-log "$calib_line"
+# calibration feedback loop: the proxy parameter is ADJUSTED until the
+# MEASURED added round trip matches the target (the raw sleep model lands
+# a few ms high on this host; the measured value is what counts).
+rtt_param="$RTT_MS"
+calib_line=""
+for attempt in 1 2 3; do
+    start_proxy "$rtt_param"
+    proxy_p50=$(bench_p50 "http://127.0.0.1:$PROXY_PORT" "$OUT/bench-proxy-$attempt.txt")
+    stop_proxy
+    delta=$(python3 -c "print(f'{$proxy_p50-$direct_p50:.2f}')")
+    ok=$(python3 -c "print(1 if abs($delta-$RTT_MS) <= max(2.0, $RTT_MS*0.15) else 0)")
+    calib_line="CALIB attempt=$attempt param=${rtt_param}ms direct_get_p50=${direct_p50}ms proxy_get_p50=${proxy_p50}ms delta=${delta}ms target=${RTT_MS}ms verdict=$( [[ "$ok" == 1 ]] && echo MATCH || echo adjust )"
+    log "$calib_line"
+    [[ "$ok" == 1 ]] && break
+    rtt_param=$(python3 -c "print(max(1.0, round($RTT_MS * $RTT_MS / $delta, 1)))")
+done
+[[ "$ok" == 1 ]] || fail "calibration failed to converge (last: $calib_line)"
+echo "$rtt_param" > "$PROXY_PARAM_FILE"
+res "$calib_line (SIMULATED delay calibration; lightfs-bench prepare,raw-serial 30 SigV4 GETs; proxy parameter locked for rtt stages)"
 stop_minio
 fi
 
 # ---------- stage rtt100: 100 files through the proxy (SigV4 compat) ----------
 if [[ " $STAGES " == *" rtt100 "* ]]; then
-log "== RTT100: $N_SMOKE files x (A B C) through proxy (SIMULATED ${RTT_MS}ms) =="
+[[ -f "$PROXY_PARAM_FILE" ]] || fail "rtt100 needs the calib stage first (no $PROXY_PARAM_FILE)"
+RTT_PARAM=$(cat "$PROXY_PARAM_FILE")
+wall_check
+log "== RTT100: $N_SMOKE files x (A B C) through proxy (SIMULATED, param ${RTT_PARAM}ms -> calibrated ~${RTT_MS}ms RTT) =="
 start_minio
-start_proxy "$RTT_MS"
+start_proxy "$RTT_PARAM"
 S3_ENDPOINT="http://127.0.0.1:$PROXY_PORT"
 for g in A B C; do
     run_group "$g" "$N_SMOKE" rtt100 30
@@ -719,11 +798,14 @@ fi
 
 # ---------- stage rtt1000: the recorded experiment ----------
 if [[ " $STAGES " == *" rtt1000 "* ]]; then
-log "== RTT1000: $N_RTT files x (A B C) through proxy (SIMULATED ${RTT_MS}ms) =="
+[[ -f "$PROXY_PARAM_FILE" ]] || fail "rtt1000 needs the calib stage first (no $PROXY_PARAM_FILE)"
+RTT_PARAM=$(cat "$PROXY_PARAM_FILE")
+wall_check
+log "== RTT1000: $N_RTT files x (A B C) through proxy (SIMULATED, param ${RTT_PARAM}ms -> calibrated ~${RTT_MS}ms RTT) =="
 start_minio
-start_proxy "$RTT_MS"
+start_proxy "$RTT_PARAM"
 S3_ENDPOINT="http://127.0.0.1:$PROXY_PORT"
-for g in A B C; do
+for g in ${RTT_GROUPS:-A B C}; do
     run_group "$g" "$N_RTT" rtt1000 "$CAP2"
 done
 S3_ENDPOINT=""
@@ -734,10 +816,12 @@ fi
 
 # ---------- stage reads: R1/R2/R3 fairness (direct loopback) ----------
 if [[ " $STAGES " == *" reads "* ]]; then
+wall_check
 log "== READS: R1/R2/R3 $N_RTT files x 8MiB budget (direct) =="
 start_minio
 read_group(){  # $1 = R1|R2|R3
     local g=$1
+    wall_check
     start_stack "$g"
     local W="$OUT/read-$g"; mkdir -p "$W"
     # dataset: 300-file hot set + $N_RTT-file scan set, written under the
@@ -768,7 +852,7 @@ except Exception: pass'; } > "$W/cache.txt"
     res "READCACHE=$g $(tr '\n' ' ' < "$W/cache.txt")"
     stop_stack
 }
-for g in R1 R2 R3; do read_group "$g"; done
+for g in ${READS_GROUPS:-R1 R2 R3}; do read_group "$g"; done
 stop_minio
 log "== READS done =="
 fi

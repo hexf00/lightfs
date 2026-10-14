@@ -19,14 +19,23 @@ import asyncio
 
 
 async def one_way(reader, writer, delay, counters, key):
+    # Apply the one-way delay once per BURST, not per TCP chunk: an HTTP
+    # response commonly arrives as 2+ segments (headers, body) microseconds
+    # apart; sleeping on each would double-count the direction. A burst is a
+    # chunk arriving after >3ms of idle on this direction (i.e. a new request
+    # or a new response on a keep-alive connection).
+    last_rx = None
     try:
         while True:
             data = await reader.read(262144)
             if not data:
                 break
             counters[key] += len(data)
-            if delay > 0:
-                await asyncio.sleep(delay)
+            now = asyncio.get_event_loop().time()
+            if last_rx is None or (now - last_rx) > 0.003:
+                if delay > 0:
+                    await asyncio.sleep(delay)
+            last_rx = now
             writer.write(data)
             await writer.drain()
     except (ConnectionResetError, BrokenPipeError):
@@ -83,4 +92,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
