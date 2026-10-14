@@ -402,11 +402,12 @@ obj_count() {  # $1 = subpath filter ("" = all, "packs" = packs/ only)
 # (GDIR-relative: resolved per call, GDIR only exists once a group started)
 phase_begin() { metrics_snap "$GDIR/bef.txt"; }
 phase_end() {  # $1 = label, $2.. = extra key=val notes
+    local label=$1
+    shift
     metrics_snap "$GDIR/aft.txt"
     local extra=""
-    shift
     for kv in "$@"; do extra="$extra $kv"; done
-    res "PHASE=$1 group=$GROUP_DELTA_TAG delta: $(metrics_delta "$GDIR/bef.txt" "$GDIR/aft.txt")$extra"
+    res "PHASE=$label group=$GROUP_DELTA_TAG delta: $(metrics_delta "$GDIR/bef.txt" "$GDIR/aft.txt")$extra"
 }
 GROUP_DELTA_TAG="?"
 
@@ -852,7 +853,7 @@ PY
     python3 - "$MNT2_POINT" <<'PY' || note "[$g] DUAL rename-visibility FAIL"
 import hashlib, os, sys
 d = os.path.join(sys.argv[1], "dual", "a2")
-want = hashlib.sha256(("a\n" * 512)).hexdigest()
+want = hashlib.sha256(("a\n" * 512).encode()).hexdigest()
 bad = 0
 for i in range(200):
     p = os.path.join(d, "f%03d.bin" % i)
@@ -881,7 +882,9 @@ PY
     python3 - "$MNT" "$MNT2_POINT" <<'PY' || note "[$g] DUAL conflict FAIL"
 import hashlib, os, sys, threading
 m1, m2 = sys.argv[1], sys.argv[2]
-d1 = os.path.join(m1, "dual", "conf"); os.makedirs(d1, exist_ok=True)
+d1 = os.path.join(m1, "dual", "conf")
+os.makedirs(d1, exist_ok=True)
+os.makedirs(os.path.join(m2, "dual", "conf"), exist_ok=True)
 pat1 = (b"one\n" * 512); pat2 = (b"two\n" * 512)
 def put(root, pat):
     for i in range(10):
