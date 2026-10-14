@@ -938,9 +938,8 @@ PY
     if [[ "$g" == CF ]]; then
         log "[$g] FRAG churn + gc + shared-pack unlink safety"
         python3 - "$MNT" <<'PY'
-import os
+import os, sys, threading
 d = os.path.join(sys.argv[1], "frag"); os.makedirs(d, exist_ok=True)
-import threading
 def w(t):
     for i in range(t * 4, (t + 1) * 4):   # 25 threads x 4 = 100 files, one burst
         with open(os.path.join(d, "f%03d.bin" % i), "wb") as f:
@@ -965,7 +964,7 @@ PY
 
         # shared-pack safety: burst-created siblings survive sibling deletion + gc
         python3 - "$MNT" <<'PY'
-import os, threading
+import os, sys, threading
 d = os.path.join(sys.argv[1], "shared"); os.makedirs(d, exist_ok=True)
 def w(t):
     for i in range(t * 2, (t + 1) * 2):   # 25 threads x 2 = 50 files, one burst
