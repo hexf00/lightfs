@@ -53,7 +53,7 @@ DEPLOY_DIR="${DEPLOY_DIR:-$HOME/gate-s31}"
 MINIO_PORT="${MINIO_PORT:-9002}"
 CONSOLE_PORT="${CONSOLE_PORT:-9003}"
 SRV_PORT="${SRV_PORT:-18096}"
-GROUPS="${GROUPS:-A B C C2 D CF}"
+S31_GROUPS="${S31_GROUPS:-A B C C2 D CF}"
 N1="${N1:-6000}"            # files per dataset
 SIZE1="${SIZE1:-4096}"      # bytes per file
 THREADS="${THREADS:-16}"    # MT writers
@@ -88,7 +88,7 @@ if pgrep -af "minio server" >"$RUN/preexisting-minio.txt" 2>/dev/null; then
     log "NOTE: pre-existing minio process(es) detected - NOT touched:"
     sed 's/^/       /' "$RUN/preexisting-minio.txt" | tee -a "$EXECLOG"
 fi
-log "gate-s31 harness: run=$RUN groups=($GROUPS) minio=:$MINIO_PORT srv=:$SRV_PORT"
+log "gate-s31 harness: run=$RUN groups=($S31_GROUPS) minio=:$MINIO_PORT srv=:$SRV_PORT"
 
 ##############################################################################
 # MinIO lifecycle - OUR pid only, never pkill
@@ -1048,7 +1048,7 @@ PY
 res "# S3.1 comparison raw results — $(date -u +%FT%TZ)"
 res "# all request counts are server-side deltas over the labeled phase;"
 res "# latency percentiles are client-side (python over the FUSE mount), ms."
-for g in $GROUPS; do
+for g in $S31_GROUPS; do
     run_group "$g"
 done
 log "ALL GROUPS DONE -> $OUT/RESULTS.md"
