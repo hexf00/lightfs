@@ -888,7 +888,7 @@ os.makedirs(os.path.join(m2, "dual", "conf"), exist_ok=True)
 pat1 = (b"one\n" * 512); pat2 = (b"two\n" * 512)
 def put(root, pat):
     for i in range(10):
-        with open(os.path.join(root, "conf", "f%02d.bin" % i), "wb") as f:
+        with open(os.path.join(root, "dual", "conf", "f%02d.bin" % i), "wb") as f:
             f.write(pat); f.flush(); os.fsync(f.fileno())
 t1 = threading.Thread(target=put, args=(m1, pat1))
 t2 = threading.Thread(target=put, args=(m2, pat2))
