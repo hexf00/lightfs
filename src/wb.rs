@@ -48,15 +48,17 @@ use crate::object_store::ObjectStore;
 #[derive(Clone, Debug)]
 pub struct WbOptions {
     pub staging_dir: String,
-    /// Drain concurrency. >1 is SUPPORTED and safe, with an explicit
-    /// contract (S3.5): every task PUTs its own immutable version key and
-    /// lands through a single-statement per-node CAS, so two workers on the
-    /// same node yield exactly one winner + one visible conflict regardless
-    /// of network completion order; same-client flushes never race because
-    /// they COALESCE into one queued task while it is still queued. What
-    /// >1 does NOT mean: per-node FIFO ordering across separate tasks
-    /// (cross-client conflicts decide, the winner is never touched).
-    /// Verified by two_workers_reversed_completion_order_single_winner.
+    /// Drain concurrency. **1 is the only supported value in production**
+    /// (S3.5.1): values >1 are REJECTED at engine startup
+    /// (`resolve_wb_workers`), never silently clamped. Multi-worker
+    /// draining was demoted because its safety argument covered only
+    /// same-expected CAS races — there is NO per-node FIFO ordering
+    /// across SEPARATE queued tasks, so a later version could commit
+    /// before an earlier one lands. Re-enabling requires the per-node
+    /// ordering conditions listed in docs/S35-wb-consistency-report.md
+    /// (§B). The only multi-worker-shaped test that remains
+    /// (`cas_conflict_reversed_completion_order_single_winner`) drives
+    /// two manual drain threads and proves CONFLICT PROTECTION only.
     pub drain_workers: usize,
     /// S3.2 batch-pack drain: > 0 merges queued tasks into immutable pack
     /// objects in the background (one PUT per pack, per-file CAS after).
@@ -91,6 +93,30 @@ pub struct WriteBackEngine {
 }
 
 type TaskRow = crate::metadata::WbTask;
+
+/// Result of probing a node's pending staged content (S3.5.1 three-state
+/// contract - the old `Option<Vec<u8>>` could not distinguish "no pending"
+/// from "the probe kept losing the race", and callers read exhaustion as
+/// absence, serving a previous generation or a spurious EOF).
+pub(crate) enum PendingRead {
+    /// Served from a pinned staging snapshot (or its EOF, when the caller's
+    /// window starts at/after the staged size - an answer about a CURRENTLY
+    /// valid staged view, never about committed). S3.5 lifecycle: the
+    /// staging query→open window is closed open-before-validate - open
+    /// ENOENT means the drain committed right there (no pending), an open
+    /// fd PINS the bytes (POSIX unlink-open), and the post-open
+    /// re-validation distinguishes serve-fd / coalesced / committed.
+    Bytes(Vec<u8>),
+    /// Authoritative: no pending task existed at query time. The caller may
+    /// serve the committed object.
+    None,
+    /// The probe kept losing the race (a newer flush coalesced over the
+    /// task on every attempt; retry loop exhausted). NOT "no pending": the
+    /// caller must re-resolve the WHOLE read snapshot - falling through to
+    /// the committed branch here would serve a previous generation (or a
+    /// spurious EOF for a file with no committed object at all).
+    Retry,
+}
 
 impl WriteBackEngine {
     pub(crate) fn new(
@@ -261,32 +287,19 @@ impl WriteBackEngine {
         Ok(out)
     }
 
-    /// Content of a node's pending staged write, if any (read-your-writes
-    /// overlay; also backs projected stat).
-    ///
-    /// S3.5 lifecycle contract: a task dies through commit CAS → wb_finish
-    /// (row delete) → staging unlink, in that order. The only windows where
-    /// a concurrent read can be hurt are BETWEEN the staging-path QUERY and
-    /// the staging-file OPEN. Both are handled here without locks:
-    /// - open hits ENOENT: the drain finished in that window - the task is
-    ///   committed now, so report "no pending" and let the caller serve the
-    ///   committed object;
-    /// - open succeeded: the fd PINS the bytes (POSIX unlink-open
-    ///   semantics), so the later wb_finish+unlink cannot invalidate the
-    ///   read. A post-open re-validation distinguishes "task still on this
-    ///   staging file" (serve the fd) from "a newer flush coalesced over
-    ///   this task" (re-resolve, latest wins) from "task finished right
-    ///   after the open" (the fd holds exactly the committed bytes - serve
-    ///   them).
-    /// Returns the slice [offset, offset+len) clamped to the TASK's staged
-    /// size (the projected EOF) - callers pass their raw window.
-    pub fn read_pending(&self, node_id: i64, offset: u64, len: u64) -> Result<Option<Vec<u8>>> {
+    /// Probe the node's pending staged content (read-your-writes overlay;
+    /// also backs projected stat). See [`PendingRead`] for the three-state
+    /// contract; the S3.5 lifecycle notes live on the enum variants.
+    pub(crate) fn read_pending(&self, node_id: i64, offset: u64, len: u64) -> Result<PendingRead> {
         for _ in 0..3 {
             let Some((staging, size)) = self.meta.wb_latest_staging(node_id)? else {
-                return Ok(None);
+                return Ok(PendingRead::None);
             };
+            // EOF fast path against the CURRENT staged view: a pending task
+            // exists, so this is a statement about the staged size, never a
+            // license for the caller to skip the overlay.
             if offset >= size as u64 || len == 0 {
-                return Ok(Some(Vec::new()));
+                return Ok(PendingRead::Bytes(Vec::new()));
             }
             let end = (offset + len).min(size as u64);
             #[cfg(test)]
@@ -298,21 +311,23 @@ impl WriteBackEngine {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e.into()),
             };
+            use std::io::{Read, Seek, SeekFrom};
             match self.meta.wb_latest_staging(node_id)? {
                 Some((p, _)) if p == staging => {}
                 Some(_) => continue, // coalesced onto a newer staging file
                 None => {}           // finished right after the open: fd == committed
             }
-            use std::io::{Read, Seek, SeekFrom};
             f.seek(SeekFrom::Start(offset))?;
             let mut buf = vec![0u8; (end - offset) as usize];
             f.read_exact(&mut buf)?;
-            return Ok(Some(buf));
+            return Ok(PendingRead::Bytes(buf));
         }
-        // Persistently raced (three coalesces in a row): report no pending;
-        // the caller re-resolves and serves the committed object, which by
-        // then can only be this task's own successor content.
-        Ok(None)
+        // S3.5.1: three coalesces in a row is a RACE, not an absence. The
+        // old behavior (Ok(None)) made Core fall through to the committed
+        // branch - serving EOF for a never-committed file or the previous
+        // generation for an overwritten one. Report Retry explicitly; the
+        // caller re-resolves the entire snapshot.
+        Ok(PendingRead::Retry)
     }
 
     /// Projected stat for a node with pending tasks: (latest staged size,
@@ -677,10 +692,13 @@ impl WriteBackEngine {
         // Object unreadable = cannot verify = NOT committed (conservative:
         // the normal conflict path then decides, the winner stays intact).
         let read = if let (Some(off), Some(plen)) = (n.pack_off, n.pack_len) {
-            self.objects.get(key, Some(crate::object_store::Range {
-                start: off as u64,
-                len: plen as u64,
-            }))
+            self.objects.get(
+                key,
+                Some(crate::object_store::Range {
+                    start: off as u64,
+                    len: plen as u64,
+                }),
+            )
         } else {
             self.objects.get(key, None)
         };
@@ -702,9 +720,11 @@ impl WriteBackEngine {
     }
 
     /// Spawn `workers` drain threads. Prototype lifetime: detached threads
-    /// that end when the process ends or `stop()` is called.
+    /// that end when the process ends or `stop()` is called. The caller
+    /// (engine startup via `resolve_wb_workers`) owns the validation —
+    /// this takes the count verbatim, no clamping.
     pub(crate) fn spawn_workers(self: &Arc<Self>, workers: usize) {
-        for _ in 0..workers.max(1) {
+        for _ in 0..workers {
             let eng = self.clone();
             std::thread::spawn(move || {
                 loop {
@@ -1254,7 +1274,12 @@ mod tests {
     fn mixed_batch_with_rename_and_unlink_accounting() {
         let c = batch_core("mixed", 1 << 20, 0);
         let bodies: [&[u8]; 6] = [
-            b"file-zero", b"file-one", b"file-two", b"file-three", b"file-four", b"file-five",
+            b"file-zero",
+            b"file-one",
+            b"file-two",
+            b"file-three",
+            b"file-four",
+            b"file-five",
         ];
         let mut expect: Vec<(String, &[u8])> = Vec::new();
         for (i, body) in bodies.iter().enumerate() {
@@ -1293,7 +1318,8 @@ mod tests {
             assert_eq!(
                 c.read(&cur, 0, 1000).unwrap(),
                 *body,
-                "{} content after mixed batch", cur
+                "{} content after mixed batch",
+                cur
             );
         }
         // the unlinked pair: identity gone, no residue rows
@@ -1347,7 +1373,8 @@ mod tests {
             queue_max_tasks: 0,
         };
         let body = b"survives a crash";
-        let store: StdArc<dyn crate::object_store::ObjectStore> = StdArc::new(MemObjectStore::new());
+        let store: StdArc<dyn crate::object_store::ObjectStore> =
+            StdArc::new(MemObjectStore::new());
         let node_id = {
             let c = Core::with_options(
                 StdArc::new(SqliteMetadataStore::open(db.to_string_lossy().as_ref()).unwrap()),
@@ -1363,9 +1390,7 @@ mod tests {
             // then "die" before wb_finish
             let task = c.metadata().wb_active_tasks().unwrap().pop().unwrap();
             let vkey = crate::core::new_version_key_for(task.node_id);
-            c.objects()
-                .put(&vkey, body)
-                .unwrap();
+            c.objects().put(&vkey, body).unwrap();
             c.metadata()
                 .commit_content_cas(
                     task.node_id,
@@ -1408,13 +1433,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// S3.5 red test 4: two drain workers, two tasks on ONE node (cross-
-    /// client same-expected), network completion order REVERSED via a
-    /// delay-injecting store. CAS anchoring must yield exactly one winner,
-    /// one visible conflict, zero silent losses - multi-worker drain is
-    /// safe BECAUSE every task PUTs its own immutable version key.
+    /// S3.5 red test 4 (renamed S3.5.1): two MANUAL drain threads, two
+    /// tasks on ONE node (cross-client same-expected), network completion
+    /// order REVERSED via a delay-injecting store. CAS anchoring yields
+    /// exactly one winner, one visible conflict, zero silent losses.
+    /// **Scope statement (S3.5.1): this proves CONFLICT PROTECTION of the
+    /// single-statement CAS under reversed completion — it is NOT evidence
+    /// that multiple drain workers preserve per-node FIFO order across
+    /// separate queued tasks. Multi-worker draining is disabled for
+    /// production (startup refuses >1); the two threads here simulate
+    /// concurrent completion of two ALREADY-CLAIMED tasks, which real
+    /// workers would only reach if the ordering gap were closed.**
     #[test]
-    fn two_workers_reversed_completion_order_single_winner() {
+    fn cas_conflict_reversed_completion_order_single_winner() {
         struct SlowFirstPut {
             inner: MemObjectStore,
             gate: std::sync::atomic::AtomicU64,
@@ -1544,6 +1575,89 @@ mod tests {
             served == b"client A content" || served == b"client B content",
             "served content must be one of the two clients' staged bytes"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S3.5.1 B.3: the ONE supported worker configuration. Same file,
+    /// consecutive flushes from the same client land in the queue as
+    /// separate enqueue attempts; the queued-period coalesce folds them
+    /// into ONE task (later expected replaces the staging), and the single
+    /// drain commits the final content at the first version. This is the
+    /// ordering guarantee production actually relies on — the cross-client
+    /// same-expected race above only proves conflict protection.
+    #[test]
+    fn single_worker_same_file_consecutive_flushes_coalesce_and_land() {
+        use crate::core::DEFAULT_SUPERSEDED_SECS;
+        use crate::metadata::sqlite::SqliteMetadataStore;
+        use crate::object_store::mem::MemObjectStore;
+        type StdArc<T> = std::sync::Arc<T>;
+        let dir = std::env::temp_dir().join(format!(
+            "lightfs-wbsame-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Core::with_options(
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            StdArc::new(MemObjectStore::new()),
+            DEFAULT_SUPERSEDED_SECS,
+            None,
+            Some(WbOptions {
+                staging_dir: dir.join("staging").to_string_lossy().to_string(),
+                drain_workers: 0, // manual drain, one claim at a time
+                batch_pack_bytes: 0,
+                batch_max_wait_ms: 0,
+                queue_max_tasks: 0,
+            }),
+        )
+        .unwrap();
+        c.create("/f", 0o644).unwrap();
+        let node = c.lookup("/f").unwrap();
+
+        // flush #1 (expected v0) then flush #2 (expected v1 = projected
+        // after #1) with NOTHING drained in between: the queued-period
+        // coalesce must fold #2 onto #1's task (staging replaced).
+        let r1 = c
+            .wb()
+            .unwrap()
+            .write_deferred(&node, 0, &mut std::io::Cursor::new(b"first".to_vec()), 5)
+            .unwrap();
+        let r2 = c
+            .wb()
+            .unwrap()
+            .write_deferred(
+                &r1,
+                r1.version,
+                &mut std::io::Cursor::new(b"second-generation".to_vec()),
+                17,
+            )
+            .unwrap();
+        assert_eq!(r1.version, 1, "flush #1 projects committed v0 + 1 pending");
+        assert_eq!(
+            r2.version, 1,
+            "coalesce must NOT bump the projected version"
+        );
+
+        // one drain, one task, one CAS: the FINAL staging wins wholesale
+        assert!(c.wb().unwrap().drain_once().unwrap());
+        assert_eq!(
+            c.metrics.wb_coalesced.load(Ordering::Relaxed),
+            1,
+            "flush #2 must be accounted as a coalesce"
+        );
+        assert_eq!(c.metrics.wb_cas_ok.load(Ordering::Relaxed), 1);
+        assert_eq!(c.wb().unwrap().queue_counts(), (0, 0, 0));
+        let served = c.read("/f", 0, 100).unwrap();
+        assert_eq!(served, b"second-generation", "the later flush must win");
+        let final_node = c.lookup("/f").unwrap();
+        assert_eq!(
+            final_node.version, 1,
+            "one CAS: v0 -> v1, no intermediate commits"
+        );
+        assert_eq!(final_node.size, 17);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

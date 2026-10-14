@@ -243,13 +243,12 @@ impl Core {
     }
 
     /// Start the write-back drain workers (engine/server startup). Workers
-    /// are daemon-style: they end with the process or at `stop_wb()`.
-    pub fn start_wb_workers(&self) {
+    /// are daemon-style: they end with the process or at `stop_wb()`. The
+    /// count comes from engine startup's `resolve_wb_workers` (config +
+    /// LIGHTFS_WB_WORKERS override, validated there); this takes it
+    /// verbatim so there is exactly ONE wiring path, not an env side channel.
+    pub fn start_wb_workers(&self, workers: usize) {
         if let Some(wb) = &self.wb {
-            let workers = std::env::var("LIGHTFS_WB_WORKERS")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(1);
             wb.spawn_workers(workers);
         }
     }
@@ -479,12 +478,11 @@ impl Core {
         // must report the projected size/version here too — the committed
         // view (size 0 for a just-written file) would blind every stat
         // within the attr_ttl window.
-        Ok(self
-            .meta
+        self.meta
             .list_children(node.id)?
             .into_iter()
             .map(|child| self.finish_lookup(child))
-            .collect::<Result<Vec<_>>>()?)
+            .collect()
     }
 
     pub fn mkdir(&self, path: &str, mode: u32) -> Result<Node> {
@@ -639,28 +637,37 @@ impl Core {
     /// 1. staged bytes (read_pending is open-before-validate and
     ///    re-resolves internally when the drain lands in its window);
     /// 2. the committed object of a FRESHLY fetched node, validated
-    ///    afterwards against the projected view - a transition during the
+    ///    afterwards against the committed view - a transition during the
     ///    read (enqueue, coalesce, commit) retries, so a retired key can
     ///    never serve a previous generation.
+    ///
     /// The byte range is clamped against whichever view is authoritative
     /// for the branch taken.
     fn read_node_by_id(&self, node_id: i64, offset: u64, size: u64) -> Result<Vec<u8>> {
         let wb_mode = self.wb.is_some();
         let attempts = if wb_mode { 4 } else { 1 };
         let mut best: Option<Vec<u8>> = None;
+        let mut pending_raced = false;
         for _ in 0..attempts {
             // Staged bytes first, by node id: read_pending clamps against
             // the TASK's staged size and re-resolves internally when the
-            // drain lands inside its query/open window.
+            // drain lands inside its query/open window. Retry means the
+            // probe kept losing a coalesce race - the whole snapshot must
+            // be re-resolved; treating that as "no pending" would serve a
+            // previous generation or a spurious EOF.
             if let Some(wb) = &self.wb {
                 match wb.read_pending(node_id, offset, size)? {
-                    Some(staged) => {
+                    crate::wb::PendingRead::Bytes(staged) => {
                         self.metrics
                             .bytes_read
                             .fetch_add(staged.len() as u64, Ordering::Relaxed);
                         return Ok(staged);
                     }
-                    None => {}
+                    crate::wb::PendingRead::None => {}
+                    crate::wb::PendingRead::Retry => {
+                        pending_raced = true;
+                        continue;
+                    }
                 }
             }
             // Committed branch: fetch the node AT THIS INSTANT - it may
@@ -685,18 +692,21 @@ impl Core {
                     if !wb_mode {
                         return Ok(bytes);
                     }
+                    // Validate against the COMMITTED views actually read,
+                    // never the projected ones: the projection folds
+                    // pending count into the version, so a commit landing
+                    // mid-read (committed +1, pending -1) keeps the
+                    // projected version AND size identical and would bless
+                    // the previous generation's bytes.
                     let unchanged = match self.meta.get_node(node_id)? {
-                        Some(now) => {
-                            let now = self.finish_lookup(now)?;
-                            let snap = self.finish_lookup(raw.clone())?;
-                            now.version == snap.version && now.size == snap.size
-                        }
+                        Some(now) => now.version == raw.version && now.size == raw.size,
                         None => false,
                     };
                     if unchanged {
                         return Ok(bytes);
                     }
                     best = Some(bytes); // raced: retry, but keep as a valid instant
+                    pending_raced = false; // the committed branch made progress
                 }
                 Err(Error::NotFound(_)) if wb_mode => {
                     // the node's previous object was retired mid-read; the
@@ -705,6 +715,14 @@ impl Core {
                 }
                 Err(e) => return Err(e),
             }
+        }
+        if pending_raced {
+            // The last failure was a pending-layer race: any `best` here is
+            // several generations behind the staged truth. An explicit error
+            // beats silently serving stale bytes.
+            return Err(Error::Storage(format!(
+                "write-back read of node {node_id} kept racing pending updates; retries exhausted"
+            )));
         }
         // Every attempt raced a transition; `best` was still read from a
         // valid source at one instant, which is a legal linearized read.
@@ -1854,7 +1872,10 @@ mod tests {
         let snapshot = c.lookup("/f").unwrap(); // projected: size 14, v1, no key
         c.wb().unwrap().drain_once().unwrap(); // commit + finish + remove staging
         let got = c.read_node_by_id(snapshot.id, 0, 14).unwrap();
-        assert_eq!(got, b"generation one", "stale snapshot must resolve to the committed content");
+        assert_eq!(
+            got, b"generation one",
+            "stale snapshot must resolve to the committed content"
+        );
     }
 
     /// Overwrite: the stale snapshot still points at the PREVIOUS
@@ -1870,7 +1891,10 @@ mod tests {
         let snapshot = c.lookup("/f").unwrap(); // projected v2, object_key still gen-1
         c.wb().unwrap().drain_once().unwrap();
         let got = c.read_node_by_id(snapshot.id, 0, 11).unwrap();
-        assert_eq!(got, b"new-content", "must not serve the previous generation through the stale key");
+        assert_eq!(
+            got, b"new-content",
+            "must not serve the previous generation through the stale key"
+        );
     }
 
     /// readdir feeds the mount's readdirplus seed: a child with staged
@@ -1889,8 +1913,163 @@ mod tests {
             .iter()
             .find(|n| n.name == "f")
             .expect("child f listed");
-        assert_eq!(f.size, 12, "readdir must serve the staged size, not the committed 0");
+        assert_eq!(
+            f.size, 12,
+            "readdir must serve the staged size, not the committed 0"
+        );
         assert_eq!(f.version, 1, "readdir must serve the projected version");
+    }
+
+    // ------------------------------------------------------------------
+    // S3.5.1 red tests: read_pending's internal retry loop can exhaust
+    // under a persistent coalescer. Exhaustion must surface as an explicit
+    // retry to Core (which re-resolves the WHOLE snapshot), never as "no
+    // pending" — that disguise makes a brand-new file read as EOF and an
+    // overwritten file read as its previous committed generation.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn red_pending_coalesce_race_on_new_file_must_not_read_as_eof() {
+        // A1: a file with NO committed object ever, staging rewritten
+        // under the reader until the probe loop exhausts. The read must
+        // return the FINAL generation's full content - not zero bytes,
+        // not a spurious EOF from the committed size 0.
+        let c = wb_core("pendcoalesce1");
+        c.create("/f", 0o644).unwrap();
+        flush(&c, "/f", b"gen-1", Some(0)); // queued, never drained
+        let node = c.lookup("/f").unwrap();
+
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let expected = Arc::new(std::sync::atomic::AtomicI64::new(1));
+        let eng = Arc::clone(c.wb().unwrap());
+        let node_for_hook = node.clone();
+        let probes_for_hook = Arc::clone(&probes);
+        let expected_for_hook = Arc::clone(&expected);
+        *c.wb().unwrap().test_hook_before_open.lock().unwrap() = Some(Box::new(move || {
+            let n = probes_for_hook.fetch_add(1, Ordering::Relaxed);
+            if n >= 3 {
+                return; // stop coalescing: the read may now succeed
+            }
+            let body = format!("gen-{}", n + 2); // gen-2, gen-3, gen-4
+            let exp = expected_for_hook.fetch_add(1, Ordering::Relaxed) + 1;
+            eng.write_deferred(
+                &node_for_hook,
+                exp,
+                &mut std::io::Cursor::new(body.into_bytes()),
+                5,
+            )
+            .unwrap();
+        }));
+
+        let got = c.read("/f", 0, 64).unwrap();
+        assert_eq!(
+            got, b"gen-4",
+            "must serve the final staged generation, not EOF"
+        );
+        assert!(
+            probes.load(Ordering::Relaxed) >= 3,
+            "hook must have raced the probe loop"
+        );
+
+        *c.wb().unwrap().test_hook_before_open.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn red_pending_coalesce_race_on_committed_file_must_not_serve_base() {
+        // A2: `base` is committed, a rewrite is queued, and the reader
+        // keeps losing the coalesce race. The read must NOT fall back to
+        // the committed `base` (the projected-view comparison made both
+        // snapshots look identical and served it) - it must serve the
+        // latest staged generation.
+        let c = wb_core("pendcoalesce2");
+        c.create("/f", 0o644).unwrap();
+        flush(&c, "/f", b"base", Some(0));
+        c.wb().unwrap().drain_once().unwrap(); // commit base
+        flush(&c, "/f", b"gen-1", Some(1)); // queued rewrite
+        let node = c.lookup("/f").unwrap();
+
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let expected = Arc::new(std::sync::atomic::AtomicI64::new(1));
+        let eng = Arc::clone(c.wb().unwrap());
+        let node_for_hook = node.clone();
+        let probes_for_hook = Arc::clone(&probes);
+        let expected_for_hook = Arc::clone(&expected);
+        *c.wb().unwrap().test_hook_before_open.lock().unwrap() = Some(Box::new(move || {
+            let n = probes_for_hook.fetch_add(1, Ordering::Relaxed);
+            if n >= 5 {
+                return; // >3 internal retries: the loop MUST have exhausted
+            }
+            let body = format!("gen-{}", n + 2);
+            let exp = expected_for_hook.fetch_add(1, Ordering::Relaxed) + 1;
+            eng.write_deferred(
+                &node_for_hook,
+                exp,
+                &mut std::io::Cursor::new(body.into_bytes()),
+                5,
+            )
+            .unwrap();
+        }));
+
+        let got = c.read("/f", 0, 64).unwrap();
+        assert_eq!(
+            got, b"gen-6",
+            "must serve the latest staged bytes, never committed base"
+        );
+        assert!(
+            probes.load(Ordering::Relaxed) >= 3,
+            "the internal retry loop must have been exhausted (5 coalesces)"
+        );
+
+        *c.wb().unwrap().test_hook_before_open.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn red_pending_permanent_coalesce_race_ends_in_explicit_error() {
+        // A2 variant: the coalescer NEVER stops. Every retry loses; the
+        // read must end in an explicit error - silently serving the
+        // committed `base` (the old disguise) is forbidden.
+        let c = wb_core("pendcoalesce3");
+        c.create("/f", 0o644).unwrap();
+        flush(&c, "/f", b"base", Some(0));
+        c.wb().unwrap().drain_once().unwrap();
+        flush(&c, "/f", b"gen-1", Some(1));
+        let node = c.lookup("/f").unwrap();
+
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let expected = Arc::new(std::sync::atomic::AtomicI64::new(1));
+        let eng = Arc::clone(c.wb().unwrap());
+        let node_for_hook = node.clone();
+        let probes_for_hook = Arc::clone(&probes);
+        let expected_for_hook = Arc::clone(&expected);
+        *c.wb().unwrap().test_hook_before_open.lock().unwrap() = Some(Box::new(move || {
+            let n = probes_for_hook.fetch_add(1, Ordering::Relaxed);
+            let body = format!("gen-{}", n + 2);
+            let exp = expected_for_hook.fetch_add(1, Ordering::Relaxed) + 1;
+            eng.write_deferred(
+                &node_for_hook,
+                exp,
+                &mut std::io::Cursor::new(body.into_bytes()),
+                5,
+            )
+            .unwrap();
+        }));
+
+        let got = c.read("/f", 0, 64);
+        assert!(
+            got.is_err(),
+            "exhausted retries must error, not serve stale content"
+        );
+        let msg = format!("{}", got.unwrap_err());
+        assert!(
+            msg.contains("race") || msg.contains("racing") || msg.contains("retry"),
+            "error must name the race/retry, got: {msg}"
+        );
+        assert!(
+            probes.load(Ordering::Relaxed) > 3,
+            "the outer loop must have retried past the internal exhaustion"
+        );
+
+        *c.wb().unwrap().test_hook_before_open.lock().unwrap() = None;
     }
 }
 
@@ -2272,5 +2451,4 @@ mod symlink_tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 }
