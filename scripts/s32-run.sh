@@ -306,15 +306,17 @@ wb_counts() {
 import json, sys
 try:
     r = json.load(sys.stdin)["result"]
-    print("%s %s" % (r.get("wb_enqueued", -1), r.get("wb_drained", -1)))
+    print("%s %s" % (r.get("wb_queued", -1), r.get("wb_draining", -1)))
 except Exception: print("-1 -1")
 '
 }
-wb_wait_drained() {  # $1 = timeout_s -> stdout: seconds until drained==enqueued
+wb_wait_drained() {  # $1 = timeout_s -> stdout: seconds until queue is idle
+    # idle = no queued AND no draining tasks; dead-lettered rows are
+    # terminal outcomes (conflict / lost staging), not pending work
     local t0=$(date +%s) deadline=$(( $(date +%s) + $1 ))
     while (( $(date +%s) < deadline )); do
-        read -r enq drn <<< "$(wb_counts)"
-        [[ "$enq" == "$drn" && "$enq" != "-1" ]] && { echo $(( $(date +%s) - t0 )); return 0; }
+        read -r q d <<< "$(wb_counts)"
+        [[ "$q" == "0" && "$d" == "0" ]] && { echo $(( $(date +%s) - t0 )); return 0; }
         sleep 0.1
     done
     echo "-1"; return 1

@@ -153,6 +153,12 @@ fn handle(core: &Core, method: &str, params: &Value) -> Result<Value> {
                 "wb_enqueued": g(&m.wb_enqueued), "wb_drained": g(&m.wb_drained),
                 "wb_conflicts": g(&m.wb_conflicts),
                 "wb_packs": g(&m.wb_packs), "wb_overflow": g(&m.wb_overflow),
+                // live queue state: "fully drained" = queued == 0 AND
+                // draining == 0 (dead-lettered rows are terminal, not
+                // pending work)
+                "wb_queued": core.wb().map(|w| w.queue_counts().0).unwrap_or(0),
+                "wb_draining": core.wb().map(|w| w.queue_counts().1).unwrap_or(0),
+                "wb_dead": core.wb().map(|w| w.queue_counts().2).unwrap_or(0),
             }))
         }
         "lookup" | "getattr" | "open" => {
