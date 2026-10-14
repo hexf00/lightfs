@@ -48,6 +48,15 @@ use crate::object_store::ObjectStore;
 #[derive(Clone, Debug)]
 pub struct WbOptions {
     pub staging_dir: String,
+    /// Drain concurrency. >1 is SUPPORTED and safe, with an explicit
+    /// contract (S3.5): every task PUTs its own immutable version key and
+    /// lands through a single-statement per-node CAS, so two workers on the
+    /// same node yield exactly one winner + one visible conflict regardless
+    /// of network completion order; same-client flushes never race because
+    /// they COALESCE into one queued task while it is still queued. What
+    /// >1 does NOT mean: per-node FIFO ordering across separate tasks
+    /// (cross-client conflicts decide, the winner is never touched).
+    /// Verified by two_workers_reversed_completion_order_single_winner.
     pub drain_workers: usize,
     /// S3.2 batch-pack drain: > 0 merges queued tasks into immutable pack
     /// objects in the background (one PUT per pack, per-file CAS after).
@@ -73,6 +82,12 @@ pub struct WriteBackEngine {
     wake: Condvar,
     idle: Mutex<usize>,
     stop: AtomicBool,
+    /// Test-only determinism seam: fired between the staging-path QUERY and
+    /// the staging-file OPEN in read_pending, so a test can run a full
+    /// drain inside that window and pin the race deterministically. Never
+    /// set outside #[cfg(test)] builds.
+    #[cfg(test)]
+    pub(crate) test_hook_before_open: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 type TaskRow = crate::metadata::WbTask;
@@ -98,6 +113,8 @@ impl WriteBackEngine {
             wake: Condvar::new(),
             idle: Mutex::new(0),
             stop: AtomicBool::new(false),
+            #[cfg(test)]
+            test_hook_before_open: Mutex::new(None),
         })
     }
 
@@ -231,6 +248,7 @@ impl WriteBackEngine {
             self.now(),
         )?;
         if let Some(old) = replaced_staging {
+            self.metrics.wb_coalesced.fetch_add(1, Ordering::Relaxed);
             let _ = std::fs::remove_file(old); // coalesced away; row no longer references it
         }
         self.metrics.wb_enqueued.fetch_add(1, Ordering::Relaxed);
@@ -244,34 +262,68 @@ impl WriteBackEngine {
     }
 
     /// Content of a node's pending staged write, if any (read-your-writes
-    /// overlay; also backs projected stat). Returns the slice [offset,
-    /// offset+len) zero-padded reads past EOF are handled by the caller's
-    /// size clamp — this returns exactly the requested window.
+    /// overlay; also backs projected stat).
+    ///
+    /// S3.5 lifecycle contract: a task dies through commit CAS → wb_finish
+    /// (row delete) → staging unlink, in that order. The only windows where
+    /// a concurrent read can be hurt are BETWEEN the staging-path QUERY and
+    /// the staging-file OPEN. Both are handled here without locks:
+    /// - open hits ENOENT: the drain finished in that window - the task is
+    ///   committed now, so report "no pending" and let the caller serve the
+    ///   committed object;
+    /// - open succeeded: the fd PINS the bytes (POSIX unlink-open
+    ///   semantics), so the later wb_finish+unlink cannot invalidate the
+    ///   read. A post-open re-validation distinguishes "task still on this
+    ///   staging file" (serve the fd) from "a newer flush coalesced over
+    ///   this task" (re-resolve, latest wins) from "task finished right
+    ///   after the open" (the fd holds exactly the committed bytes - serve
+    ///   them).
+    /// Returns the slice [offset, offset+len) clamped to the TASK's staged
+    /// size (the projected EOF) - callers pass their raw window.
     pub fn read_pending(&self, node_id: i64, offset: u64, len: u64) -> Result<Option<Vec<u8>>> {
-        let Some((staging, size)) = self.meta.wb_latest_staging(node_id)? else {
-            return Ok(None);
-        };
-        if offset >= size as u64 || len == 0 {
-            return Ok(Some(Vec::new()));
+        for _ in 0..3 {
+            let Some((staging, size)) = self.meta.wb_latest_staging(node_id)? else {
+                return Ok(None);
+            };
+            if offset >= size as u64 || len == 0 {
+                return Ok(Some(Vec::new()));
+            }
+            let end = (offset + len).min(size as u64);
+            #[cfg(test)]
+            if let Some(hook) = self.test_hook_before_open.lock().unwrap().as_ref() {
+                hook(); // test seam: a full drain may land right here
+            }
+            let mut f = match std::fs::File::open(&staging) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            match self.meta.wb_latest_staging(node_id)? {
+                Some((p, _)) if p == staging => {}
+                Some(_) => continue, // coalesced onto a newer staging file
+                None => {}           // finished right after the open: fd == committed
+            }
+            use std::io::{Read, Seek, SeekFrom};
+            f.seek(SeekFrom::Start(offset))?;
+            let mut buf = vec![0u8; (end - offset) as usize];
+            f.read_exact(&mut buf)?;
+            return Ok(Some(buf));
         }
-        let end = (offset + len).min(size as u64);
-        let f = std::fs::File::open(&staging)?;
-        use std::io::{Read, Seek, SeekFrom};
-        let mut f = f;
-        f.seek(SeekFrom::Start(offset))?;
-        let mut buf = vec![0u8; (end - offset) as usize];
-        f.read_exact(&mut buf)?;
-        Ok(Some(buf))
+        // Persistently raced (three coalesces in a row): report no pending;
+        // the caller re-resolves and serves the committed object, which by
+        // then can only be this task's own successor content.
+        Ok(None)
     }
 
     /// Projected stat for a node with pending tasks: (latest staged size,
     /// committed version + pending task count). None = no pending tasks.
-    pub fn projected(&self, node: &Node) -> Option<(i64, i64)> {
-        self.meta
-            .wb_projection(node.id)
-            .ok()
-            .flatten()
-            .map(|(size, pending)| (size, node.version + pending))
+    /// Errors propagate: a metadata failure must never silently degrade a
+    /// lookup to the un-projected (stale-size) node.
+    pub fn projected(&self, node: &Node) -> Result<Option<(i64, i64)>> {
+        Ok(self
+            .meta
+            .wb_projection(node.id)?
+            .map(|(size, pending)| (size, node.version + pending)))
     }
 
     /// Cancel queued tasks for a node (unlink): queued staged bytes never
@@ -280,6 +332,14 @@ impl WriteBackEngine {
     pub fn cancel(&self, node_id: i64) {
         match self.meta.wb_cancel_queued(node_id) {
             Ok(paths) => {
+                if !paths.is_empty() {
+                    // S3.5: cancellations are a TERMINAL outcome - count
+                    // them so enqueued == drained+conflicts+discarded
+                    // +cancelled+dead always reconciles.
+                    self.metrics
+                        .wb_cancelled
+                        .fetch_add(paths.len() as u64, Ordering::Relaxed);
+                }
                 for p in paths {
                     let _ = std::fs::remove_file(p);
                 }
@@ -354,6 +414,7 @@ impl WriteBackEngine {
         match outcome {
             Ok(()) => {
                 self.metrics.metadata_tx.fetch_add(1, Ordering::Relaxed);
+                self.metrics.wb_cas_ok.fetch_add(1, Ordering::Relaxed);
                 if let Some(old_key) = &node.object_key {
                     self.retire(old_key);
                 }
@@ -362,6 +423,15 @@ impl WriteBackEngine {
                 self.metrics.wb_drained.fetch_add(1, Ordering::Relaxed);
             }
             Err(Error::Conflict { .. }) => {
+                // Crash between CAS and wb_finish: the commit LANDED - the
+                // recovered task must finish as a success, never as a
+                // conflict (S3.5 recovery semantics).
+                if self.task_already_committed(&task, &content)? {
+                    self.meta.wb_finish(task.id)?;
+                    let _ = std::fs::remove_file(&task.staging);
+                    self.metrics.wb_drained.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
                 // Never corrupt the winner: dead-letter with bytes retained.
                 self.metrics.conflicts.fetch_add(1, Ordering::Relaxed);
                 self.metrics.wb_conflicts.fetch_add(1, Ordering::Relaxed);
@@ -374,7 +444,9 @@ impl WriteBackEngine {
                 );
             }
             Err(Error::NotFound(_)) => {
-                // raced with unlink after the get_node above
+                // raced with unlink after the get_node above: TERMINAL
+                // discard, counted (S3.5 - never a silent disappearance)
+                self.metrics.wb_discarded.fetch_add(1, Ordering::Relaxed);
                 let _ = self.objects.delete(&version_key);
                 self.meta.wb_finish(task.id)?;
                 let _ = std::fs::remove_file(&task.staging);
@@ -514,12 +586,12 @@ impl WriteBackEngine {
         self.meta.mark_pack_uploaded(&pack_key, self.now())?;
         for (task, off, len) in entries {
             let hash = crate::pack::content_hash(&buf[off..off + len]);
-            let old_key = self
-                .meta
-                .get_node(task.node_id)
-                .ok()
-                .flatten()
-                .and_then(|n| n.object_key);
+            // Errors propagate: a get_node failure must not silently skip
+            // the retire of the previous generation (S3.5 swallow fix).
+            let old_key = match self.meta.get_node(task.node_id)? {
+                Some(n) => n.object_key,
+                None => None,
+            };
             let outcome = self.meta.commit_content_cas_pack(
                 task.node_id,
                 task.expected,
@@ -533,6 +605,7 @@ impl WriteBackEngine {
             match outcome {
                 Ok(()) => {
                     self.metrics.metadata_tx.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.wb_cas_ok.fetch_add(1, Ordering::Relaxed);
                     if let Some(k) = old_key {
                         self.retire(&k);
                     }
@@ -541,6 +614,15 @@ impl WriteBackEngine {
                     self.metrics.wb_drained.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(Error::Conflict { .. }) => {
+                    // Crash between the per-file CAS and wb_finish: the
+                    // commit landed - finish as a success (S3.5 recovery).
+                    let staged = &buf[off..off + len];
+                    if self.task_already_committed(&task, staged)? {
+                        self.meta.wb_finish(task.id)?;
+                        let _ = std::fs::remove_file(&task.staging);
+                        self.metrics.wb_drained.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     // The winner stands; this entry's bytes stay in the pack
                     // as unreferenced residue (pack gc reclaims them).
                     self.metrics.conflicts.fetch_add(1, Ordering::Relaxed);
@@ -556,7 +638,9 @@ impl WriteBackEngine {
                     );
                 }
                 Err(Error::NotFound(_)) => {
-                    // unlinked while the batch was in flight
+                    // unlinked while the batch was in flight: TERMINAL
+                    // discard, counted (S3.5)
+                    self.metrics.wb_discarded.fetch_add(1, Ordering::Relaxed);
                     self.meta.wb_finish(task.id)?;
                     let _ = std::fs::remove_file(&task.staging);
                 }
@@ -573,6 +657,37 @@ impl WriteBackEngine {
             }
         }
         Ok(())
+    }
+
+    /// True when `task`'s bytes are ALREADY the node's committed state -
+    /// the signature of a crash between the content CAS and wb_finish. The
+    /// recovered task must then complete as a success, never dead-letter as
+    /// a conflict. Verified by CONTENT (bytes for per-file objects, the
+    /// committed pack range for pack-backed nodes), not just version arith.
+    fn task_already_committed(&self, task: &TaskRow, staged: &[u8]) -> Result<bool> {
+        let Some(n) = self.meta.get_node(task.node_id)? else {
+            return Ok(false);
+        };
+        if n.version != task.expected + 1 || n.size != task.size {
+            return Ok(false);
+        }
+        let Some(key) = &n.object_key else {
+            return Ok(false);
+        };
+        // Object unreadable = cannot verify = NOT committed (conservative:
+        // the normal conflict path then decides, the winner stays intact).
+        let read = if let (Some(off), Some(plen)) = (n.pack_off, n.pack_len) {
+            self.objects.get(key, Some(crate::object_store::Range {
+                start: off as u64,
+                len: plen as u64,
+            }))
+        } else {
+            self.objects.get(key, None)
+        };
+        match read {
+            Ok(d) => Ok(d.data == staged),
+            Err(_) => Ok(false),
+        }
     }
 
     fn retire(&self, key: &str) {
@@ -1044,10 +1159,12 @@ mod tests {
         c.create("/hot", 0o644).unwrap();
         let _ = write_via_rpc(&c, "/hot", b"occupies the queue", Some(0));
         // background drainer: keeps freeing slots while the front stage
-        // writes under backpressure
+        // writes under backpressure. The handle is JOINED before the
+        // assertions below - the only race-free way to know every claim
+        // has settled (wb_drained increments after the row delete).
         let eng = std::sync::Arc::clone(c.wb().unwrap());
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        {
+        let drainer = {
             let stop = std::sync::Arc::clone(&stop);
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
@@ -1055,14 +1172,14 @@ mod tests {
                         std::thread::sleep(Duration::from_millis(2));
                     }
                 }
-            });
-        }
+            })
+        };
         // 20 flushes against a cap of 1: some MUST observe the full queue
         for i in 0..20 {
             let _ = write_via_rpc(&c, "/hot", format!("generation {i}").as_bytes(), None);
         }
-        // wait for the front stage to finish, then stop the drainer and
-        // synchronously finish the tail
+        // wait for the front stage to finish, stop the drainer, JOIN it
+        // (every claim settled), then synchronously finish the tail
         for _ in 0..5000 {
             if c.wb().unwrap().queue_counts().0 == 0 {
                 break;
@@ -1070,6 +1187,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         stop.store(true, Ordering::Relaxed);
+        drainer.join().unwrap();
         while c.wb().unwrap().drain_once().unwrap() {}
         assert_eq!(c.wb().unwrap().queue_counts().0, 0);
         assert!(
@@ -1095,5 +1213,367 @@ mod tests {
         // covered at the metadata layer in sqlite tests (wb_requeue_draining,
         // dead on missing staging); the engine-level recover() runs in
         // with_options startup for file-backed stores.
+    }
+
+    // ------------------------------------------------------------------
+    // S3.5 red tests: deterministic interleavings that the read snapshot
+    // rework must survive. Each test pins one production interleaving via
+    // the cfg(test) hook or a pre-drain node snapshot — no sleeps.
+    // ------------------------------------------------------------------
+
+    /// Red: the drain lands between the staging-path QUERY and the staging
+    /// file OPEN. The task row is gone and the staging file is removed; the
+    /// read must still serve the correct complete bytes (they are, at that
+    /// instant, the committed content), never ENOENT.
+    #[test]
+    fn red_staging_vanishes_between_query_and_open() {
+        let c = wb_core("red-open");
+        c.create("/f", 0o644).unwrap();
+        let _ = write_via_rpc(&c, "/f", b"staged bytes", Some(0));
+        {
+            let eng = std::sync::Arc::clone(c.wb().unwrap());
+            let eng_in_hook = std::sync::Arc::clone(&eng);
+            *eng.test_hook_before_open.lock().unwrap() = Some(Box::new(move || {
+                eng_in_hook.drain_once().unwrap(); // commit + wb_finish + remove staging
+            }));
+        }
+        let got = c.read("/f", 0, 100);
+        assert_eq!(
+            got.unwrap(),
+            b"staged bytes",
+            "drain between query and open must not break the read"
+        );
+    }
+    /// Evidence-chain test (S3.5 phase 3 shape): several independent files
+    /// staged, rename and unlink interleaved, one batch drain. Every
+    /// survivor must read back byte-exact; every task must reach a terminal
+    /// state; the committed metadata refs must match what actually serves
+    /// the bytes. Old implementation included: this documents the invariants
+    /// the read/commit lifecycle must keep under rename/unlink pressure.
+    #[test]
+    fn mixed_batch_with_rename_and_unlink_accounting() {
+        let c = batch_core("mixed", 1 << 20, 0);
+        let bodies: [&[u8]; 6] = [
+            b"file-zero", b"file-one", b"file-two", b"file-three", b"file-four", b"file-five",
+        ];
+        let mut expect: Vec<(String, &[u8])> = Vec::new();
+        for (i, body) in bodies.iter().enumerate() {
+            let path = format!("/m{i}");
+            c.create(&path, 0o644).unwrap();
+            let _ = write_via_rpc(&c, &path, body, Some(0));
+            expect.push((path, body));
+        }
+        // interleave metadata churn over staged-but-undrained files
+        c.rename("/m1", "/m1-renamed").unwrap();
+        c.unlink("/m3").unwrap(); // queued → cancelled
+        c.rename("/m4", "/m4-renamed").unwrap();
+        c.unlink("/m5").unwrap(); // queued → cancelled
+        // drain everything
+        for _ in 0..10 {
+            if !c.wb().unwrap().drain_once().unwrap() {
+                break;
+            }
+        }
+        // survivors: byte-exact under their CURRENT path (two were renamed
+        // while their bytes were still staged)
+        let survivor = |p: &str| -> String {
+            if p == "/m1" {
+                "/m1-renamed".to_string()
+            } else if p == "/m4" {
+                "/m4-renamed".to_string()
+            } else {
+                p.to_string()
+            }
+        };
+        for (path, body) in &expect {
+            if *path == "/m3" || *path == "/m5" {
+                continue;
+            }
+            let cur = survivor(path);
+            assert_eq!(
+                c.read(&cur, 0, 1000).unwrap(),
+                *body,
+                "{} content after mixed batch", cur
+            );
+        }
+        // the unlinked pair: identity gone, no residue rows
+        assert!(matches!(
+            c.lookup("/m3"),
+            Err(Error::NotFound(_)) | Err(crate::error::Error::IdentityGone(_))
+        ));
+        assert_eq!(c.wb().unwrap().queue_counts().0, 0, "nothing queued");
+        assert_eq!(c.wb().unwrap().queue_counts().1, 0, "nothing draining");
+        assert_eq!(
+            c.metrics.wb_drained.load(Ordering::Relaxed),
+            4,
+            "4 committed (2 cancelled before drain never reach CAS)"
+        );
+        // every live ref resolves to real pack content with the right bytes
+        for (path, body) in &expect {
+            if *path == "/m3" || *path == "/m5" {
+                continue;
+            }
+            let cur = survivor(path);
+            let n = c.lookup(&cur).unwrap();
+            let key = n.object_key.clone().unwrap();
+            assert!(key.starts_with(crate::pack::PACK_KEY_PREFIX));
+            let got = c.read(&cur, 0, 1000).unwrap();
+            assert_eq!(got, *body);
+        }
+    }
+
+    /// S3.5 recovery semantics: a task whose CAS committed but which died
+    /// before wb_finish must recover as a SUCCESS, never as a conflict
+    /// dead-letter. Simulated with a file-backed store + engine restart
+    /// (recover()), exactly the server startup path.
+    #[test]
+    fn cas_committed_task_recovers_as_success_not_conflict() {
+        let dir = std::env::temp_dir().join(format!(
+            "lightfs-wbrec-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("meta.db");
+        let staging = dir.join("staging");
+        let opts = |staging: &String| WbOptions {
+            staging_dir: staging.clone(),
+            drain_workers: 0,
+            batch_pack_bytes: 0,
+            batch_max_wait_ms: 0,
+            queue_max_tasks: 0,
+        };
+        let body = b"survives a crash";
+        let store: StdArc<dyn crate::object_store::ObjectStore> = StdArc::new(MemObjectStore::new());
+        let node_id = {
+            let c = Core::with_options(
+                StdArc::new(SqliteMetadataStore::open(db.to_string_lossy().as_ref()).unwrap()),
+                store.clone(),
+                crate::core::DEFAULT_SUPERSEDED_SECS,
+                None,
+                Some(opts(&staging.to_string_lossy().to_string())),
+            )
+            .unwrap();
+            c.create("/f", 0o644).unwrap();
+            let n = write_via_rpc(&c, "/f", body, Some(0));
+            // crash window: replay the CAS exactly as drain_task would,
+            // then "die" before wb_finish
+            let task = c.metadata().wb_active_tasks().unwrap().pop().unwrap();
+            let vkey = crate::core::new_version_key_for(task.node_id);
+            c.objects()
+                .put(&vkey, body)
+                .unwrap();
+            c.metadata()
+                .commit_content_cas(
+                    task.node_id,
+                    task.expected,
+                    task.size,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64,
+                    &vkey,
+                    "etag-crash",
+                )
+                .unwrap();
+            n.id
+            // Core dropped here = process death with the task still 'draining'
+        };
+        // restart: recovery requeues the draining task, then the drain must
+        // recognize its own commit and FINISH it - not dead-letter it
+        let c = Core::with_options(
+            StdArc::new(SqliteMetadataStore::open(db.to_string_lossy().as_ref()).unwrap()),
+            store,
+            crate::core::DEFAULT_SUPERSEDED_SECS,
+            None,
+            Some(opts(&staging.to_string_lossy().to_string())),
+        )
+        .unwrap();
+        c.wb().unwrap().recover().unwrap();
+        assert_eq!(c.wb().unwrap().queue_counts(), (1, 0, 0), "requeued");
+        assert!(c.wb().unwrap().drain_once().unwrap());
+        assert_eq!(
+            c.wb().unwrap().queue_counts(),
+            (0, 0, 0),
+            "finished as success - zero dead rows"
+        );
+        assert_eq!(c.metrics.wb_drained.load(Ordering::Relaxed), 1);
+        assert_eq!(c.metrics.wb_conflicts.load(Ordering::Relaxed), 0);
+        let after = c.lookup_by_id(node_id).unwrap();
+        assert_eq!(c.read("/f", 0, 100).unwrap(), body);
+        assert_eq!(after.size, body.len() as i64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S3.5 red test 4: two drain workers, two tasks on ONE node (cross-
+    /// client same-expected), network completion order REVERSED via a
+    /// delay-injecting store. CAS anchoring must yield exactly one winner,
+    /// one visible conflict, zero silent losses - multi-worker drain is
+    /// safe BECAUSE every task PUTs its own immutable version key.
+    #[test]
+    fn two_workers_reversed_completion_order_single_winner() {
+        struct SlowFirstPut {
+            inner: MemObjectStore,
+            gate: std::sync::atomic::AtomicU64,
+        }
+        impl crate::object_store::ObjectStore for SlowFirstPut {
+            fn put(
+                &self,
+                key: &str,
+                data: &[u8],
+            ) -> crate::error::Result<crate::object_store::ObjectInfo> {
+                // delay the FIRST per-file put to land: worker A's upload
+                // finishes AFTER worker B's, reversing network order
+                if !key.starts_with(crate::pack::PACK_KEY_PREFIX)
+                    && self.gate.fetch_add(1, Ordering::SeqCst) == 0
+                {
+                    std::thread::sleep(Duration::from_millis(120));
+                }
+                self.inner.put(key, data)
+            }
+            fn put_stream(
+                &self,
+                key: &str,
+                reader: &mut dyn std::io::Read,
+                len: u64,
+            ) -> crate::error::Result<crate::object_store::ObjectInfo> {
+                self.inner.put_stream(key, reader, len)
+            }
+            fn get(
+                &self,
+                key: &str,
+                range: Option<crate::object_store::Range>,
+            ) -> crate::error::Result<crate::object_store::ObjectData> {
+                self.inner.get(key, range)
+            }
+            fn get_stream(
+                &self,
+                key: &str,
+                range: Option<crate::object_store::Range>,
+            ) -> crate::error::Result<(Box<dyn std::io::Read + Send>, u64)> {
+                self.inner.get_stream(key, range)
+            }
+            fn head(&self, key: &str) -> crate::error::Result<crate::object_store::ObjectInfo> {
+                self.inner.head(key)
+            }
+            fn delete(&self, key: &str) -> crate::error::Result<()> {
+                self.inner.delete(key)
+            }
+            fn list(
+                &self,
+                prefix: &str,
+                token: Option<&str>,
+                max: usize,
+            ) -> crate::error::Result<crate::object_store::ListPage> {
+                self.inner.list(prefix, token, max)
+            }
+            fn ping(&self) -> crate::error::Result<()> {
+                self.inner.ping()
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "lightfs-wborder-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = StdArc::new(SlowFirstPut {
+            inner: MemObjectStore::new(),
+            gate: std::sync::atomic::AtomicU64::new(0),
+        });
+        let c = Core::with_options(
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            store,
+            crate::core::DEFAULT_SUPERSEDED_SECS,
+            None,
+            Some(WbOptions {
+                staging_dir: dir.join("staging").to_string_lossy().to_string(),
+                drain_workers: 0,
+                batch_pack_bytes: 0,
+                batch_max_wait_ms: 0,
+                queue_max_tasks: 0,
+            }),
+        )
+        .unwrap();
+        c.create("/f", 0o644).unwrap();
+        let node = c.lookup("/f").unwrap();
+        let _ = write_via_rpc(&c, "/f", b"client A content", Some(0));
+        {
+            let eng = c.wb().unwrap();
+            eng.write_deferred(
+                &node,
+                0,
+                &mut std::io::Cursor::new(b"client B content".to_vec()),
+                16,
+            )
+            .unwrap();
+        }
+        // two workers claim the two tasks CONCURRENTLY; A's put is delayed
+        // so B completes first (reversed order)
+        let eng = std::sync::Arc::clone(c.wb().unwrap());
+        let w1 = std::thread::spawn(move || eng.drain_once().unwrap());
+        std::thread::sleep(Duration::from_millis(10));
+        let w2 = {
+            let eng = std::sync::Arc::clone(c.wb().unwrap());
+            std::thread::spawn(move || eng.drain_once().unwrap())
+        };
+        assert!(w1.join().unwrap());
+        assert!(w2.join().unwrap());
+        // exactly one winner; the other is a VISIBLE conflict
+        assert_eq!(
+            c.metrics.wb_cas_ok.load(Ordering::Relaxed),
+            1,
+            "single CAS winner"
+        );
+        assert_eq!(c.metrics.wb_conflicts.load(Ordering::Relaxed), 1);
+        assert_eq!(c.wb().unwrap().queue_counts(), (0, 0, 1));
+        // the winner's bytes are what the node serves; nothing vanished
+        let total_terminal = c.metrics.wb_drained.load(Ordering::Relaxed)
+            + c.metrics.wb_conflicts.load(Ordering::Relaxed)
+            + c.metrics.wb_discarded.load(Ordering::Relaxed)
+            + c.metrics.wb_cancelled.load(Ordering::Relaxed);
+        assert_eq!(total_terminal, 2, "every task reached a terminal state");
+        let served = c.read("/f", 0, 100).unwrap();
+        assert!(
+            served == b"client A content" || served == b"client B content",
+            "served content must be one of the two clients' staged bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S3.5 evidence chain: enqueued == new tasks + coalesced, and every
+    /// task lands in exactly one terminal bucket.
+    #[test]
+    fn evidence_chain_reconciles() {
+        let c = batch_core("evidence", 1 << 20, 0);
+        c.create("/f", 0o644).unwrap();
+        let _ = write_via_rpc(&c, "/f", b"gen one", Some(0));
+        let _ = write_via_rpc(&c, "/f", b"gen two (coalesces)", Some(1));
+        assert_eq!(c.metrics.wb_enqueued.load(Ordering::Relaxed), 2);
+        assert_eq!(c.metrics.wb_coalesced.load(Ordering::Relaxed), 1);
+        assert!(c.wb().unwrap().drain_once().unwrap());
+        assert!(!c.wb().unwrap().drain_once().unwrap());
+        assert_eq!(c.metrics.wb_cas_ok.load(Ordering::Relaxed), 1);
+        assert_eq!(c.metrics.wb_drained.load(Ordering::Relaxed), 1);
+        // 2 flushes = 1 new task + 1 coalesced = 1 drained, zero residue
+        assert_eq!(
+            c.metrics.wb_enqueued.load(Ordering::Relaxed),
+            c.metrics.wb_drained.load(Ordering::Relaxed)
+                + c.metrics.wb_conflicts.load(Ordering::Relaxed)
+                + c.metrics.wb_discarded.load(Ordering::Relaxed)
+                + c.metrics.wb_cancelled.load(Ordering::Relaxed)
+                + c.metrics.wb_coalesced.load(Ordering::Relaxed),
+        );
+        // unlink accounting path
+        c.create("/g", 0o644).unwrap();
+        let _ = write_via_rpc(&c, "/g", b"never drains", Some(0));
+        c.unlink("/g").unwrap();
+        assert_eq!(c.metrics.wb_cancelled.load(Ordering::Relaxed), 1);
     }
 }

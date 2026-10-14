@@ -53,6 +53,15 @@ pub struct Metrics {
     /// to a synchronous commit because the queue was full.
     pub wb_packs: AtomicU64,
     pub wb_overflow: AtomicU64,
+    /// S3.5 evidence chain: every task must be accountable through exactly
+    /// one terminal outcome. flushes = enqueued = new_tasks + coalesced;
+    /// new_tasks land as drained (CAS ok, incl. crash-recovery finishes),
+    /// conflicts (dead), discarded (node gone mid-drain), cancelled
+    /// (unlink of queued tasks), dead (transient failures past retries).
+    pub wb_coalesced: AtomicU64,
+    pub wb_cancelled: AtomicU64,
+    pub wb_discarded: AtomicU64,
+    pub wb_cas_ok: AtomicU64,
 }
 
 pub struct Core {
@@ -250,16 +259,18 @@ impl Core {
     /// (committed + pending tasks). The client's commit chain assembles
     /// its overlay base from exactly this view, so consecutive flushes of
     /// a write-back session compose correctly before any drain lands.
-    fn finish_lookup(&self, node: Node) -> Node {
+    /// Errors propagate (S3.5): a metadata failure must never silently
+    /// degrade the lookup to the un-projected (stale-size) node.
+    fn finish_lookup(&self, node: Node) -> Result<Node> {
         if let Some(wb) = &self.wb {
-            if let Some((size, version)) = wb.projected(&node) {
+            if let Some((size, version)) = wb.projected(&node)? {
                 let mut node = node;
                 node.size = size;
                 node.version = version;
-                return node;
+                return Ok(node);
             }
         }
-        node
+        Ok(node)
     }
 
     /// Retire a committed object: record it for retention (point-in-time
@@ -354,7 +365,7 @@ impl Core {
                 i += 1;
             }
             if i == comps.len() {
-                return Ok(self.finish_lookup(node));
+                return self.finish_lookup(node);
             }
         }
     }
@@ -393,7 +404,7 @@ impl Core {
             .meta
             .get_node(node_id)?
             .ok_or_else(|| Error::IdentityGone(node_id.to_string()))?;
-        Ok(self.finish_lookup(node))
+        self.finish_lookup(node)
     }
 
     /// symlink(target, link_path): store the target VERBATIM. Fails with
@@ -463,7 +474,17 @@ impl Core {
                 actual: node.kind.as_str().to_string(),
             });
         }
-        self.meta.list_children(node.id)
+        // Same write-back projection as lookup: the mount seeds its attr
+        // cache from this listing, so a child with staged pending writes
+        // must report the projected size/version here too — the committed
+        // view (size 0 for a just-written file) would blind every stat
+        // within the attr_ttl window.
+        Ok(self
+            .meta
+            .list_children(node.id)?
+            .into_iter()
+            .map(|child| self.finish_lookup(child))
+            .collect::<Result<Vec<_>>>()?)
     }
 
     pub fn mkdir(&self, path: &str, mode: u32) -> Result<Node> {
@@ -524,11 +545,7 @@ impl Core {
                 actual: "dir".into(),
             });
         }
-        if offset >= node.size as u64 || size == 0 {
-            return Ok(Vec::new());
-        }
-        let len = size.min(node.size as u64 - offset);
-        self.read_node_bytes(&node, offset, len)
+        self.read_node_by_id(node.id, offset, size)
     }
 
     /// Stream a byte range of `path` without buffering the whole slice:
@@ -548,7 +565,7 @@ impl Core {
                 actual: "dir".into(),
             });
         }
-        self.open_read_node(&node, offset, size)
+        self.open_read_node(node.id, offset, size)
     }
 
     /// By-id read: the node is located by its STABLE id, so a rename by
@@ -561,6 +578,27 @@ impl Core {
         offset: u64,
         size: u64,
     ) -> Result<(Box<dyn std::io::Read + Send>, u64)> {
+        self.open_read_node(node_id, offset, size)
+    }
+
+    /// Byte-range reader for a node located by STABLE id. Content state is
+    /// resolved here (see read_node_by_id), never from a caller-held
+    /// snapshot.
+    fn open_read_node(
+        &self,
+        node_id: i64,
+        offset: u64,
+        size: u64,
+    ) -> Result<(Box<dyn std::io::Read + Send>, u64)> {
+        // Write-back overlay and pack-backed content both materialize a
+        // bounded slice (pack files are small by definition, staged writes
+        // are bounded by the staging budget); per-file objects keep the
+        // zero-copy stream.
+        if self.wb.is_some() {
+            let data = self.read_node_by_id(node_id, offset, size)?;
+            let n = data.len() as u64;
+            return Ok((Box::new(std::io::Cursor::new(data)), n));
+        }
         let node = self
             .meta
             .get_node(node_id)?
@@ -572,26 +610,12 @@ impl Core {
                 actual: "dir".into(),
             });
         }
-        let node = self.finish_lookup(node);
-        self.open_read_node(&node, offset, size)
-    }
-
-    fn open_read_node(
-        &self,
-        node: &Node,
-        offset: u64,
-        size: u64,
-    ) -> Result<(Box<dyn std::io::Read + Send>, u64)> {
         if offset >= node.size as u64 || size == 0 {
             return Ok((Box::new(std::io::empty()), 0));
         }
         let len = size.min(node.size as u64 - offset);
-        // Write-back overlay and pack-backed content both materialize a
-        // bounded slice (pack files are small by definition, staged writes
-        // are bounded by the staging budget); per-file objects keep the
-        // zero-copy stream.
-        if self.wb.is_some() || node.is_pack_backed() {
-            let data = self.read_node_bytes(node, offset, len)?;
+        if node.is_pack_backed() {
+            let data = self.read_committed_bytes(&node, offset, len)?;
             let n = data.len() as u64;
             return Ok((Box::new(std::io::Cursor::new(data)), n));
         }
@@ -607,18 +631,90 @@ impl Core {
         Ok(data)
     }
 
-    /// One read through the right lens: staged write-back bytes for a node
-    /// with pending tasks, then a pack range (optionally through the pack
-    /// read cache), then the plain per-file object.
-    fn read_node_bytes(&self, node: &Node, offset: u64, len: u64) -> Result<Vec<u8>> {
-        if let Some(wb) = &self.wb {
-            if let Some(staged) = wb.read_pending(node.id, offset, len)? {
-                self.metrics
-                    .bytes_read
-                    .fetch_add(staged.len() as u64, Ordering::Relaxed);
-                return Ok(staged);
+    /// One read for a node, resolved AUTHORITATIVELY at read time (S3.5).
+    /// `node` is only a hint: the async drain can commit, finish the task
+    /// and unlink the staging file at ANY moment after a snapshot was
+    /// taken, so neither the snapshot's object_key nor its pending state
+    /// may be spliced into the read. Resolution order per attempt:
+    /// 1. staged bytes (read_pending is open-before-validate and
+    ///    re-resolves internally when the drain lands in its window);
+    /// 2. the committed object of a FRESHLY fetched node, validated
+    ///    afterwards against the projected view - a transition during the
+    ///    read (enqueue, coalesce, commit) retries, so a retired key can
+    ///    never serve a previous generation.
+    /// The byte range is clamped against whichever view is authoritative
+    /// for the branch taken.
+    fn read_node_by_id(&self, node_id: i64, offset: u64, size: u64) -> Result<Vec<u8>> {
+        let wb_mode = self.wb.is_some();
+        let attempts = if wb_mode { 4 } else { 1 };
+        let mut best: Option<Vec<u8>> = None;
+        for _ in 0..attempts {
+            // Staged bytes first, by node id: read_pending clamps against
+            // the TASK's staged size and re-resolves internally when the
+            // drain lands inside its query/open window.
+            if let Some(wb) = &self.wb {
+                match wb.read_pending(node_id, offset, size)? {
+                    Some(staged) => {
+                        self.metrics
+                            .bytes_read
+                            .fetch_add(staged.len() as u64, Ordering::Relaxed);
+                        return Ok(staged);
+                    }
+                    None => {}
+                }
+            }
+            // Committed branch: fetch the node AT THIS INSTANT - it may
+            // have been committed/finished since the pending check above.
+            let raw = self
+                .meta
+                .get_node(node_id)?
+                .ok_or_else(|| Error::IdentityGone(node_id.to_string()))?;
+            if !raw.is_file() {
+                return Err(Error::KindMismatch {
+                    path: node_id.to_string(),
+                    expected: "file",
+                    actual: "dir".into(),
+                });
+            }
+            if offset >= raw.size as u64 || size == 0 {
+                return Ok(Vec::new());
+            }
+            let len = size.min(raw.size as u64 - offset);
+            match self.read_committed_bytes(&raw, offset, len) {
+                Ok(bytes) => {
+                    if !wb_mode {
+                        return Ok(bytes);
+                    }
+                    let unchanged = match self.meta.get_node(node_id)? {
+                        Some(now) => {
+                            let now = self.finish_lookup(now)?;
+                            let snap = self.finish_lookup(raw.clone())?;
+                            now.version == snap.version && now.size == snap.size
+                        }
+                        None => false,
+                    };
+                    if unchanged {
+                        return Ok(bytes);
+                    }
+                    best = Some(bytes); // raced: retry, but keep as a valid instant
+                }
+                Err(Error::NotFound(_)) if wb_mode => {
+                    // the node's previous object was retired mid-read; the
+                    // fresh fetch at the top of the next attempt sees the
+                    // new generation
+                }
+                Err(e) => return Err(e),
             }
         }
+        // Every attempt raced a transition; `best` was still read from a
+        // valid source at one instant, which is a legal linearized read.
+        best.ok_or_else(|| Error::Storage(format!("wb read raced node {node_id}")))
+    }
+
+    /// Committed-content read for a RAW node: a pack range (optionally
+    /// through the pack read cache) or the plain per-file object. No
+    /// write-back awareness - callers resolve staged bytes first.
+    fn read_committed_bytes(&self, node: &Node, offset: u64, len: u64) -> Result<Vec<u8>> {
         let key = node
             .object_key
             .clone()
@@ -938,8 +1034,8 @@ impl Core {
         let node = self
             .meta
             .get_node(handle.file_id)?
-            .map(|n| self.finish_lookup(n))
             .ok_or_else(|| Error::NotFound(handle.path.clone()))?;
+        let node = self.finish_lookup(node)?;
         if node.version != handle.expected_version {
             self.metrics.conflicts.fetch_add(1, Ordering::Relaxed);
             return Err(Error::Conflict {
@@ -1702,6 +1798,100 @@ mod tests {
         assert_eq!(c.readdir("/").unwrap().len(), 4);
         assert_eq!(c.read("/t2/f", 0, 100).unwrap(), b"data-2");
     }
+    // ------------------------------------------------------------------
+    // S3.5 red tests: the read path must never splice a node snapshot with
+    // content state that the async drain invalidated afterwards. Both tests
+    // hand read_node_bytes a node captured BEFORE the drain - the exact
+    // shape a concurrent reader holds in production - and demand the
+    // CURRENT content.
+    // ------------------------------------------------------------------
+    fn wb_core(tag: &str) -> Core {
+        use crate::wb::WbOptions;
+        let dir = std::env::temp_dir().join(format!(
+            "lightfs-core-wb-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Core::with_options(
+            Arc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            Arc::new(MemObjectStore::new()),
+            DEFAULT_SUPERSEDED_SECS,
+            None,
+            Some(WbOptions {
+                staging_dir: dir.join("staging").to_string_lossy().to_string(),
+                drain_workers: 0,
+                batch_pack_bytes: 1 << 20,
+                batch_max_wait_ms: 0,
+                queue_max_tasks: 0,
+            }),
+        )
+        .unwrap()
+    }
+
+    fn flush(c: &Core, path: &str, body: &[u8], expected: Option<i64>) {
+        c.write_stream(
+            path,
+            expected,
+            false,
+            &mut std::io::Cursor::new(body.to_vec()),
+            body.len() as u64,
+        )
+        .unwrap();
+    }
+
+    /// First write of a file: the stale snapshot has NO object_key at all,
+    /// so splicing it after the drain must not fall back to a default key
+    /// that was never uploaded (old code: read error).
+    #[test]
+    fn red_read_with_pre_drain_snapshot_first_generation() {
+        let c = wb_core("splice1");
+        c.create("/f", 0o644).unwrap();
+        flush(&c, "/f", b"generation one", Some(0));
+        let snapshot = c.lookup("/f").unwrap(); // projected: size 14, v1, no key
+        c.wb().unwrap().drain_once().unwrap(); // commit + finish + remove staging
+        let got = c.read_node_by_id(snapshot.id, 0, 14).unwrap();
+        assert_eq!(got, b"generation one", "stale snapshot must resolve to the committed content");
+    }
+
+    /// Overwrite: the stale snapshot still points at the PREVIOUS
+    /// generation's object; splicing it after the drain would serve the old
+    /// version. The read must return the current content instead.
+    #[test]
+    fn red_read_with_pre_drain_snapshot_second_generation() {
+        let c = wb_core("splice2");
+        c.create("/f", 0o644).unwrap();
+        flush(&c, "/f", b"old", Some(0));
+        c.wb().unwrap().drain_once().unwrap();
+        flush(&c, "/f", b"new-content", Some(1));
+        let snapshot = c.lookup("/f").unwrap(); // projected v2, object_key still gen-1
+        c.wb().unwrap().drain_once().unwrap();
+        let got = c.read_node_by_id(snapshot.id, 0, 11).unwrap();
+        assert_eq!(got, b"new-content", "must not serve the previous generation through the stale key");
+    }
+
+    /// readdir feeds the mount's readdirplus seed: a child with staged
+    /// pending writes must carry the PROJECTED size there too, or one
+    /// directory listing poisons the attr cache with the committed size 0
+    /// and every stat within the attr_ttl window goes blind. git pack
+    /// verification read its just-written 11 MB pack as an empty file
+    /// through exactly this hole.
+    #[test]
+    fn red_readdir_projects_pending_writes() {
+        let c = wb_core("rdproj");
+        c.create("/f", 0o644).unwrap();
+        flush(&c, "/f", b"staged-bytes", Some(0)); // queued: drain_workers=0
+        let listed = c.readdir("/").unwrap();
+        let f = listed
+            .iter()
+            .find(|n| n.name == "f")
+            .expect("child f listed");
+        assert_eq!(f.size, 12, "readdir must serve the staged size, not the committed 0");
+        assert_eq!(f.version, 1, "readdir must serve the projected version");
+    }
 }
 
 #[cfg(test)]
@@ -2082,4 +2272,5 @@ mod symlink_tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
 }

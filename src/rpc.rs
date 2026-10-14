@@ -153,6 +153,8 @@ fn handle(core: &Core, method: &str, params: &Value) -> Result<Value> {
                 "wb_enqueued": g(&m.wb_enqueued), "wb_drained": g(&m.wb_drained),
                 "wb_conflicts": g(&m.wb_conflicts),
                 "wb_packs": g(&m.wb_packs), "wb_overflow": g(&m.wb_overflow),
+                "wb_coalesced": g(&m.wb_coalesced), "wb_cancelled": g(&m.wb_cancelled),
+                "wb_discarded": g(&m.wb_discarded), "wb_cas_ok": g(&m.wb_cas_ok),
                 // live queue state: "fully drained" = queued == 0 AND
                 // draining == 0 (dead-lettered rows are terminal, not
                 // pending work)
