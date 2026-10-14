@@ -152,6 +152,7 @@ fn handle(core: &Core, method: &str, params: &Value) -> Result<Value> {
                 "pack_bytes_loaded": g(&m.pack_bytes_loaded),
                 "wb_enqueued": g(&m.wb_enqueued), "wb_drained": g(&m.wb_drained),
                 "wb_conflicts": g(&m.wb_conflicts),
+                "wb_packs": g(&m.wb_packs), "wb_overflow": g(&m.wb_overflow),
             }))
         }
         "lookup" | "getattr" | "open" => {

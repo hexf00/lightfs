@@ -49,6 +49,15 @@ use crate::object_store::ObjectStore;
 pub struct WbOptions {
     pub staging_dir: String,
     pub drain_workers: usize,
+    /// S3.2 batch-pack drain: > 0 merges queued tasks into immutable pack
+    /// objects in the background (one PUT per pack, per-file CAS after).
+    /// 0 = per-file drain.
+    pub batch_pack_bytes: u64,
+    /// Background-only seal wait for a partially-filled batch.
+    pub batch_max_wait_ms: u64,
+    /// Queued-task bound; 0 = unbounded. At the limit the flushing write
+    /// degrades to a synchronous per-file commit instead of erroring.
+    pub queue_max_tasks: usize,
 }
 
 pub struct WriteBackEngine {
@@ -57,6 +66,9 @@ pub struct WriteBackEngine {
     metrics: Arc<Metrics>,
     staging_dir: PathBuf,
     retention_supersede: bool,
+    batch_pack_bytes: u64,
+    batch_max_wait_ms: u64,
+    queue_max_tasks: usize,
     /// Signalled whenever a task is enqueued so idle workers wake.
     wake: Condvar,
     idle: Mutex<usize>,
@@ -80,6 +92,9 @@ impl WriteBackEngine {
             metrics,
             staging_dir: PathBuf::from(&opts.staging_dir),
             retention_supersede,
+            batch_pack_bytes: opts.batch_pack_bytes,
+            batch_max_wait_ms: opts.batch_max_wait_ms,
+            queue_max_tasks: opts.queue_max_tasks,
             wake: Condvar::new(),
             idle: Mutex::new(0),
             stop: AtomicBool::new(false),
@@ -163,6 +178,27 @@ impl WriteBackEngine {
         reader: &mut dyn std::io::Read,
         len: u64,
     ) -> Result<Node> {
+        // Queue bound: when the queue is at the limit the flush WAITS for
+        // the drain workers to free a slot (backpressure). Erroring the
+        // flush would break the durability promise; committing inline would
+        // need a CAS anchor version that does not exist yet (the projected
+        // version includes pending tasks). Waiting preserves flush order
+        // and the coalescing anchor exactly; the cost shows up as front
+        // stage latency ONLY when the queue is actually full, which the
+        // wb_overflow counter makes visible.
+        if self.queue_max_tasks > 0 {
+            let (queued, _, _) = self.meta.wb_counts()?;
+            if queued as usize >= self.queue_max_tasks {
+                self.metrics.wb_overflow.fetch_add(1, Ordering::Relaxed);
+                loop {
+                    let (queued, _, _) = self.meta.wb_counts()?;
+                    if (queued as usize) < self.queue_max_tasks {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
         // Stage first (durable), record second; a crash in between leaves
         // an orphan staging file that recover() sweeps at next start.
         let staging = self.staging_dir.join(format!(
@@ -252,17 +288,22 @@ impl WriteBackEngine {
         }
     }
 
-    /// Drain worker body. Claims one queued task at a time by atomically
-    /// renaming its staging file (coalescing can then never touch it) and
-    /// marking the row 'draining', replays it through PUT + CAS, and
-    /// resolves the row: done (deleted), dead (conflict / attempts
-    /// exhausted / lost staging), or discarded (node gone).
+    /// Drain worker body, per-file mode. Claims one queued task at a time,
+    /// replays it through PUT + CAS.
     pub fn drain_once(&self) -> Result<bool> {
-        // Claim under one IMMEDIATE transaction: rename the staging file so
-        // a racing coalesce sees state='draining' and queues behind us.
+        if self.batch_pack_bytes > 0 {
+            return self.drain_batch_once();
+        }
         let Some(task) = self.meta.wb_claim(self.now())? else {
             return Ok(false);
         };
+        self.drain_task(task)?;
+        Ok(true)
+    }
+
+    /// Body of draining one claimed task through the exact same chain as
+    /// strict write_stream: immutable version key → PUT → CAS → retire.
+    fn drain_task(&self, task: TaskRow) -> Result<()> {
         let content = match std::fs::read(&task.staging) {
             Ok(c) => c,
             Err(e) => {
@@ -271,7 +312,7 @@ impl WriteBackEngine {
                     "lightfs wb: task {id} dead: staging unreadable: {e}",
                     id = task.id
                 );
-                return Ok(true);
+                return Ok(());
             }
         };
         if content.len() as i64 != task.size {
@@ -282,7 +323,7 @@ impl WriteBackEngine {
                 got = content.len(),
                 want = task.size
             );
-            return Ok(true);
+            return Ok(());
         }
         // Same chain as strict write_stream_node: immutable version key →
         // CAS → retire. A losing writer cleans its own key up.
@@ -293,7 +334,7 @@ impl WriteBackEngine {
                 // the delete-before-commit cancel outcome)
                 self.meta.wb_finish(task.id)?;
                 let _ = std::fs::remove_file(&task.staging);
-                return Ok(true);
+                return Ok(());
             }
         };
         let version_key = crate::core::new_version_key_for(task.node_id);
@@ -350,7 +391,188 @@ impl WriteBackEngine {
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
+        Ok(())
+    }
+
+    /// S3.2 batch-pack drain: merge queued tasks' staged bytes into ONE
+    /// immutable pack object (one PUT), then CAS each logical file
+    /// individually against its enqueued expected version. All waiting
+    /// happens here on the worker — the front stage never waits for a
+    /// batch, a seal, or an upload.
+    pub fn drain_batch_once(&self) -> Result<bool> {
+        let max_bytes = self.batch_pack_bytes;
+        let mut entries: Vec<(TaskRow, usize, usize)> = Vec::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut first_at: Option<std::time::Instant> = None;
+        loop {
+            if self.stop.load(Ordering::Relaxed) && !entries.is_empty() {
+                break;
+            }
+            let fit = (max_bytes - buf.len() as u64).min(i64::MAX as u64) as i64;
+            match self.meta.wb_claim_fit(fit, self.now())? {
+                None => {
+                    if entries.is_empty() {
+                        // nothing fits: either the queue is dry, or only
+                        // oversized tasks remain — take one unconditionally
+                        // and drain it per-file so it can never starve.
+                        return match self.meta.wb_claim(self.now())? {
+                            None => Ok(false),
+                            Some(big) => {
+                                self.drain_task(big)?;
+                                Ok(true)
+                            }
+                        };
+                    }
+                    let waited_long_enough = match first_at {
+                        Some(t0) => t0.elapsed() >= Duration::from_millis(self.batch_max_wait_ms),
+                        None => true,
+                    };
+                    if !waited_long_enough {
+                        std::thread::sleep(Duration::from_millis(2));
+                        continue; // give coalescing stragglers a chance
+                    }
+                    break; // seal what we have
+                }
+                Some(task) => {
+                    if first_at.is_none() {
+                        first_at = Some(std::time::Instant::now());
+                    }
+                    let content = match std::fs::read(&task.staging) {
+                        Ok(c) if c.len() as i64 == task.size => c,
+                        Ok(c) => {
+                            self.set_state(task.id, "dead")?;
+                            eprintln!(
+                                "lightfs wb: task {id} dead: staged {got} != declared {want}",
+                                id = task.id,
+                                got = c.len(),
+                                want = task.size
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            self.set_state(task.id, "dead")?;
+                            eprintln!(
+                                "lightfs wb: task {id} dead: staging unreadable: {e}",
+                                id = task.id
+                            );
+                            continue;
+                        }
+                    };
+                    entries.push((task, buf.len(), content.len()));
+                    buf.extend_from_slice(&content);
+                    if buf.len() as u64 >= max_bytes {
+                        break; // pack budget reached
+                    }
+                }
+            }
+        }
+        self.seal_batch(entries, buf)?;
         Ok(true)
+    }
+
+    /// Upload one assembled pack and resolve every entry's CAS. The PUT
+    /// runs while holding NO shared lock — only this worker's entries are
+    /// in flight, and sibling tasks stay claimable throughout.
+    fn seal_batch(&self, entries: Vec<(TaskRow, usize, usize)>, buf: Vec<u8>) -> Result<()> {
+        let pack_key = format!(
+            "{}wb-{:x}-{:x}.data",
+            crate::pack::PACK_KEY_PREFIX,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        // Register the pack row (uploaded_at NULL) before the upload — the
+        // same "intent before object" invariant the strict pack engine uses.
+        self.meta.register_pack(&pack_key, buf.len() as i64)?;
+        let put = self.objects.put(&pack_key, &buf);
+        self.metrics.s3_put.fetch_add(1, Ordering::Relaxed);
+        if put.is_ok() {
+            self.metrics.wb_packs.fetch_add(1, Ordering::Relaxed);
+        }
+        let put = match put {
+            Ok(info) => info,
+            Err(e) => {
+                // upload failed: nothing references the pack yet — undo row
+                // + object, requeue the batch with the retry budget.
+                let _ = self.objects.delete(&pack_key);
+                let _ = self.meta.drop_pack(&pack_key);
+                for (task, _, _) in &entries {
+                    if !self.meta.wb_retry_or_dead(task.id, 3, self.now())? {
+                        eprintln!(
+                            "lightfs wb: task {id} dead after retries: {e}",
+                            id = task.id
+                        );
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                return Ok(());
+            }
+        };
+        let _ = put;
+        self.meta.mark_pack_uploaded(&pack_key, self.now())?;
+        for (task, off, len) in entries {
+            let hash = crate::pack::content_hash(&buf[off..off + len]);
+            let old_key = self
+                .meta
+                .get_node(task.node_id)
+                .ok()
+                .flatten()
+                .and_then(|n| n.object_key);
+            let outcome = self.meta.commit_content_cas_pack(
+                task.node_id,
+                task.expected,
+                task.size,
+                self.now(),
+                &pack_key,
+                off as i64,
+                len as i64,
+                &hash,
+            );
+            match outcome {
+                Ok(()) => {
+                    self.metrics.metadata_tx.fetch_add(1, Ordering::Relaxed);
+                    if let Some(k) = old_key {
+                        self.retire(&k);
+                    }
+                    self.meta.wb_finish(task.id)?;
+                    let _ = std::fs::remove_file(&task.staging);
+                    self.metrics.wb_drained.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(Error::Conflict { .. }) => {
+                    // The winner stands; this entry's bytes stay in the pack
+                    // as unreferenced residue (pack gc reclaims them).
+                    self.metrics.conflicts.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.wb_conflicts.fetch_add(1, Ordering::Relaxed);
+                    self.metrics
+                        .pack_dead_bytes
+                        .fetch_add(len as u64, Ordering::Relaxed);
+                    self.set_state(task.id, "dead")?;
+                    eprintln!(
+                        "lightfs wb: task {id} for node {node} dead: CAS conflict (pack sibling bytes kept for gc)",
+                        id = task.id,
+                        node = task.node_id
+                    );
+                }
+                Err(Error::NotFound(_)) => {
+                    // unlinked while the batch was in flight
+                    self.meta.wb_finish(task.id)?;
+                    let _ = std::fs::remove_file(&task.staging);
+                }
+                Err(e) => {
+                    // transient CAS failure: retry via the queue. The entry
+                    // will be re-staged as its own task in a later pack.
+                    if !self.meta.wb_retry_or_dead(task.id, 3, self.now())? {
+                        eprintln!(
+                            "lightfs wb: task {id} dead after retries: {e}",
+                            id = task.id
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn retire(&self, key: &str) {
@@ -435,6 +657,9 @@ mod tests {
             Some(WbOptions {
                 staging_dir: dir.join("staging").to_string_lossy().to_string(),
                 drain_workers: 0, // manual drain in these tests
+                batch_pack_bytes: 0,
+                batch_max_wait_ms: 0,
+                queue_max_tasks: 0,
             }),
         )
         .unwrap()
@@ -572,6 +797,297 @@ mod tests {
         let node = c.lookup_by_id(c.lookup("/f").unwrap().id).unwrap();
         assert_eq!(node.size, 100);
         assert_eq!(node.version, 1);
+    }
+
+    fn batch_core(tag: &str, pack_bytes: u64, queue_max: usize) -> Core {
+        let dir = std::env::temp_dir().join(format!(
+            "lightfs-wbb-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Core::with_options(
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            StdArc::new(MemObjectStore::new()),
+            crate::core::DEFAULT_SUPERSEDED_SECS,
+            None,
+            Some(WbOptions {
+                staging_dir: dir.join("staging").to_string_lossy().to_string(),
+                drain_workers: 0,
+                batch_pack_bytes: pack_bytes,
+                batch_max_wait_ms: 0, // no straggler wait in tests
+                queue_max_tasks: queue_max,
+            }),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn batch_drain_merges_files_into_one_pack() {
+        let c = batch_core("merge", 1 << 20, 0);
+        let mut nodes = Vec::new();
+        for (i, body) in [
+            b"alpha-content".as_slice(),
+            b"beta-content",
+            b"gamma-content",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = format!("/f{i}");
+            c.create(&path, 0o644).unwrap();
+            nodes.push(write_via_rpc(&c, &path, body, Some(0)));
+        }
+        assert!(c.wb().unwrap().drain_once().unwrap(), "one batch drain");
+        assert!(
+            !c.wb().unwrap().drain_once().unwrap(),
+            "queue empty after one seal"
+        );
+        assert_eq!(c.metrics.s3_put.load(Ordering::Relaxed), 1, "one pack PUT");
+        assert_eq!(c.metrics.wb_packs.load(Ordering::Relaxed), 1);
+        // every file: pack-backed, byte-correct, independently versioned
+        let mut pack_keys = std::collections::HashSet::new();
+        for (i, _) in [0usize; 3].into_iter().enumerate() {
+            let n = c.lookup(&format!("/f{i}")).unwrap();
+            let key = n.object_key.as_deref().unwrap();
+            assert!(key.starts_with(crate::pack::PACK_KEY_PREFIX), "{key}");
+            assert!(n.pack_len.is_some());
+            pack_keys.insert(key.to_string());
+            let got = c.read(&format!("/f{i}"), 0, 1000).unwrap();
+            let want = [
+                b"alpha-content".as_slice(),
+                b"beta-content",
+                b"gamma-content",
+            ][i];
+            assert_eq!(got, want);
+        }
+        assert_eq!(pack_keys.len(), 1, "all three share one pack");
+        assert_eq!(c.metrics.wb_drained.load(Ordering::Relaxed), 3);
+        assert_eq!(c.metrics.pack_dead_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn batch_respects_pack_budget_and_drains_oversized_per_file() {
+        let c = batch_core("budget", 64, 0);
+        // three 40-byte tasks: two fit a 64-byte pack, one goes per-file
+        for i in 0..3 {
+            let path = format!("/g{i}");
+            c.create(&path, 0o644).unwrap();
+            let _ = write_via_rpc(&c, &path, &vec![b'x' + i as u8; 40][..], Some(0));
+        }
+        // 40-byte tasks against a 64-byte budget: packs must split
+        for _ in 0..10 {
+            if !c.wb().unwrap().drain_once().unwrap() {
+                break;
+            }
+        }
+        let packs = c.metrics.wb_packs.load(Ordering::Relaxed);
+        let per_file = c.metrics.s3_put.load(Ordering::Relaxed) - packs;
+        assert_eq!(c.metrics.wb_drained.load(Ordering::Relaxed), 3);
+        assert!(
+            packs >= 2,
+            "budget 64 with 40-byte files must split: packs={packs} per_file={per_file}"
+        );
+        for i in 0..3 {
+            let n = c.lookup(&format!("/g{i}")).unwrap();
+            let got = c.read(&format!("/g{i}"), 0, 100).unwrap();
+            assert_eq!(got, vec![b'x' + i as u8; 40]);
+            let _ = n;
+        }
+    }
+
+    #[test]
+    fn batch_conflict_dead_letters_without_breaking_pack_siblings() {
+        let c = batch_core("conflict", 1 << 20, 0);
+        c.create("/f", 0o644).unwrap();
+        let node = c.lookup("/f").unwrap();
+        // two clients staged against the SAME committed version: both
+        // tasks queue separately and land in the SAME pack
+        let _ = write_via_rpc(&c, "/f", b"client A wins this", Some(0));
+        {
+            let eng = c.wb().unwrap();
+            eng.write_deferred(
+                &node,
+                0,
+                &mut std::io::Cursor::new(b"client B loses".to_vec()),
+                14,
+            )
+            .unwrap();
+        }
+        // one batch drain seals both entries into one pack, then CASes
+        // each: A wins v1, B dead-letters with its bytes left in the pack
+        assert!(c.wb().unwrap().drain_once().unwrap());
+        assert!(!c.wb().unwrap().drain_once().unwrap(), "queue empty");
+        let after = c.lookup("/f").unwrap();
+        assert_eq!(after.version, 1, "one commit, one winner");
+        assert_eq!(c.read("/f", 0, 100).unwrap(), b"client A wins this");
+        assert_eq!(c.metrics.wb_conflicts.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            c.metrics.pack_dead_bytes.load(Ordering::Relaxed),
+            14,
+            "loser's bytes remain in the shared pack as residue"
+        );
+        // the winner's pack-backed object exists and serves the bytes
+        let key = after.object_key.unwrap();
+        assert!(key.starts_with(crate::pack::PACK_KEY_PREFIX));
+        assert_eq!(c.objects().get(&key, None).unwrap().data.len(), 32);
+    }
+
+    #[test]
+    fn batch_upload_failure_requeues_and_recovers() {
+        struct FlakyThenOk {
+            inner: MemObjectStore,
+            fail_first: std::sync::atomic::AtomicBool,
+        }
+        impl crate::object_store::ObjectStore for FlakyThenOk {
+            fn put(
+                &self,
+                key: &str,
+                data: &[u8],
+            ) -> crate::error::Result<crate::object_store::ObjectInfo> {
+                if key.starts_with(crate::pack::PACK_KEY_PREFIX)
+                    && self.fail_first.swap(false, Ordering::Relaxed)
+                {
+                    return Err(crate::error::Error::Storage(
+                        "simulated upload outage".into(),
+                    ));
+                }
+                self.inner.put(key, data)
+            }
+            fn put_stream(
+                &self,
+                key: &str,
+                reader: &mut dyn std::io::Read,
+                len: u64,
+            ) -> crate::error::Result<crate::object_store::ObjectInfo> {
+                self.inner.put_stream(key, reader, len)
+            }
+            fn get(
+                &self,
+                key: &str,
+                range: Option<crate::object_store::Range>,
+            ) -> crate::error::Result<crate::object_store::ObjectData> {
+                self.inner.get(key, range)
+            }
+            fn get_stream(
+                &self,
+                key: &str,
+                range: Option<crate::object_store::Range>,
+            ) -> crate::error::Result<(Box<dyn std::io::Read + Send>, u64)> {
+                self.inner.get_stream(key, range)
+            }
+            fn head(&self, key: &str) -> crate::error::Result<crate::object_store::ObjectInfo> {
+                self.inner.head(key)
+            }
+            fn delete(&self, key: &str) -> crate::error::Result<()> {
+                self.inner.delete(key)
+            }
+            fn list(
+                &self,
+                prefix: &str,
+                token: Option<&str>,
+                max: usize,
+            ) -> crate::error::Result<crate::object_store::ListPage> {
+                self.inner.list(prefix, token, max)
+            }
+            fn ping(&self) -> crate::error::Result<()> {
+                self.inner.ping()
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "lightfs-wbf-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = StdArc::new(FlakyThenOk {
+            inner: MemObjectStore::new(),
+            fail_first: std::sync::atomic::AtomicBool::new(true),
+        });
+        let c = Core::with_options(
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            store,
+            crate::core::DEFAULT_SUPERSEDED_SECS,
+            None,
+            Some(WbOptions {
+                staging_dir: dir.join("staging").to_string_lossy().to_string(),
+                drain_workers: 0,
+                batch_pack_bytes: 1 << 20,
+                batch_max_wait_ms: 0,
+                queue_max_tasks: 0,
+            }),
+        )
+        .unwrap();
+        c.create("/resilient", 0o644).unwrap();
+        let _ = write_via_rpc(&c, "/resilient", b"survives an outage", Some(0));
+        // first attempt: upload fails, task requeued
+        assert!(c.wb().unwrap().drain_once().unwrap());
+        assert_eq!(c.metrics.wb_drained.load(Ordering::Relaxed), 0);
+        assert_eq!(c.wb().unwrap().queue_counts().0, 1, "back in the queue");
+        // second attempt: succeeds
+        assert!(c.wb().unwrap().drain_once().unwrap());
+        assert_eq!(c.metrics.wb_drained.load(Ordering::Relaxed), 1);
+        assert_eq!(c.read("/resilient", 0, 100).unwrap(), b"survives an outage");
+        // the failed pack left no row and no object behind
+        assert_eq!(c.metadata().all_packs().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn queue_full_applies_backpressure_and_then_drains() {
+        let c = batch_core("backpressure", 1 << 20, 1); // queue cap 1
+        c.create("/hot", 0o644).unwrap();
+        let _ = write_via_rpc(&c, "/hot", b"occupies the queue", Some(0));
+        // background drainer: keeps freeing slots while the front stage
+        // writes under backpressure
+        let eng = std::sync::Arc::clone(c.wb().unwrap());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if !eng.drain_once().unwrap() {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }
+            });
+        }
+        // 20 flushes against a cap of 1: some MUST observe the full queue
+        for i in 0..20 {
+            let _ = write_via_rpc(&c, "/hot", format!("generation {i}").as_bytes(), None);
+        }
+        // wait for the front stage to finish, then stop the drainer and
+        // synchronously finish the tail
+        for _ in 0..5000 {
+            if c.wb().unwrap().queue_counts().0 == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        stop.store(true, Ordering::Relaxed);
+        while c.wb().unwrap().drain_once().unwrap() {}
+        assert_eq!(c.wb().unwrap().queue_counts().0, 0);
+        assert!(
+            c.metrics.wb_overflow.load(Ordering::Relaxed) > 0,
+            "backpressure must have been hit with cap=1 and 20 flushes"
+        );
+        assert_eq!(
+            c.metrics.wb_drained.load(Ordering::Relaxed),
+            21,
+            "initial + 20 flushes"
+        );
+        let fin = c.lookup("/hot").unwrap();
+        assert_eq!(fin.version, 21, "initial commit + 20 flushes");
+        assert_eq!(
+            c.read("/hot", 0, 100).unwrap(),
+            b"generation 19",
+            "last flush must be the surviving content"
+        );
     }
 
     #[test]

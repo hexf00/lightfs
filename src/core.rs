@@ -49,6 +49,10 @@ pub struct Metrics {
     pub wb_enqueued: AtomicU64,
     pub wb_drained: AtomicU64,
     pub wb_conflicts: AtomicU64,
+    /// S3.2 batch-pack drain: packs uploaded, and flushes that degraded
+    /// to a synchronous commit because the queue was full.
+    pub wb_packs: AtomicU64,
+    pub wb_overflow: AtomicU64,
 }
 
 pub struct Core {

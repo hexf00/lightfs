@@ -238,6 +238,13 @@ pub trait MetadataStore: Send + Sync {
         let _ = now;
         Ok(None)
     }
+    /// Like [`Self::wb_claim`] but only tasks whose declared size fits
+    /// `max_bytes` (batch-pack assembly). None does NOT imply an empty
+    /// queue: oversized tasks remain for the unconditional [`Self::wb_claim`].
+    fn wb_claim_fit(&self, max_bytes: i64, now: i64) -> Result<Option<WbTask>> {
+        let _ = (max_bytes, now);
+        Ok(None)
+    }
     /// A claimed task finished successfully: drop the row.
     fn wb_finish(&self, id: i64) -> Result<()> {
         let _ = id;

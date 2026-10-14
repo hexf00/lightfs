@@ -821,6 +821,40 @@ impl MetadataStore for SqliteMetadataStore {
         Ok(row)
     }
 
+    fn wb_claim_fit(&self, max_bytes: i64, now: i64) -> Result<Option<crate::metadata::WbTask>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let row = tx
+            .query_row(
+                "SELECT id, node_id, staging, size, expected FROM wb_tasks \
+                 WHERE state = 'queued' AND size <= ?1 ORDER BY id LIMIT 1",
+                params![max_bytes],
+                |r| {
+                    Ok(crate::metadata::WbTask {
+                        id: r.get(0)?,
+                        node_id: r.get(1)?,
+                        staging: r.get(2)?,
+                        size: r.get(3)?,
+                        expected: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(t) = &row {
+            let n = tx.execute(
+                "UPDATE wb_tasks SET state = 'draining', updated_at = ?2 \
+                 WHERE id = ?1 AND state = 'queued'",
+                params![t.id, now],
+            )?;
+            if n == 0 {
+                tx.commit()?;
+                return Ok(None);
+            }
+        }
+        tx.commit()?;
+        Ok(row)
+    }
+
     fn wb_finish(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM wb_tasks WHERE id = ?1", params![id])?;

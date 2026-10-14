@@ -41,6 +41,9 @@ fn build_core(
         Some(crate::wb::WbOptions {
             staging_dir: cfg.writeback.staging_dir.clone(),
             drain_workers: cfg.writeback.drain_workers,
+            batch_pack_bytes: cfg.writeback.batch_pack_bytes,
+            batch_max_wait_ms: cfg.writeback.batch_max_wait_ms,
+            queue_max_tasks: cfg.writeback.queue_max_tasks,
         })
     } else {
         None

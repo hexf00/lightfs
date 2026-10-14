@@ -84,6 +84,18 @@ pub struct WritebackSection {
     pub staging_dir: String,
     /// Background drain workers (same-node tasks serialize per node).
     pub drain_workers: usize,
+    /// S3.2 batch-pack drain: when > 0, the background worker merges
+    /// queued tasks' staged bytes into immutable pack objects (one PUT per
+    /// pack) and CASes each logical file individually. 0 = per-file drain
+    /// (one PUT per task).
+    pub batch_pack_bytes: u64,
+    /// How long a partially-filled batch may wait for more tasks before it
+    /// seals. Purely background: the front stage never waits for this.
+    pub batch_max_wait_ms: u64,
+    /// Bound on queued tasks; 0 = unbounded. When the queue is at the
+    /// limit, the flushing write degrades to a synchronous per-file commit
+    /// (front stage blocks, correctness unchanged) instead of erroring.
+    pub queue_max_tasks: usize,
 }
 
 impl Default for WritebackSection {
@@ -91,6 +103,9 @@ impl Default for WritebackSection {
         Self {
             staging_dir: String::from("./staging"),
             drain_workers: 1,
+            batch_pack_bytes: 0,
+            batch_max_wait_ms: 200,
+            queue_max_tasks: 0,
         }
     }
 }
