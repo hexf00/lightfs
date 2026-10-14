@@ -373,6 +373,9 @@ fn node_from_json(v: &Value) -> Result<Node> {
         version: v["version"].as_i64().unwrap_or(0),
         etag: v["etag"].as_str().unwrap_or_default().into(),
         target: v["target"].as_str().map(String::from),
+        pack_off: v["pack_off"].as_i64(),
+        pack_len: v["pack_len"].as_i64(),
+        content_hash: v["content_hash"].as_str().map(String::from),
     })
 }
 

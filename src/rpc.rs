@@ -64,6 +64,9 @@ pub fn node_to_json(n: &Node) -> Value {
         "version": n.version,
         "etag": n.etag,
         "target": n.target,
+        "pack_off": n.pack_off,
+        "pack_len": n.pack_len,
+        "content_hash": n.content_hash,
     })
 }
 
@@ -77,6 +80,9 @@ fn node_from_json(v: &Value) -> Result<Node> {
         _ => return Err(Error::InvalidArgument("node kind".into())),
     };
     Ok(Node {
+        pack_off: v["pack_off"].as_i64(),
+        pack_len: v["pack_len"].as_i64(),
+        content_hash: v["content_hash"].as_str().map(String::from),
         id: v["id"]
             .as_i64()
             .ok_or_else(|| Error::InvalidArgument("id".into()))?,
@@ -139,6 +145,13 @@ fn handle(core: &Core, method: &str, params: &Value) -> Result<Value> {
                 "s3_list": g(&m.s3_list),
                 "bytes_read": g(&m.bytes_read), "bytes_written": g(&m.bytes_written),
                 "conflicts": g(&m.conflicts), "metadata_tx": g(&m.metadata_tx),
+                "pack_uploads": g(&m.pack_uploads), "pack_entries": g(&m.pack_entries),
+                "pack_dead_bytes": g(&m.pack_dead_bytes),
+                "pack_cache_hits": g(&m.pack_cache_hits), "pack_cache_misses": g(&m.pack_cache_misses),
+                "pack_cache_evictions": g(&m.pack_cache_evictions),
+                "pack_bytes_loaded": g(&m.pack_bytes_loaded),
+                "wb_enqueued": g(&m.wb_enqueued), "wb_drained": g(&m.wb_drained),
+                "wb_conflicts": g(&m.wb_conflicts),
             }))
         }
         "lookup" | "getattr" | "open" => {

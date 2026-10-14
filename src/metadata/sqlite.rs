@@ -35,13 +35,61 @@ CREATE TABLE IF NOT EXISTS nodes (
     version TEXT,
     etag TEXT,
     target TEXT,
+    pack_key TEXT,
+    pack_off INTEGER,
+    pack_len INTEGER,
+    content_hash TEXT,
     UNIQUE(parent_id, name)
 );
 CREATE TABLE IF NOT EXISTS superseded_objects (
     object_key TEXT PRIMARY KEY,
     superseded_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS packs (
+    key TEXT PRIMARY KEY,
+    bytes INTEGER NOT NULL,
+    uploaded_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS wb_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id INTEGER NOT NULL,
+    staging TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    expected INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'queued',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wb_tasks_node ON wb_tasks(node_id, state);
 "#;
+
+/// S3.1 branch: add the pack columns to a nodes table created by an older
+/// build of THIS branch lineage. Pure additive ALTERs (idempotent); the
+/// AUTOINCREMENT identity contract check above still runs first and still
+/// rejects genuinely legacy databases.
+fn add_missing_pack_columns(conn: &Connection) -> rusqlite::Result<()> {
+    let mut present: Vec<String> = Vec::new();
+    let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('nodes')")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    for name in rows {
+        present.push(name?);
+    }
+    drop(stmt);
+    for (col, ddl) in [
+        ("pack_key", "ALTER TABLE nodes ADD COLUMN pack_key TEXT"),
+        ("pack_off", "ALTER TABLE nodes ADD COLUMN pack_off INTEGER"),
+        ("pack_len", "ALTER TABLE nodes ADD COLUMN pack_len INTEGER"),
+        (
+            "content_hash",
+            "ALTER TABLE nodes ADD COLUMN content_hash TEXT",
+        ),
+    ] {
+        if !present.iter().any(|c| c == col) {
+            conn.execute_batch(ddl)?;
+        }
+    }
+    Ok(())
+}
 
 fn now() -> i64 {
     std::time::SystemTime::now()
@@ -80,11 +128,14 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
             .unwrap_or(0),
         etag: row.get::<_, Option<String>>("etag")?.unwrap_or_default(),
         target: row.get("target")?,
+        pack_off: row.get("pack_off")?,
+        pack_len: row.get("pack_len")?,
+        content_hash: row.get("content_hash")?,
     })
 }
 
-const NODE_COLS: &str =
-    "id, parent_id, name, kind, size, mtime, mode, object_key, version, etag, target";
+const NODE_COLS: &str = "id, parent_id, name, kind, size, mtime, mode, object_key, version, \
+                         etag, target, pack_off, pack_len, content_hash";
 
 impl SqliteMetadataStore {
     /// Open (creating if needed) the store and ensure schema + root.
@@ -120,6 +171,7 @@ impl SqliteMetadataStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        add_missing_pack_columns(&conn)?;
         // Root: id 1, no parent. Ignore conflict on reopen.
         conn.execute(
             "INSERT OR IGNORE INTO nodes (id, parent_id, name, kind, size, mtime, mode) VALUES (1, NULL, '', 'dir', 0, ?1, ?2)",
@@ -551,6 +603,376 @@ impl MetadataStore for SqliteMetadataStore {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    fn commit_content_cas_pack(
+        &self,
+        id: i64,
+        expected_version: i64,
+        size: i64,
+        mtime: i64,
+        pack_key: &str,
+        pack_off: i64,
+        pack_len: i64,
+        content_hash: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        // Same single-statement CAS shape as commit_content_cas: the WHERE
+        // re-check is the only success path. etag is CLEARED (empty) — a
+        // shared pack's ETag is not this file's; empty-etag rows are
+        // excluded from the read cache by the R4.3 guards.
+        let n = conn.execute(
+            "UPDATE nodes
+             SET size = ?2, mtime = ?3, version = version + 1, object_key = ?4, etag = '',
+                 pack_off = ?5, pack_len = ?6, content_hash = ?7
+             WHERE id = ?1 AND version = ?8",
+            params![
+                id,
+                size,
+                mtime,
+                pack_key,
+                pack_off,
+                pack_len,
+                content_hash,
+                expected_version.to_string()
+            ],
+        )?;
+        if n == 0 {
+            let exists: Option<String> = conn
+                .query_row(
+                    "SELECT version FROM nodes WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            return match exists {
+                Some(actual) => {
+                    let actual: i64 = actual.parse().unwrap_or(0);
+                    Err(Error::Conflict {
+                        path: format!("id {id}"),
+                        expected: expected_version,
+                        actual,
+                    })
+                }
+                None => Err(Error::NotFound(format!("id {id}"))),
+            };
+        }
+        Ok(())
+    }
+
+    fn register_pack(&self, key: &str, bytes: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        // INSERT OR IGNORE: a re-registration after a crash keeps the
+        // original row (and its uploaded_at state) untouched.
+        conn.execute(
+            "INSERT OR IGNORE INTO packs (key, bytes, uploaded_at) VALUES (?1, ?2, NULL)",
+            params![key, bytes],
+        )?;
+        Ok(())
+    }
+
+    fn mark_pack_uploaded(&self, key: &str, at: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE packs SET uploaded_at = ?2 WHERE key = ?1",
+            params![key, at],
+        )?;
+        Ok(())
+    }
+
+    fn gc_pack_candidates(&self, cutoff: i64, limit: usize) -> Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT p.key, p.bytes FROM packs p \
+             WHERE p.uploaded_at IS NOT NULL AND p.uploaded_at <= ?1 \
+               AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.object_key = p.key) \
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![cutoff, limit as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    fn drop_pack(&self, key: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM packs WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    fn all_packs(&self) -> Result<Vec<(String, i64, Option<i64>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT key, bytes, uploaded_at FROM packs ORDER BY key")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    fn wb_enqueue(
+        &self,
+        node_id: i64,
+        staging: &str,
+        size: i64,
+        expected: i64,
+        now: i64,
+    ) -> Result<(i64, Option<String>)> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let version: Option<String> = tx
+            .query_row(
+                "SELECT version FROM nodes WHERE id = ?1",
+                params![node_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(v) = version else {
+            return Err(Error::NotFound(format!("id {node_id}")));
+        };
+        let committed: i64 = v.parse().unwrap_or(0);
+        // Coalesce only a strictly newer expected version (same writer
+        // lineage). An equal expected means another writer aiming at the
+        // same base: it queues separately and the CAS at drain decides.
+        let existing: Option<(i64, i64, String)> = tx
+            .query_row(
+                "SELECT id, expected, staging FROM wb_tasks \
+                 WHERE node_id = ?1 AND state = 'queued' ORDER BY id LIMIT 1",
+                params![node_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let mut replaced = None;
+        if let Some((id, task_expected, old_staging)) = existing {
+            if expected > task_expected {
+                // Coalesce CONTENT only. The task's `expected` stays at the
+                // committed anchor the first flush observed: the drain's
+                // CAS gates against the COMMITTED version (which has not
+                // moved — the task is still queued), while the client's
+                // newer `expected` is a PROJECTED version. Rewriting it
+                // would make the drain conflict with reality.
+                tx.execute(
+                    "UPDATE wb_tasks SET staging = ?2, size = ?3, attempts = 0, \
+                     updated_at = ?4 WHERE id = ?1",
+                    params![id, staging, size, now],
+                )?;
+                replaced = Some(old_staging);
+            }
+        }
+        if replaced.is_none() {
+            tx.execute(
+                "INSERT INTO wb_tasks (node_id, staging, size, expected, state, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'queued', ?5)",
+                params![node_id, staging, size, expected, now],
+            )
+            .map_err(|e| map_constraint(e, || Error::Storage("wb insert".into())))?;
+        }
+        let pending: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM wb_tasks WHERE node_id = ?1 AND state IN ('queued','draining')",
+            params![node_id],
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        Ok((committed + pending, replaced))
+    }
+
+    fn wb_claim(&self, now: i64) -> Result<Option<crate::metadata::WbTask>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let row = tx
+            .query_row(
+                "SELECT id, node_id, staging, size, expected FROM wb_tasks \
+                 WHERE state = 'queued' ORDER BY id LIMIT 1",
+                [],
+                |r| {
+                    Ok(crate::metadata::WbTask {
+                        id: r.get(0)?,
+                        node_id: r.get(1)?,
+                        staging: r.get(2)?,
+                        size: r.get(3)?,
+                        expected: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(t) = &row {
+            let n = tx.execute(
+                "UPDATE wb_tasks SET state = 'draining', updated_at = ?2 \
+                 WHERE id = ?1 AND state = 'queued'",
+                params![t.id, now],
+            )?;
+            if n == 0 {
+                tx.commit()?;
+                return Ok(None); // raced: another drainer claimed it
+            }
+        }
+        tx.commit()?;
+        Ok(row)
+    }
+
+    fn wb_finish(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM wb_tasks WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    fn wb_retry_or_dead(&self, id: i64, max_attempts: u32, now: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE wb_tasks SET attempts = attempts + 1, updated_at = ?2 WHERE id = ?1",
+            params![id, now],
+        )?;
+        let attempts: i64 = conn.query_row(
+            "SELECT attempts FROM wb_tasks WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        if attempts >= max_attempts as i64 {
+            conn.execute(
+                "UPDATE wb_tasks SET state = 'dead', updated_at = ?2 WHERE id = ?1",
+                params![id, now],
+            )?;
+            return Ok(false);
+        }
+        conn.execute(
+            "UPDATE wb_tasks SET state = 'queued', updated_at = ?2 WHERE id = ?1",
+            params![id, now],
+        )?;
+        Ok(true)
+    }
+
+    fn wb_set_state(&self, id: i64, state: &str, now: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE wb_tasks SET state = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, state, now],
+        )?;
+        Ok(())
+    }
+
+    fn wb_requeue_draining(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE wb_tasks SET state = 'queued', updated_at = ?1 WHERE state = 'draining'",
+            params![now()],
+        )?;
+        Ok(())
+    }
+
+    fn wb_active_tasks(&self) -> Result<Vec<crate::metadata::WbTask>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, node_id, staging, size, expected FROM wb_tasks \
+             WHERE state IN ('queued','draining') ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(crate::metadata::WbTask {
+                id: r.get(0)?,
+                node_id: r.get(1)?,
+                staging: r.get(2)?,
+                size: r.get(3)?,
+                expected: r.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    fn wb_all_stagings(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT staging FROM wb_tasks")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    fn wb_latest_staging(&self, node_id: i64) -> Result<Option<(String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT staging, size FROM wb_tasks \
+                 WHERE node_id = ?1 AND state IN ('queued','draining') ORDER BY id DESC LIMIT 1",
+                params![node_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    fn wb_projection(&self, node_id: i64) -> Result<Option<(i64, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(i64, i64)> = conn
+            .query_row(
+                "SELECT (SELECT size FROM wb_tasks WHERE node_id = ?1 \
+                         AND state IN ('queued','draining') ORDER BY id DESC LIMIT 1), \
+                        COUNT(*) FROM wb_tasks WHERE node_id = ?1 \
+                        AND state IN ('queued','draining')",
+                params![node_id],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                        r.get::<_, i64>(1)?,
+                    ))
+                },
+            )
+            .optional()?;
+        match row {
+            Some((size, count)) if count > 0 => Ok(Some((size, count))),
+            _ => Ok(None),
+        }
+    }
+
+    fn wb_cancel_queued(&self, node_id: i64) -> Result<Vec<String>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut stmt =
+            tx.prepare("SELECT staging FROM wb_tasks WHERE node_id = ?1 AND state = 'queued'")?;
+        let paths: Vec<String> = stmt
+            .query_map(params![node_id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        tx.execute(
+            "DELETE FROM wb_tasks WHERE node_id = ?1 AND state = 'queued'",
+            params![node_id],
+        )?;
+        tx.commit()?;
+        Ok(paths)
+    }
+
+    fn wb_counts(&self) -> Result<(u64, u64, u64)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT state, COUNT(*) FROM wb_tasks GROUP BY state")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut q = 0u64;
+        let mut d = 0u64;
+        let mut dead = 0u64;
+        for r in rows {
+            let (state, n) = r?;
+            match state.as_str() {
+                "queued" => q = n as u64,
+                "draining" => d = n as u64,
+                "dead" => dead = n as u64,
+                _ => {}
+            }
+        }
+        Ok((q, d, dead))
     }
 }
 

@@ -17,10 +17,82 @@ pub struct Config {
     pub server: ServerSection,
     pub cache: CacheSection,
     pub retention: RetentionSection,
+    /// Packfile prototype (S3.1 branch): aggregate small-file content into
+    /// immutable pack objects. Disabled by default — absent section means
+    /// today's per-file behavior, byte for byte.
+    #[serde(default)]
+    pub pack: PackSection,
+    /// Commit protocol prototype (S3.1 branch): "strict" (default) or
+    /// "writeback" (stage durably server-side, drain in background).
+    #[serde(default)]
+    pub commit: CommitSection,
+    /// Write-back staging location (only used when commit.mode = "writeback").
+    #[serde(default)]
+    pub writeback: WritebackSection,
     /// Path policy (Phase P). Absent = no policy = today's routing.
     /// Strictly validated at mount: unknown fields inside are errors.
     #[serde(default)]
     pub policy: Option<crate::policy::PolicySection>,
+}
+
+/// S3.1 pack prototype knobs. All off/neutral by default.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PackSection {
+    pub enabled: bool,
+    /// Seal (upload) a pack once its buffered bytes reach this size.
+    pub max_bytes: u64,
+    /// Seal a pack when its oldest buffered entry is this old; bounds the
+    /// flush latency a small commit can wait. 0 = seal only on size.
+    pub max_age_ms: u64,
+    /// Files larger than this stay per-file objects (pack content is
+    /// small-file aggregation; big files pay no aggregation tax).
+    pub large_file_bytes: u64,
+    /// Pack-level read cache budget in bytes. 0 = every file read is one
+    /// Range GET into the pack. > 0 = first touch loads the whole pack and
+    /// sibling files read from RAM (LRU eviction).
+    pub read_cache_bytes: u64,
+}
+
+impl Default for PackSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_bytes: 8 * 1024 * 1024,
+            max_age_ms: 50,
+            large_file_bytes: 1024 * 1024,
+            read_cache_bytes: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct CommitSection {
+    /// "strict" (default): flush returns after the remote commit.
+    /// "writeback" (prototype): flush returns after durable local staging;
+    /// a background queue drains to the object store.
+    pub mode: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WritebackSection {
+    /// Server-local staging directory for deferred writes. Its durability
+    /// boundary is the write-back contract: data here survives process
+    /// death, not disk loss.
+    pub staging_dir: String,
+    /// Background drain workers (same-node tasks serialize per node).
+    pub drain_workers: usize,
+}
+
+impl Default for WritebackSection {
+    fn default() -> Self {
+        Self {
+            staging_dir: String::from("./staging"),
+            drain_workers: 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -137,6 +209,9 @@ impl Config {
                     data: DataCacheSection::default(),
                 },
                 retention: RetentionSection::default(),
+                pack: PackSection::default(),
+                commit: CommitSection::default(),
+                writeback: WritebackSection::default(),
                 policy: None,
             }),
         }
@@ -151,6 +226,19 @@ impl Config {
         }
         if self.metadata.path.is_empty() {
             return Err(Error::Config("metadata.path is required".into()));
+        }
+        match self.commit.mode.as_str() {
+            "" | "strict" | "writeback" => {}
+            other => {
+                return Err(Error::Config(format!(
+                    "commit.mode must be \"strict\" or \"writeback\", got {other:?}"
+                )));
+            }
+        }
+        if self.commit.mode == "writeback" && self.writeback.staging_dir.is_empty() {
+            return Err(Error::Config(
+                "writeback.staging_dir is required in write-back mode".into(),
+            ));
         }
         Ok(())
     }

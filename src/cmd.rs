@@ -92,9 +92,34 @@ pub fn gc(cfg: &Config) -> Result<()> {
             eng.core.metadata().drop_superseded(&key)?;
         }
     }
+    // S3.1 pack gc: uploaded packs past the window with NO live references
+    // (the live-reference guard lives in gc_pack_candidates' SQL). Pending
+    // packs (never uploaded) are never candidates.
+    let mut purged_packs = 0u64;
+    let mut freed_bytes = 0i64;
+    loop {
+        let packs = eng.core.metadata().gc_pack_candidates(cutoff, 100)?;
+        if packs.is_empty() {
+            break;
+        }
+        for (key, bytes) in packs {
+            match eng.core.objects().delete(&key) {
+                Ok(()) => {
+                    purged_packs += 1;
+                    freed_bytes += bytes;
+                }
+                Err(_) => {
+                    failed += 1;
+                    continue; // keep the row; next gc retries the object
+                }
+            }
+            eng.core.metadata().drop_pack(&key)?;
+        }
+    }
     let retained = eng.core.metadata().all_superseded()?.len();
+    let packs_left = eng.core.metadata().all_packs()?.len();
     println!(
-        "gc: purged {purged} object(s), {failed} failed (kept for retry), {retained} still retained (superseded_secs = {})",
+        "gc: purged {purged} object(s) + {purged_packs} pack(s) ({freed_bytes}B), {failed} failed (kept for retry), {retained} still retained, {packs_left} pack rows (superseded_secs = {})",
         cfg.retention.superseded_secs
     );
     Ok(())

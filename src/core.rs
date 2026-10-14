@@ -8,12 +8,16 @@
 //!   never a silent overwrite
 
 use std::collections::BTreeMap;
+use std::io::Read as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::config::PackSection;
 use crate::error::{Error, Result};
 use crate::metadata::{MetadataStore, Node, NodeKind};
 use crate::object_store::ObjectStore;
+use crate::pack::{PackEngine, PackReadCache};
+use crate::wb::{WbOptions, WriteBackEngine};
 
 /// Counters per the spec notes. Cheap atomics; the benchmark reads them.
 #[derive(Debug, Default)]
@@ -27,6 +31,24 @@ pub struct Metrics {
     pub bytes_written: AtomicU64,
     pub conflicts: AtomicU64,
     pub metadata_tx: AtomicU64,
+    // ---- S3.1 prototype counters ----
+    /// Immutable pack objects uploaded (one PUT each).
+    pub pack_uploads: AtomicU64,
+    /// Files routed into packs (per-entry, not per-PUT).
+    pub pack_entries: AtomicU64,
+    /// Dead bytes inside packs: CAS losers and unlinked-before-seal entries.
+    pub pack_dead_bytes: AtomicU64,
+    /// Pack-read-cache accounting (hits serve from RAM, zero GETs).
+    pub pack_cache_hits: AtomicU64,
+    pub pack_cache_misses: AtomicU64,
+    pub pack_cache_evictions: AtomicU64,
+    /// Pack bytes transferred from the store (amplification denominator:
+    /// logical consumption is bytes_read).
+    pub pack_bytes_loaded: AtomicU64,
+    /// Write-back deferred-commit lifecycle.
+    pub wb_enqueued: AtomicU64,
+    pub wb_drained: AtomicU64,
+    pub wb_conflicts: AtomicU64,
 }
 
 pub struct Core {
@@ -38,6 +60,10 @@ pub struct Core {
     /// restore point-in-time content. `lightfs gc` purges them after the
     /// retention window. false restores the old immediate-delete behavior.
     retention_supersede: bool,
+    /// S3.1 prototype engines; None = today's behavior exactly.
+    pack: Option<Arc<PackEngine>>,
+    pack_cache: Option<Arc<PackReadCache>>,
+    wb: Option<Arc<WriteBackEngine>>,
 }
 
 /// Default retention window for superseded objects: 7 days.
@@ -56,6 +82,18 @@ pub struct WriteHandle {
 
 pub fn object_key_for(file_id: i64) -> String {
     format!("objects/{file_id}/data")
+}
+
+/// Unique content key per write, rooted in the file id (AD-010: derived
+/// from identity, never from the path — rename stays metadata-only).
+pub(crate) fn new_version_key_for(file_id: i64) -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("objects/{file_id}/w-{nanos:x}-{seq:x}.data")
 }
 
 /// Split an absolute path into normalized components.
@@ -127,7 +165,97 @@ impl Core {
             objects,
             metrics: Arc::new(Metrics::default()),
             retention_supersede: superseded_secs > 0,
+            pack: None,
+            pack_cache: None,
+            wb: None,
         }
+    }
+
+    /// S3.1 prototype constructor: wires the pack engine and/or the
+    /// write-back engine. Either None keeps today's behavior byte for byte.
+    pub fn with_options(
+        meta: Arc<dyn MetadataStore>,
+        objects: Arc<dyn ObjectStore>,
+        superseded_secs: u64,
+        pack: Option<PackSection>,
+        wb: Option<WbOptions>,
+    ) -> Result<Self> {
+        let metrics = Arc::new(Metrics::default());
+        let retention_supersede = superseded_secs > 0;
+        let pack_engine = pack.map(|cfg| {
+            let cache = if cfg.read_cache_bytes > 0 {
+                Some(Arc::new(PackReadCache::new(cfg.read_cache_bytes)))
+            } else {
+                None
+            };
+            (
+                Arc::new(PackEngine::new(
+                    meta.clone(),
+                    objects.clone(),
+                    metrics.clone(),
+                    cfg,
+                )),
+                cache,
+            )
+        });
+        let wb_engine = match wb {
+            Some(opts) => Some(Arc::new(WriteBackEngine::new(
+                meta.clone(),
+                objects.clone(),
+                metrics.clone(),
+                &opts,
+                retention_supersede,
+            )?)),
+            None => None,
+        };
+        Ok(Self {
+            meta,
+            objects,
+            metrics,
+            retention_supersede,
+            pack: pack_engine.as_ref().map(|(e, _)| e.clone()),
+            pack_cache: pack_engine.and_then(|(_, c)| c),
+            wb: wb_engine,
+        })
+    }
+
+    /// The write-back engine, when the config enabled it.
+    pub fn wb(&self) -> Option<&Arc<WriteBackEngine>> {
+        self.wb.as_ref()
+    }
+
+    /// The pack engine, when the config enabled it.
+    pub fn pack_engine(&self) -> Option<&Arc<PackEngine>> {
+        self.pack.as_ref()
+    }
+
+    /// Start the write-back drain workers (engine/server startup). Workers
+    /// are daemon-style: they end with the process or at `stop_wb()`.
+    pub fn start_wb_workers(&self) {
+        if let Some(wb) = &self.wb {
+            let workers = std::env::var("LIGHTFS_WB_WORKERS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1);
+            wb.spawn_workers(workers);
+        }
+    }
+
+    /// Project a node through the write-back overlay: a node with staged
+    /// pending writes reports the STAGED size and the projected version
+    /// (committed + pending tasks). The client's commit chain assembles
+    /// its overlay base from exactly this view, so consecutive flushes of
+    /// a write-back session compose correctly before any drain lands.
+    fn finish_lookup(&self, node: Node) -> Node {
+        if let Some(wb) = &self.wb {
+            if let Some((size, version)) = wb.projected(&node) {
+                let mut node = node;
+                node.size = size;
+                node.version = version;
+                return node;
+            }
+        }
+        node
     }
 
     /// Retire a committed object: record it for retention (point-in-time
@@ -135,6 +263,12 @@ impl Core {
     /// Best effort — a leftover is a stale/retained object for fsck, never
     /// a correctness issue.
     fn retire_object(&self, key: &str) {
+        // A pack object is shared by construction; no per-file path may
+        // retire (let alone delete) it. Its lifecycle is reference-driven:
+        // pack gc reclaims it when no live node references it anymore.
+        if key.starts_with(crate::pack::PACK_KEY_PREFIX) {
+            return;
+        }
         // Metadata write failed: fall through to the plain delete so the
         // data plane still does not accumulate.
         if !(self.retention_supersede && self.meta.record_superseded(key, self.now()).is_ok())
@@ -216,7 +350,7 @@ impl Core {
                 i += 1;
             }
             if i == comps.len() {
-                return Ok(node);
+                return Ok(self.finish_lookup(node));
             }
         }
     }
@@ -251,9 +385,11 @@ impl Core {
     /// parent/name - the id never changes); a deleted node reports
     /// IdentityGone, never the new occupant of the old path.
     pub fn lookup_by_id(&self, node_id: i64) -> Result<Node> {
-        self.meta
+        let node = self
+            .meta
             .get_node(node_id)?
-            .ok_or_else(|| Error::IdentityGone(node_id.to_string()))
+            .ok_or_else(|| Error::IdentityGone(node_id.to_string()))?;
+        Ok(self.finish_lookup(node))
     }
 
     /// symlink(target, link_path): store the target VERBATIM. Fails with
@@ -388,19 +524,7 @@ impl Core {
             return Ok(Vec::new());
         }
         let len = size.min(node.size as u64 - offset);
-        let key = node
-            .object_key
-            .clone()
-            .unwrap_or_else(|| object_key_for(node.id));
-        let data = self.objects.get(
-            &key,
-            Some(crate::object_store::Range { start: offset, len }),
-        )?;
-        self.metrics.s3_get.fetch_add(1, Ordering::Relaxed);
-        self.metrics
-            .bytes_read
-            .fetch_add(data.data.len() as u64, Ordering::Relaxed);
-        Ok(data.data)
+        self.read_node_bytes(&node, offset, len)
     }
 
     /// Stream a byte range of `path` without buffering the whole slice:
@@ -444,6 +568,7 @@ impl Core {
                 actual: "dir".into(),
             });
         }
+        let node = self.finish_lookup(node);
         self.open_read_node(&node, offset, size)
     }
 
@@ -457,6 +582,15 @@ impl Core {
             return Ok((Box::new(std::io::empty()), 0));
         }
         let len = size.min(node.size as u64 - offset);
+        // Write-back overlay and pack-backed content both materialize a
+        // bounded slice (pack files are small by definition, staged writes
+        // are bounded by the staging budget); per-file objects keep the
+        // zero-copy stream.
+        if self.wb.is_some() || node.is_pack_backed() {
+            let data = self.read_node_bytes(node, offset, len)?;
+            let n = data.len() as u64;
+            return Ok((Box::new(std::io::Cursor::new(data)), n));
+        }
         let key = node
             .object_key
             .clone()
@@ -467,6 +601,73 @@ impl Core {
         )?;
         self.metrics.s3_get.fetch_add(1, Ordering::Relaxed);
         Ok(data)
+    }
+
+    /// One read through the right lens: staged write-back bytes for a node
+    /// with pending tasks, then a pack range (optionally through the pack
+    /// read cache), then the plain per-file object.
+    fn read_node_bytes(&self, node: &Node, offset: u64, len: u64) -> Result<Vec<u8>> {
+        if let Some(wb) = &self.wb {
+            if let Some(staged) = wb.read_pending(node.id, offset, len)? {
+                self.metrics
+                    .bytes_read
+                    .fetch_add(staged.len() as u64, Ordering::Relaxed);
+                return Ok(staged);
+            }
+        }
+        let key = node
+            .object_key
+            .clone()
+            .unwrap_or_else(|| object_key_for(node.id));
+        if node.is_pack_backed() {
+            let pack_off = node.pack_off.unwrap_or(0) as u64;
+            let start = pack_off + offset;
+            if let Some(cache) = &self.pack_cache {
+                let (pack, hit) = cache.get_or_load(&key, || {
+                    self.metrics.s3_get.fetch_add(1, Ordering::Relaxed);
+                    Ok(self.objects.get(&key, None)?.data)
+                })?;
+                // Mirror the cache's own counters into the core metrics the
+                // RPC surfaces (they only ever grow; store is race-loose).
+                self.metrics
+                    .pack_cache_hits
+                    .store(cache.hits.load(Ordering::Relaxed), Ordering::Relaxed);
+                self.metrics
+                    .pack_cache_misses
+                    .store(cache.misses.load(Ordering::Relaxed), Ordering::Relaxed);
+                self.metrics
+                    .pack_cache_evictions
+                    .store(cache.evictions.load(Ordering::Relaxed), Ordering::Relaxed);
+                self.metrics.pack_bytes_loaded.store(
+                    cache.loaded_bytes.load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+                let _ = hit;
+                let end = (start + len).min(pack.len() as u64);
+                let out = pack[start as usize..end as usize].to_vec();
+                self.metrics
+                    .bytes_read
+                    .fetch_add(out.len() as u64, Ordering::Relaxed);
+                return Ok(out);
+            }
+            let data = self
+                .objects
+                .get(&key, Some(crate::object_store::Range { start, len }))?;
+            self.metrics.s3_get.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .bytes_read
+                .fetch_add(data.data.len() as u64, Ordering::Relaxed);
+            return Ok(data.data);
+        }
+        let data = self.objects.get(
+            &key,
+            Some(crate::object_store::Range { start: offset, len }),
+        )?;
+        self.metrics.s3_get.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .bytes_read
+            .fetch_add(data.data.len() as u64, Ordering::Relaxed);
+        Ok(data.data)
     }
 
     /// Single-pass streaming write: bytes flow from `reader` (exactly `len`)
@@ -544,6 +745,38 @@ impl Core {
         len: u64,
         drop_created_node: bool,
     ) -> Result<Node> {
+        // Write-back prototype: stage durably, queue, ack. Remote commit
+        // happens on the drain with the same PUT + CAS chain as below.
+        if let Some(wb) = &self.wb {
+            let r = wb.write_deferred(node, expected, reader, len);
+            if r.is_err() && drop_created_node {
+                let _ = self.meta.delete_node(node.id);
+            }
+            return r;
+        }
+        // Pack prototype: small files aggregate into immutable packs.
+        if let Some(pack) = &self.pack {
+            if len <= pack.config().large_file_bytes {
+                let mut content = Vec::with_capacity(len as usize);
+                if let Err(e) = reader.take(len).read_to_end(&mut content) {
+                    if drop_created_node {
+                        let _ = self.meta.delete_node(node.id);
+                    }
+                    return Err(e.into());
+                }
+                if content.len() as u64 != len {
+                    let e = Error::InvalidArgument(format!(
+                        "declared length {len} != body length {}",
+                        content.len()
+                    ));
+                    if drop_created_node {
+                        let _ = self.meta.delete_node(node.id);
+                    }
+                    return Err(e);
+                }
+                return self.commit_via_pack(node, expected, content, drop_created_node);
+            }
+        }
         let version_key = self.new_version_key(node.id);
         let info = match self.objects.put_stream(&version_key, reader, len) {
             Ok(info) => info,
@@ -586,6 +819,39 @@ impl Core {
             }
             Err(e) => {
                 let _ = self.objects.delete(&version_key);
+                Err(e)
+            }
+        }
+    }
+
+    /// Pack-routed commit for in-memory content (shared by the streaming
+    /// and buffered-session paths). The pack engine blocks until THIS
+    /// file's CAS resolved — strict per-file semantics, aggregated layout.
+    fn commit_via_pack(
+        &self,
+        node: &Node,
+        expected: i64,
+        content: Vec<u8>,
+        drop_created_node: bool,
+    ) -> Result<Node> {
+        let pack = self.pack.as_ref().unwrap();
+        self.metrics
+            .bytes_written
+            .fetch_add(content.len() as u64, Ordering::Relaxed);
+        match pack.commit(node, expected, content) {
+            Ok(n) => {
+                self.metrics.metadata_tx.fetch_add(1, Ordering::Relaxed);
+                // retire of the previous object respects the pack guard
+                // (pack keys are never retired from a per-file path).
+                if let Some(old_key) = &node.object_key {
+                    self.retire_object(old_key);
+                }
+                Ok(n)
+            }
+            Err(e) => {
+                if drop_created_node {
+                    let _ = self.meta.delete_node(node.id);
+                }
                 Err(e)
             }
         }
@@ -662,9 +928,13 @@ impl Core {
     ///    reports (the spec notes, fsck section)
     pub fn commit_write(&self, handle: &WriteHandle) -> Result<Node> {
         // Fast-fail before any network I/O; the CAS below is the real gate.
+        // The lookup passes through the write-back projection so a session
+        // rebased onto a projected version does not spuriously conflict
+        // while its earlier flush is still queued.
         let node = self
             .meta
             .get_node(handle.file_id)?
+            .map(|n| self.finish_lookup(n))
             .ok_or_else(|| Error::NotFound(handle.path.clone()))?;
         if node.version != handle.expected_version {
             self.metrics.conflicts.fetch_add(1, Ordering::Relaxed);
@@ -685,6 +955,22 @@ impl Core {
             content[off as usize..off as usize + data.len()].copy_from_slice(data);
         }
         drop(chunks);
+
+        // Write-back prototype (buffered-session path): defer the whole
+        // assembled content; the drain replays it through the same PUT +
+        // CAS chain as the streaming path below.
+        if let Some(wb) = &self.wb {
+            let len = content.len() as u64;
+            let mut cursor = std::io::Cursor::new(content);
+            return wb.write_deferred(&node, handle.expected_version, &mut cursor, len);
+        }
+        // Pack prototype (buffered-session path): small content aggregates
+        // into the shared immutable pack buffer.
+        if let Some(pack) = &self.pack {
+            if content.len() as u64 <= pack.config().large_file_bytes {
+                return self.commit_via_pack(&node, handle.expected_version, content, false);
+            }
+        }
 
         let version_key = self.new_version_key(node.id);
         let info = self.objects.put(&version_key, &content)?;
@@ -737,13 +1023,7 @@ impl Core {
     /// derived from identity, never from the path — rename stays
     /// metadata-only).
     fn new_version_key(&self, file_id: i64) -> String {
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        format!("objects/{file_id}/w-{nanos:x}-{seq:x}.data")
+        new_version_key_for(file_id)
     }
 
     /// rename/move: metadata-only. Object bytes never move (AD-010).
@@ -821,12 +1101,22 @@ impl Core {
             });
         }
         if let Some(key) = &node.object_key {
-            if self.retention_supersede {
+            if node.is_pack_backed() {
+                // Shared pack: never a per-file delete/retire. The pack
+                // simply loses one reference; pack gc reclaims it when the
+                // last one is gone (retention window applies).
+            } else if self.retention_supersede {
                 self.meta.record_superseded(key, self.now())?;
             } else {
                 self.objects.delete(key)?;
                 self.metrics.s3_delete.fetch_add(1, Ordering::Relaxed);
             }
+        }
+        // Write-back: queued staged writes for this node never reach the
+        // store (the delete-before-commit cancel). A draining task rides
+        // to its CAS, which fails NotFound and is discarded.
+        if let Some(wb) = &self.wb {
+            wb.cancel(node.id);
         }
         self.metrics.metadata_tx.fetch_add(1, Ordering::Relaxed);
         self.meta.delete_node(node.id)

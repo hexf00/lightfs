@@ -259,6 +259,9 @@ impl LocalFs {
         #[cfg(not(unix))]
         let mode = if kind == NodeKind::Dir { 0o755 } else { 0o644 };
         Ok(Node {
+            pack_off: None,
+            pack_len: None,
+            content_hash: None,
             id,
             parent_id: None,
             name: Self::name_of(rel).to_string(),

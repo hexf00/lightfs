@@ -25,6 +25,34 @@ fn ensure_parent_dir(path: &str) {
     }
 }
 
+/// Build the Core from config, wiring the S3.1 prototype engines (pack /
+/// write-back) when enabled. Shared by embedded and server startup.
+fn build_core(
+    cfg: &Config,
+    meta: Arc<dyn MetadataStore>,
+    objects: Arc<dyn ObjectStore>,
+) -> Result<Core> {
+    let pack = if cfg.pack.enabled {
+        Some(cfg.pack.clone())
+    } else {
+        None
+    };
+    let wb = if cfg.commit.mode == "writeback" {
+        Some(crate::wb::WbOptions {
+            staging_dir: cfg.writeback.staging_dir.clone(),
+            drain_workers: cfg.writeback.drain_workers,
+        })
+    } else {
+        None
+    };
+    let core = Core::with_options(meta, objects, cfg.retention.superseded_secs, pack, wb)?;
+    if core.wb().is_some() {
+        core.wb().unwrap().recover()?;
+        core.start_wb_workers();
+    }
+    Ok(core)
+}
+
 /// Embedded mode: Core + SQLite + S3 in one process. No daemon required.
 pub fn open_embedded(cfg: &Config) -> Result<Engine> {
     ensure_parent_dir(&cfg.metadata.path);
@@ -32,11 +60,7 @@ pub fn open_embedded(cfg: &Config) -> Result<Engine> {
     let objects: Arc<dyn ObjectStore> = Arc::new(S3ObjectStore::new(cfg.s3_config())?);
     objects.ping()?;
     Ok(Engine {
-        core: Arc::new(Core::with_retention(
-            meta,
-            objects,
-            cfg.retention.superseded_secs,
-        )),
+        core: Arc::new(build_core(cfg, meta, objects)?),
     })
 }
 
@@ -47,10 +71,6 @@ pub fn open_embedded_mem(cfg: &Config) -> Result<Engine> {
     let meta: Arc<dyn MetadataStore> = Arc::new(SqliteMetadataStore::open(&cfg.metadata.path)?);
     let objects: Arc<dyn ObjectStore> = Arc::new(crate::object_store::mem::MemObjectStore::new());
     Ok(Engine {
-        core: Arc::new(Core::with_retention(
-            meta,
-            objects,
-            cfg.retention.superseded_secs,
-        )),
+        core: Arc::new(build_core(cfg, meta, objects)?),
     })
 }

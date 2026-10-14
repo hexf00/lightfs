@@ -31,6 +31,14 @@ pub struct FsckReport {
     /// history kept so a metadata backup can restore point-in-time
     /// content until `lightfs gc` purges them past the window.
     pub retained_objects: Vec<String>,
+    /// S3.1: pack objects uploaded but referenced by NO live node anymore
+    /// (gc-managed; never a correctness problem).
+    pub unreferenced_packs: Vec<String>,
+    /// S3.1: distinct pack objects still referenced by live nodes.
+    pub live_packs: usize,
+    /// S3.1: registered packs never uploaded (pending rows = dead-server
+    /// mid-upload leftovers; visible, gc ignores them).
+    pub pending_packs: Vec<String>,
 }
 
 impl FsckReport {
@@ -62,6 +70,15 @@ impl FsckReport {
         for k in &self.retained_objects {
             out.push_str(&format!("RETAINED (restorable): {k}\n"));
         }
+        for k in &self.pending_packs {
+            out.push_str(&format!("PENDING PACK: {k}\n"));
+        }
+        out.push_str(&format!(
+            "packs: {live} live, {unref} unreferenced (gc), {pend} pending\n",
+            live = self.live_packs,
+            unref = self.unreferenced_packs.len(),
+            pend = self.pending_packs.len()
+        ));
         if self.problems() == 0 {
             out.push_str(&format!(
                 "clean: metadata and objects agree ({} stale, {} retained)\n",
@@ -79,6 +96,11 @@ impl FsckReport {
 pub fn fsck(core: &Core) -> Result<FsckReport> {
     let mut report = FsckReport::default();
     let mut live_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Pack-backed nodes share objects: HEAD each DISTINCT pack once and
+    // check the file's window is inside it (a pack's ETag is never a
+    // file's, so the per-file etag comparison does not apply).
+    let mut pack_windows: std::collections::HashMap<String, (i64, i64, i64)> =
+        std::collections::HashMap::new(); // key -> (min_off, max_end, node_count)
 
     for node in core.metadata().all_nodes()? {
         report.checked_nodes += 1;
@@ -95,6 +117,15 @@ pub fn fsck(core: &Core) -> Result<FsckReport> {
             .clone()
             .unwrap_or_else(|| object_key_for(node.id));
         live_keys.insert(key.clone());
+        if node.is_pack_backed() {
+            let off = node.pack_off.unwrap_or(0);
+            let end = off + node.pack_len.unwrap_or(node.size);
+            let e = pack_windows.entry(key).or_insert((off, end, 0));
+            e.0 = e.0.min(off);
+            e.1 = e.1.max(end);
+            e.2 += 1;
+            continue;
+        }
         match core.objects().head(&key) {
             Ok(info) => {
                 if info.size != node.size as u64 {
@@ -119,6 +150,27 @@ pub fn fsck(core: &Core) -> Result<FsckReport> {
         }
     }
 
+    // One HEAD per distinct live pack; window bounds must fit.
+    for (key, (min_off, max_end, count)) in &pack_windows {
+        report.live_packs += 1;
+        match core.objects().head(key) {
+            Ok(info) => {
+                if *max_end > info.size as i64 || *min_off < 0 {
+                    report.size_mismatches.push(format!(
+                        "{key} pack_size={} window=[{min_off},{max_end}) nodes={count}",
+                        info.size
+                    ));
+                }
+            }
+            Err(crate::error::Error::ObjectMissing(_)) => {
+                report
+                    .missing_objects
+                    .push(format!("{key} (shared pack, {count} nodes)"));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
     // Classify every stored key:
     //   live node's current key  -> checked above
     //   recorded superseded key  -> retained history (restorable, gc-managed)
@@ -126,6 +178,40 @@ pub fn fsck(core: &Core) -> Result<FsckReport> {
     //   key under a dead node id -> orphan object
     let superseded: std::collections::HashSet<String> =
         core.metadata().all_superseded()?.into_iter().collect();
+    // Pack classification: referenced -> live (counted above); unreferenced
+    // uploaded -> gc-managed; pending rows -> visible leftovers; unknown
+    // bucket packs (no row) -> orphan (rows are written before uploads, so
+    // a bucket pack without a row is external tampering or a deleted row).
+    let pack_rows: std::collections::HashMap<String, Option<i64>> = core
+        .metadata()
+        .all_packs()?
+        .into_iter()
+        .map(|(k, _, up)| (k, up))
+        .collect();
+    let mut token = None;
+    loop {
+        let page = core.objects().list("packs/", token.as_deref(), 1000)?;
+        for item in &page.items {
+            if live_keys.contains(&item.key) {
+                continue;
+            }
+            match pack_rows.get(&item.key) {
+                Some(Some(_)) => report
+                    .unreferenced_packs
+                    .push(format!("{} ({}B)", item.key, item.size)),
+                Some(None) => report
+                    .pending_packs
+                    .push(format!("{} (registered, never uploaded)", item.key)),
+                None => report
+                    .orphan_objects
+                    .push(format!("{} ({}B, pack without row)", item.key, item.size)),
+            }
+        }
+        match page.next_token {
+            Some(t) => token = Some(t),
+            None => break,
+        }
+    }
     let mut token = None;
     loop {
         let page = core.objects().list("objects/", token.as_deref(), 1000)?;

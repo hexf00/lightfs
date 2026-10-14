@@ -3,7 +3,7 @@
 
 pub mod sqlite;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKind {
@@ -52,6 +52,14 @@ pub struct Node {
     /// Symlink target, stored VERBATIM (relative or absolute); None for
     /// every other kind. Resolution semantics live in Core, not here.
     pub target: Option<String>,
+    /// S3.1 pack prototype: when `pack_off` is set, the file's bytes live
+    /// INSIDE the immutable pack object `object_key` at [pack_off,
+    /// pack_off+pack_len). The pack's ETag is NOT this file's etag (which
+    /// is empty for pack-backed rows — the per-file content digest rides
+    /// in `content_hash` instead).
+    pub pack_off: Option<i64>,
+    pub pack_len: Option<i64>,
+    pub content_hash: Option<String>,
 }
 
 impl Node {
@@ -63,6 +71,12 @@ impl Node {
     }
     pub fn is_symlink(&self) -> bool {
         self.kind == NodeKind::Symlink
+    }
+    /// True when this node's content lives inside a shared immutable pack
+    /// object (S3.1 prototype). Such rows must never be retired/deleted as
+    /// if `object_key` were their own — the pack is shared.
+    pub fn is_pack_backed(&self) -> bool {
+        self.pack_off.is_some()
     }
 }
 
@@ -135,4 +149,148 @@ pub trait MetadataStore: Send + Sync {
     fn drop_superseded(&self, object_key: &str) -> Result<()>;
     /// All superseded keys (fsck classification).
     fn all_superseded(&self) -> Result<Vec<String>>;
+
+    // ---- S3.1 pack prototype (branch-local schema) ----
+
+    /// Pack-backed CAS: same single-statement optimistic gate as
+    /// commit_content_cas, but the new content lives at (pack_key,
+    /// [pack_off, pack_off+pack_len)) inside a shared immutable object and
+    /// the per-file digest is `content_hash` (the pack's ETag is the
+    /// pack's, never the file's). The row's etag is cleared: empty etag
+    /// rows are structurally excluded from the read cache (R4.3 guard).
+    #[allow(clippy::too_many_arguments)]
+    fn commit_content_cas_pack(
+        &self,
+        id: i64,
+        expected_version: i64,
+        size: i64,
+        mtime: i64,
+        pack_key: &str,
+        pack_off: i64,
+        pack_len: i64,
+        content_hash: &str,
+    ) -> Result<()> {
+        let _ = (
+            id,
+            expected_version,
+            size,
+            mtime,
+            pack_key,
+            pack_off,
+            pack_len,
+            content_hash,
+        );
+        Err(Error::Storage("packs unsupported".into()))
+    }
+    /// Register a pack BEFORE its bytes are uploaded (uploaded_at NULL =
+    /// pending; crash before upload leaves a pending row and no object,
+    /// which pack gc and fsck can both see). Idempotent per key.
+    fn register_pack(&self, key: &str, bytes: i64) -> Result<()> {
+        let _ = (key, bytes);
+        Err(Error::Storage("packs unsupported".into()))
+    }
+    /// Mark a pack uploaded (immutable from now on; gc-eligible once no
+    /// live node references it and the retention window has passed).
+    fn mark_pack_uploaded(&self, key: &str, at: i64) -> Result<()> {
+        let _ = (key, at);
+        Err(Error::Storage("packs unsupported".into()))
+    }
+    /// Uploaded packs past the retention cutoff that NO live node
+    /// references anymore, with their byte sizes (gc + fragmentation
+    /// accounting). Pending (never-uploaded) packs are never returned.
+    fn gc_pack_candidates(&self, cutoff: i64, limit: usize) -> Result<Vec<(String, i64)>> {
+        let _ = (cutoff, limit);
+        Ok(Vec::new())
+    }
+    /// Remove one pack row (after its object was purged).
+    fn drop_pack(&self, key: &str) -> Result<()> {
+        let _ = key;
+        Err(Error::Storage("packs unsupported".into()))
+    }
+    /// All pack rows (key, bytes, uploaded_at): fsck + fragmentation trend.
+    fn all_packs(&self) -> Result<Vec<(String, i64, Option<i64>)>> {
+        Ok(Vec::new())
+    }
+
+    // ---- S3.1 write-back prototype: the durable task queue lives in the
+    // metadata store so staging + task commit share one durability story
+    // (WAL SQLite). Default implementations report unsupported; the SQLite
+    // backend implements them (the only backend this branch ships).
+
+    /// Record a staged write for `node_id`. Coalesces into the node's
+    /// QUEUED task when `expected` is strictly newer than the task's
+    /// (same-writer lineage); otherwise queues a new task. Returns the
+    /// projected version (committed + pending tasks AFTER this call) and,
+    /// when a coalesce replaced one, the staging file the row abandoned.
+    fn wb_enqueue(
+        &self,
+        node_id: i64,
+        staging: &str,
+        size: i64,
+        expected: i64,
+        now: i64,
+    ) -> Result<(i64, Option<String>)> {
+        let _ = (node_id, staging, size, expected, now);
+        Err(Error::Storage("write-back unsupported".into()))
+    }
+    /// Atomically claim the oldest QUEUED task for draining.
+    fn wb_claim(&self, now: i64) -> Result<Option<WbTask>> {
+        let _ = now;
+        Ok(None)
+    }
+    /// A claimed task finished successfully: drop the row.
+    fn wb_finish(&self, id: i64) -> Result<()> {
+        let _ = id;
+        Ok(())
+    }
+    /// Bump the retry counter; dead-letter at `max_attempts`. Returns true
+    /// when the task was requeued for another attempt.
+    fn wb_retry_or_dead(&self, id: i64, max_attempts: u32, now: i64) -> Result<bool> {
+        let _ = (id, max_attempts, now);
+        Err(Error::Storage("write-back unsupported".into()))
+    }
+    fn wb_set_state(&self, id: i64, state: &str, now: i64) -> Result<()> {
+        let _ = (id, state, now);
+        Err(Error::Storage("write-back unsupported".into()))
+    }
+    /// Startup recovery: draining tasks go back to queued (their staging
+    /// file was renamed under them; the recorded path still points at it).
+    fn wb_requeue_draining(&self) -> Result<()> {
+        Ok(())
+    }
+    fn wb_active_tasks(&self) -> Result<Vec<WbTask>> {
+        Ok(Vec::new())
+    }
+    fn wb_all_stagings(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    /// Latest staged write for a node: (staging path, size) or None.
+    fn wb_latest_staging(&self, node_id: i64) -> Result<Option<(String, i64)>> {
+        let _ = node_id;
+        Ok(None)
+    }
+    /// (latest staged size, pending task count) for the projection.
+    fn wb_projection(&self, node_id: i64) -> Result<Option<(i64, i64)>> {
+        let _ = node_id;
+        Ok(None)
+    }
+    /// Cancel queued tasks for a node; returns their staging paths.
+    fn wb_cancel_queued(&self, node_id: i64) -> Result<Vec<String>> {
+        let _ = node_id;
+        Ok(Vec::new())
+    }
+    /// (queued, draining, dead) counts.
+    fn wb_counts(&self) -> Result<(u64, u64, u64)> {
+        Ok((0, 0, 0))
+    }
+}
+
+/// One deferred-commit task row (write-back prototype).
+#[derive(Debug, Clone)]
+pub struct WbTask {
+    pub id: i64,
+    pub node_id: i64,
+    pub staging: String,
+    pub size: i64,
+    pub expected: i64,
 }
