@@ -2687,8 +2687,11 @@ mod tests {
 
     /// A staging write whose half-written file CANNOT be deleted keeps its
     /// reservation (invariant 4: bytes may still occupy the disk). A later
-    /// reconcile() — which reflects reality — clears it.
+    /// reconcile() — which reflects reality — clears it. Unix-only: the
+    /// undeletable file is built from a 0o555 staging dir (unix permission
+    /// semantics; windows has no equivalent read-only-directory refusal).
     #[test]
+    #[cfg(unix)]
     fn p0c_half_written_file_keeps_reservation_until_reconciled() {
         let c = cap_core("halfwrite", 0, 0);
         c.create("/f", 0o644).unwrap();
@@ -2814,7 +2817,9 @@ mod tests {
     /// drain success with a staging file that cannot be deleted: bytes stay
     /// accounted (invariant 5), the task is still terminal, and a later
     /// recover() sweep releases them once the delete actually succeeds.
+    /// Unix-only: same 0o555-dir mechanism as the half-written test above.
     #[test]
+    #[cfg(unix)]
     fn p0c_drained_but_undeletable_keeps_bytes_until_sweep() {
         let dir = std::env::temp_dir().join(format!("lightfs-p0c-undel-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

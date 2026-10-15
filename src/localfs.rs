@@ -912,7 +912,10 @@ mod tests {
         fs
     }
 
+    // Unix-only: the scenario plants real symlinks (windows link creation
+    // needs privileges; without the links the assertions lose their subject).
     #[test]
+    #[cfg(unix)]
     fn planted_symlink_refused_on_open() {
         let t = tmpdir("symlink");
         let fs = fs_at(&t.join("root"));
@@ -947,7 +950,9 @@ mod tests {
         ));
     }
 
+    // Unix-only: same planted-symlink mechanism as the test above.
     #[test]
+    #[cfg(unix)]
     fn parent_escape_refused() {
         let t = tmpdir("escape");
         let fs = fs_at(&t.join("root"));
