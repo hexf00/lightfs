@@ -245,6 +245,64 @@ pub(crate) fn classify_object_upload_failure(e: &Error) -> &'static str {
     }
 }
 
+/// Backoff before a requeued task becomes claimable again — one constant
+/// for both drain paths so the retry cadence cannot drift apart.
+const REQUEUE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The complete upload-failure decision for one drained task (S4.7): the
+/// persisted error class AND whether this drain path auto-requeues. One
+/// type so the two drain engines cannot classify correctly and then
+/// decide wrongly (or vice versa) — the per-file and batch paths used to
+/// spell both halves out independently, which is exactly how the batch
+/// arm once drifted from the per-file arm. Pure logic: callers execute
+/// the requeue/dead-letter against the MetadataStore themselves.
+pub(crate) struct UploadDisposition {
+    /// Persisted on `wb_tasks.error_class` for every terminal outcome.
+    pub(crate) class: &'static str,
+    /// Auto-requeue with the bounded budget (transient only, per
+    /// [`retry_admissible`]'s production subset). When true but the
+    /// budget is exhausted, the caller dead-letters with the same class.
+    pub(crate) auto_requeue: bool,
+}
+
+pub(crate) fn upload_failure_disposition(e: &Error) -> UploadDisposition {
+    let class = classify_object_upload_failure(e);
+    UploadDisposition {
+        class,
+        auto_requeue: class == CLASS_UPLOAD_TRANSIENT,
+    }
+}
+
+/// Which drain path hit the dead letter — the shared wording must keep
+/// enough context to tell a single-task failure from a whole-batch one.
+pub(crate) enum UploadDeadScope {
+    /// Per-file drain (`drain_task`).
+    Task,
+    /// Batch drain (`seal_batch`): one failed pack upload dead-letters
+    /// every non-requeued member.
+    BatchMember,
+}
+
+/// The one dead-letter wording for upload failures on both drain paths.
+/// `auto_requeue` distinguishes "retries exhausted" from "never
+/// retryable" exactly as the two pre-existing wordings did.
+pub(crate) fn log_upload_dead(scope: UploadDeadScope, id: i64, d: &UploadDisposition, e: &Error) {
+    let who = match scope {
+        UploadDeadScope::Task => format!("task {id}"),
+        UploadDeadScope::BatchMember => format!("batch member task {id}"),
+    };
+    if d.auto_requeue {
+        eprintln!("lightfs wb: {who} dead after retries ({}): {e}", d.class);
+    } else if d.class == CLASS_UPLOAD_PERMANENT {
+        eprintln!(
+            "lightfs wb: {who} dead ({}): {e} — fix the cause before retrying",
+            d.class
+        );
+    } else {
+        eprintln!("lightfs wb: {who} dead ({}): {e}", d.class);
+    }
+}
+
 /// Result of probing a node's pending staged content (S3.5.1 three-state
 /// contract - the old `Option<Vec<u8>>` could not distinguish "no pending"
 /// from "the probe kept losing the race", and callers read exhaustion as
@@ -895,27 +953,19 @@ impl WriteBackEngine {
                 // upload failures requeue with a bounded budget; permanent
                 // remote verdicts and unjudgeable errors dead-letter now
                 // (retrying cannot fix a permission or a bucket policy).
-                let class = classify_object_upload_failure(&e);
-                if class == CLASS_UPLOAD_TRANSIENT
-                    && self.meta.wb_retry_or_dead(task.id, 3, self.now(), class)?
+                // The decision is shared with the batch path (S4.7); this
+                // arm keeps its own cleanup (version key) and control flow.
+                let d = upload_failure_disposition(&e);
+                if d.auto_requeue
+                    && self
+                        .meta
+                        .wb_retry_or_dead(task.id, 3, self.now(), d.class)?
                 {
-                    std::thread::sleep(Duration::from_millis(50));
+                    std::thread::sleep(REQUEUE_BACKOFF);
                     return Ok(());
                 }
-                if class == CLASS_UPLOAD_TRANSIENT {
-                    eprintln!(
-                        "lightfs wb: task {id} dead after retries ({class}): {e}",
-                        id = task.id
-                    );
-                } else if class == CLASS_UPLOAD_PERMANENT {
-                    eprintln!(
-                        "lightfs wb: task {id} dead ({class}): {e} — fix the cause before retrying",
-                        id = task.id
-                    );
-                } else {
-                    eprintln!("lightfs wb: task {id} dead ({class}): {e}", id = task.id);
-                }
-                self.meta.wb_mark_dead(task.id, class, self.now())?;
+                log_upload_dead(UploadDeadScope::Task, task.id, &d, &e);
+                self.meta.wb_mark_dead(task.id, d.class, self.now())?;
             }
         }
         Ok(())
@@ -1069,32 +1119,29 @@ impl WriteBackEngine {
             // + object, then S4.4 classification: transient failures
             // requeue with the retry budget; permanent remote verdicts and
             // unjudgeable outcomes dead-letter their members immediately.
+            // The decision and wording are shared with the per-file path
+            // (S4.7); this arm keeps its own cleanup (pack undo), its
+            // member loop, and the pack lifecycle — a batch upload failure
+            // is batch-scoped, but it never widens a single-member CAS
+            // outcome into a batch failure.
             let _ = self.objects.delete(&pack_key);
             let _ = self.meta.drop_pack(&pack_key);
-            let class = classify_object_upload_failure(&e);
+            let d = upload_failure_disposition(&e);
+            let mut requeued_any = false;
             for (task, _, _) in &entries {
-                if class == CLASS_UPLOAD_TRANSIENT
-                    && self.meta.wb_retry_or_dead(task.id, 3, self.now(), class)?
+                if d.auto_requeue
+                    && self
+                        .meta
+                        .wb_retry_or_dead(task.id, 3, self.now(), d.class)?
                 {
+                    requeued_any = true;
                     continue;
                 }
-                if class == CLASS_UPLOAD_PERMANENT {
-                    eprintln!(
-                        "lightfs wb: task {id} dead ({class}): {e} — fix the cause before retrying",
-                        id = task.id
-                    );
-                } else if class == CLASS_UPLOAD_TRANSIENT {
-                    eprintln!(
-                        "lightfs wb: task {id} dead after retries ({class}): {e}",
-                        id = task.id
-                    );
-                } else {
-                    eprintln!("lightfs wb: task {id} dead ({class}): {e}", id = task.id);
-                }
-                self.meta.wb_mark_dead(task.id, class, self.now())?;
+                log_upload_dead(UploadDeadScope::BatchMember, task.id, &d, &e);
+                self.meta.wb_mark_dead(task.id, d.class, self.now())?;
             }
-            if class == CLASS_UPLOAD_TRANSIENT {
-                std::thread::sleep(Duration::from_millis(50));
+            if requeued_any {
+                std::thread::sleep(REQUEUE_BACKOFF);
             }
             return Ok(());
         }
@@ -4360,6 +4407,308 @@ mod tests {
         let packs = c.metadata().pack_rows_debug().unwrap();
         assert_eq!(packs.len(), 1, "two members, ONE pack object");
         assert_eq!(packs[0].1, "active", "the batch finalized to active");
+    }
+
+    /// Object store failing put_stream while a counter is positive, with a
+    /// caller-chosen error shape (S4.7 batch-upload-failure harness: the
+    /// one-shot P0dFailOnce cannot express budget exhaustion or
+    /// fail-then-recover sequences).
+    struct P0dFailN {
+        inner: MemObjectStore,
+        remaining: std::sync::atomic::AtomicU32,
+        msg: &'static str,
+    }
+    impl P0dFailN {
+        fn fail_next(n: u32, msg: &'static str) -> Self {
+            Self {
+                inner: MemObjectStore::new(),
+                remaining: std::sync::atomic::AtomicU32::new(n),
+                msg,
+            }
+        }
+        fn forever(msg: &'static str) -> Self {
+            Self::fail_next(u32::MAX, msg)
+        }
+    }
+    impl crate::object_store::ObjectStore for P0dFailN {
+        fn put(
+            &self,
+            key: &str,
+            data: &[u8],
+        ) -> crate::error::Result<crate::object_store::ObjectInfo> {
+            self.inner.put(key, data)
+        }
+        fn put_stream(
+            &self,
+            key: &str,
+            reader: &mut dyn std::io::Read,
+            len: u64,
+        ) -> crate::error::Result<crate::object_store::ObjectInfo> {
+            if self.remaining.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                self.remaining
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(crate::error::Error::Storage(self.msg.into()));
+            }
+            self.inner.put_stream(key, reader, len)
+        }
+        fn get(
+            &self,
+            key: &str,
+            range: Option<crate::object_store::Range>,
+        ) -> crate::error::Result<crate::object_store::ObjectData> {
+            self.inner.get(key, range)
+        }
+        fn get_stream(
+            &self,
+            key: &str,
+            range: Option<crate::object_store::Range>,
+        ) -> crate::error::Result<(Box<dyn std::io::Read + Send>, u64)> {
+            self.inner.get_stream(key, range)
+        }
+        fn head(&self, key: &str) -> crate::error::Result<crate::object_store::ObjectInfo> {
+            self.inner.head(key)
+        }
+        fn delete(&self, key: &str) -> crate::error::Result<()> {
+            self.inner.delete(key)
+        }
+        fn list(
+            &self,
+            prefix: &str,
+            token: Option<&str>,
+            max: usize,
+        ) -> crate::error::Result<crate::object_store::ListPage> {
+            self.inner.list(prefix, token, max)
+        }
+        fn ping(&self) -> crate::error::Result<()> {
+            self.inner.ping()
+        }
+    }
+
+    /// Batch core over a custom object store (S4.7 batch-upload tests).
+    fn p0d4_batch_core_with_store(
+        tag: &str,
+        store: StdArc<dyn crate::object_store::ObjectStore>,
+    ) -> Core {
+        let dir = std::env::temp_dir().join(format!(
+            "lightfs-p0d4-{tag}-{}-{}",
+            std::process::id(),
+            tmp_unique()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Core::with_options(
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            store,
+            crate::core::DEFAULT_SUPERSEDED_SECS,
+            None,
+            Some(WbOptions {
+                staging_dir: dir.join("staging").to_string_lossy().to_string(),
+                drain_workers: 0,
+                batch_pack_bytes: 8388608,
+                batch_max_wait_ms: 0,
+                queue_max_tasks: 0,
+                staging_budget_bytes: 0,
+
+                ledger_lock_path: None,
+                probe_fault: false,
+            }),
+        )
+        .unwrap()
+    }
+
+    /// S4.7 shared decision table: the disposition BINDS the persisted
+    /// class to the auto-requeue decision, so a drain path cannot classify
+    /// correctly and decide wrongly. Exactly the R17 admission subset that
+    /// reaches the upload-failure arms.
+    #[test]
+    fn p0d47_upload_disposition_decision_table() {
+        use crate::error::Error;
+        let d = upload_failure_disposition(&Error::Storage(
+            "s3 transport: connection reset by peer".into(),
+        ));
+        assert_eq!(d.class, CLASS_UPLOAD_TRANSIENT);
+        assert!(d.auto_requeue);
+        for status in ["503", "429", "408", "500", "502"] {
+            let d = upload_failure_disposition(&Error::Storage(format!(
+                "s3 {status} on objects/x/k: boom"
+            )));
+            assert_eq!(d.class, CLASS_UPLOAD_TRANSIENT, "status {status}");
+            assert!(d.auto_requeue, "status {status}");
+        }
+        for status in ["403", "400", "404", "412"] {
+            let d = upload_failure_disposition(&Error::Storage(format!(
+                "s3 {status} on objects/x/k: boom"
+            )));
+            assert_eq!(d.class, CLASS_UPLOAD_PERMANENT, "status {status}");
+            assert!(!d.auto_requeue, "status {status}");
+        }
+        let d = upload_failure_disposition(&Error::Storage("part missing ETag".into()));
+        assert_eq!(d.class, CLASS_UNKNOWN);
+        assert!(!d.auto_requeue);
+        let d = upload_failure_disposition(&Error::ObjectMissing("objects/x/k".into()));
+        assert_eq!(
+            d.class, CLASS_UNKNOWN,
+            "non-Storage errors are never guessed"
+        );
+        assert!(!d.auto_requeue);
+    }
+
+    /// S4.7: a batch upload failure classified `upload-transient` requeues
+    /// EVERY member with the class persisted, undoes the pack row, and the
+    /// recovered batch later produces byte-identical committed content —
+    /// the historically-missing batch counterpart of the per-file R17
+    /// transient test.
+    #[test]
+    fn p0d47_batch_upload_transient_requeues_all_members_then_recovers() {
+        let c = p0d4_batch_core_with_store(
+            "bt",
+            StdArc::new(P0dFailN::fail_next(1, "s3 503 on packs/x: SlowDown")),
+        );
+        c.create("/f", 0o644).unwrap();
+        write_via_rpc(&c, "/f", b"batch transient f", Some(0));
+        c.create("/g", 0o644).unwrap();
+        write_via_rpc(&c, "/g", b"batch transient g!", Some(0));
+
+        assert!(c.wb().unwrap().drain_once().unwrap(), "seal attempted");
+        assert_eq!(
+            c.wb().unwrap().queue_counts(),
+            (2, 0, 0),
+            "both members requeued, none dead"
+        );
+        let rows = c.metadata().wb_task_rows().unwrap();
+        assert_eq!(rows.len(), 2);
+        for r in &rows {
+            assert_eq!(r.1, "queued");
+            assert_eq!(
+                r.3.as_deref(),
+                Some(CLASS_UPLOAD_TRANSIENT),
+                "the class is persisted while batch members wait"
+            );
+        }
+        assert_eq!(
+            c.metadata().pack_rows_debug().unwrap().len(),
+            0,
+            "the failed pack intent was undone"
+        );
+
+        assert!(c.wb().unwrap().drain_once().unwrap(), "retry seals");
+        assert_eq!(c.wb().unwrap().queue_counts(), (0, 0, 0));
+        assert_eq!(c.read("/f", 0, 100).unwrap(), b"batch transient f");
+        assert_eq!(c.read("/g", 0, 100).unwrap(), b"batch transient g!");
+        let packs = c.metadata().pack_rows_debug().unwrap();
+        assert_eq!(packs.len(), 1, "the recovered batch is ONE pack");
+        assert_eq!(packs[0].1, "active");
+    }
+
+    /// S4.7: a batch upload failure that NEVER succeeds exhausts the same
+    /// bounded budget as the per-file path and dead-letters every member
+    /// with `upload-transient` persisted, staging bytes still accounted.
+    #[test]
+    fn p0d47_batch_upload_transient_budget_exhaustion_dead_letters_with_class() {
+        let c = p0d4_batch_core_with_store(
+            "bx",
+            StdArc::new(P0dFailN::forever("s3 503 on packs/x: SlowDown")),
+        );
+        c.create("/f", 0o644).unwrap();
+        write_via_rpc(&c, "/f", b"exhaust f", Some(0));
+        c.create("/g", 0o644).unwrap();
+        write_via_rpc(&c, "/g", b"exhaust g!!", Some(0));
+
+        // attempts 1..=3 requeue, the third-or-later exhaustion dead-letters.
+        for i in 0..2 {
+            assert!(c.wb().unwrap().drain_once().unwrap(), "drain {i} requeues");
+        }
+        assert!(
+            c.wb().unwrap().drain_once().unwrap(),
+            "third drain exhausts"
+        );
+        assert_eq!(
+            c.wb().unwrap().queue_counts(),
+            (0, 0, 2),
+            "both members dead after the shared budget"
+        );
+        let rows = c.metadata().wb_task_rows().unwrap();
+        for r in &rows {
+            assert_eq!(r.1, "dead");
+            assert_eq!(r.2, 3, "exactly the bounded attempts were spent");
+            assert_eq!(r.3.as_deref(), Some(CLASS_UPLOAD_TRANSIENT));
+        }
+        assert_eq!(
+            c.metadata().pack_rows_debug().unwrap().len(),
+            0,
+            "no pack row survives a failed upload"
+        );
+        // P0-c dead-byte rules: staging still on disk, still accounted.
+        let (staged, reserved) = c.metadata().wb_capacity_snapshot().unwrap();
+        assert_eq!(staged, 20, "9+11 declared bytes stay accounted");
+        assert_eq!(reserved, 0);
+        assert_eq!(
+            c.wb().unwrap().reconcile_capacity_and_report().unwrap(),
+            (20, 0),
+            "reconcile sees the real staging files (still there)"
+        );
+    }
+
+    /// S4.7: a batch upload failure classified `upload-permanent`
+    /// dead-letters every member on the FIRST failure — no auto attempt is
+    /// spent, the class and the dead-byte accounting persist.
+    #[test]
+    fn p0d47_batch_upload_permanent_dead_letters_all_members_immediately() {
+        let c = p0d4_batch_core_with_store(
+            "bp",
+            StdArc::new(P0dFailN::forever("s3 403 on packs/x: AccessDenied")),
+        );
+        c.create("/f", 0o644).unwrap();
+        write_via_rpc(&c, "/f", b"perm f", Some(0));
+        c.create("/g", 0o644).unwrap();
+        write_via_rpc(&c, "/g", b"perm g!", Some(0));
+
+        assert!(c.wb().unwrap().drain_once().unwrap());
+        assert_eq!(
+            c.wb().unwrap().queue_counts(),
+            (0, 0, 2),
+            "one drain is enough: every member dead, none requeued"
+        );
+        let rows = c.metadata().wb_task_rows().unwrap();
+        for r in &rows {
+            assert_eq!(r.1, "dead");
+            assert_eq!(r.2, 0, "no retry attempt was spent on a verdict");
+            assert_eq!(r.3.as_deref(), Some(CLASS_UPLOAD_PERMANENT));
+        }
+        assert_eq!(c.metadata().pack_rows_debug().unwrap().len(), 0);
+        let (staged, reserved) = c.metadata().wb_capacity_snapshot().unwrap();
+        assert_eq!(staged, 13, "6+7 declared bytes stay accounted");
+        assert_eq!(reserved, 0);
+        assert_eq!(
+            c.wb().unwrap().reconcile_capacity_and_report().unwrap(),
+            (13, 0),
+            "staging files remain on disk behind the accounting"
+        );
+    }
+
+    /// S4.7: an unjudgeable batch upload outcome dead-letters every member
+    /// as `unknown` immediately — the batch path can never record a
+    /// retryable class the caller did not earn, and never silently drops
+    /// the error text (the historic batch-arm gap).
+    #[test]
+    fn p0d47_batch_upload_unknown_dead_letters_immediately_with_class() {
+        let c =
+            p0d4_batch_core_with_store("bu", StdArc::new(P0dFailN::forever("part missing ETag")));
+        c.create("/f", 0o644).unwrap();
+        write_via_rpc(&c, "/f", b"unknown f", Some(0));
+        c.create("/g", 0o644).unwrap();
+        write_via_rpc(&c, "/g", b"unknown g!", Some(0));
+
+        assert!(c.wb().unwrap().drain_once().unwrap());
+        assert_eq!(c.wb().unwrap().queue_counts(), (0, 0, 2));
+        let rows = c.metadata().wb_task_rows().unwrap();
+        for r in &rows {
+            assert_eq!(r.1, "dead");
+            assert_eq!(r.2, 0);
+            assert_eq!(r.3.as_deref(), Some(CLASS_UNKNOWN));
+        }
+        assert_eq!(c.metadata().pack_rows_debug().unwrap().len(), 0);
+        let (staged, _) = c.metadata().wb_capacity_snapshot().unwrap();
+        assert_eq!(staged, 19, "9+10 declared bytes stay accounted");
     }
 
     /// P0-d.2 capability gate: a staging directory whose namespace cannot
