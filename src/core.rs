@@ -296,6 +296,62 @@ impl Core {
         &self.meta
     }
 
+    // ---- S4.2 P0-a: durable object deletion (gc). Candidates are enrolled
+    // as deletion intents and executed against the object store with
+    // transactional guards; the production CLI refuses to run this until
+    // P0-b's backup-manifest protection exists (gc dependency gate).
+
+    /// Enroll gc candidates as durable deletion intents: unreferenced packs
+    /// past their retention window and superseded per-file objects. Each
+    /// registration re-checks its guards inside its own transaction and
+    /// returns false when the predicate no longer holds.
+    pub fn gc_enroll_candidates(&self, cutoff: i64) -> Result<(usize, usize)> {
+        let mut packs = 0usize;
+        let mut objects = 0usize;
+        for (key, _) in self.meta.gc_pack_candidates(cutoff, 1000)? {
+            if self.meta.gc_register_pack_deletion(&key, self.now())? {
+                packs += 1;
+            }
+        }
+        for key in self.meta.gc_candidates(cutoff, 1000)? {
+            if self
+                .meta
+                .gc_register_superseded_deletion(&key, self.now())?
+            {
+                objects += 1;
+            }
+        }
+        Ok((packs, objects))
+    }
+
+    /// Execute claimed deletion tasks: remote delete (idempotent — a key
+    /// already gone, e.g. a crash after the remote delete but before the
+    /// local finalize, counts as success) then the transactional finalize.
+    /// Failures persist as retryable rows; the intent is never lost.
+    pub fn gc_execute_deletions(&self, limit: usize) -> Result<(u64, u64)> {
+        let mut done = 0u64;
+        let mut failed = 0u64;
+        for d in self.meta.gc_claim_deletions(limit, self.now())? {
+            let res = match self.objects.delete(&d.key) {
+                Ok(()) => Ok(()),
+                Err(Error::NotFound(_)) => Ok(()),
+                Err(e) => Err(e),
+            };
+            match res {
+                Ok(()) => {
+                    self.meta.gc_complete_deletion(d.id, self.now())?;
+                    done += 1;
+                }
+                Err(e) => {
+                    self.meta
+                        .gc_fail_deletion(d.id, &format!("{e}"), self.now())?;
+                    failed += 1;
+                }
+            }
+        }
+        Ok((done, failed))
+    }
+
     pub fn objects(&self) -> &Arc<dyn ObjectStore> {
         &self.objects
     }
@@ -1285,6 +1341,93 @@ mod tests {
             Arc::new(SqliteMetadataStore::open_in_memory().unwrap()),
             Arc::new(MemObjectStore::new()),
         )
+    }
+
+    // ---- S4.2 P0-a: durable deletion tasks over a fake ObjectStore.
+
+    /// Red-test 10: a remote delete failure persists as a retryable
+    /// deletion task (intent never lost), and the next pass converges.
+    #[test]
+    fn p0a_deletion_failure_persists_then_retry_succeeds() {
+        let mem = Arc::new(MemObjectStore::new());
+        let c = Core::new(
+            Arc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            mem.clone(),
+        );
+        let p = "packs/p0a-fail.data";
+        c.metadata().register_pack(p, 100).unwrap();
+        c.metadata().mark_pack_uploaded(p, 1).unwrap();
+        c.metadata().wb_finalize_batch_if_terminal(p, 1).unwrap();
+        // Past the retention window: the pack enrolls as a deletion intent.
+        let (packs, objects) = c.gc_enroll_candidates(i64::MAX).unwrap();
+        assert_eq!((packs, objects), (1, 0));
+        // First execution fails on the remote: the task survives as failed
+        // and the pack row stays `deleting` (no refs can be created).
+        mem.inject_delete_failure(p);
+        let (done, failed) = c.gc_execute_deletions(10).unwrap();
+        assert_eq!((done, failed), (0, 1));
+        assert!(c.metadata().pack_state(p).unwrap().is_some());
+        assert!(
+            c.metadata()
+                .gc_pack_candidates(i64::MAX, 10)
+                .unwrap()
+                .is_empty()
+        );
+        // Second execution succeeds: pack row finalized away.
+        let (done, failed) = c.gc_execute_deletions(10).unwrap();
+        assert_eq!((done, failed), (1, 0));
+        assert!(c.metadata().pack_state(p).unwrap().is_none());
+    }
+
+    /// Red-test 11: a crash between the remote delete and the local
+    /// finalize re-enters the queue on the next pass and converges
+    /// (remote delete is idempotent).
+    #[test]
+    fn p0a_crash_before_finalize_requeues_and_converges() {
+        let c = core();
+        let p = "packs/p0a-crash.data";
+        c.metadata().register_pack(p, 100).unwrap();
+        c.metadata().mark_pack_uploaded(p, 1).unwrap();
+        c.metadata().wb_finalize_batch_if_terminal(p, 1).unwrap();
+        c.gc_enroll_candidates(i64::MAX).unwrap();
+        // "Crash": the claim happened (deleting) but execution never did.
+        let claimed = c.metadata().gc_claim_deletions(10, c.now()).unwrap();
+        assert_eq!(claimed.len(), 1);
+        // Next pass: the stale claim re-enters, executes, finalizes.
+        let (done, failed) = c.gc_execute_deletions(10).unwrap();
+        assert_eq!((done, failed), (1, 0));
+        assert!(c.metadata().pack_state(p).unwrap().is_none());
+    }
+
+    /// Superseded per-file objects ride the same durable deletion task flow.
+    #[test]
+    fn p0a_superseded_object_deletion_task_flow() {
+        let c = core();
+        c.create("/f", 0o644).unwrap();
+        let v1 = c
+            .write_stream(
+                "/f",
+                Some(0),
+                false,
+                &mut std::io::Cursor::new(b"one".to_vec()),
+                3,
+            )
+            .unwrap();
+        let old_key = v1.object_key.clone().unwrap();
+        c.write_stream(
+            "/f",
+            Some(1),
+            false,
+            &mut std::io::Cursor::new(b"two!".to_vec()),
+            4,
+        )
+        .unwrap();
+        let (packs, objects) = c.gc_enroll_candidates(i64::MAX).unwrap();
+        assert_eq!((packs, objects), (0, 1), "the superseded v1 key enrolls");
+        let (done, _) = c.gc_execute_deletions(10).unwrap();
+        assert_eq!(done, 1);
+        assert!(c.objects().get(&old_key, None).is_err(), "v1 bytes gone");
+        assert!(c.metadata().all_superseded().unwrap().is_empty());
     }
 
     #[test]

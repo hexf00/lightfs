@@ -18,6 +18,9 @@ struct Entry {
 pub struct MemObjectStore {
     objects: Mutex<BTreeMap<String, Entry>>,
     counter: std::sync::atomic::AtomicU64,
+    /// Test-only failure injection: deletes of a key present here error
+    /// once (gc retry-path coverage without a network).
+    delete_failures: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Default for MemObjectStore {
@@ -31,7 +34,14 @@ impl MemObjectStore {
         Self {
             objects: Mutex::new(BTreeMap::new()),
             counter: std::sync::atomic::AtomicU64::new(1),
+            delete_failures: Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Test-only: make the next `delete(key)` return a storage error so gc
+    /// deletion-task retry paths can be driven deterministically.
+    pub fn inject_delete_failure(&self, key: &str) {
+        self.delete_failures.lock().unwrap().insert(key.to_string());
     }
 
     fn info(&self, key: &str, e: &Entry) -> ObjectInfo {
@@ -120,6 +130,11 @@ impl ObjectStore for MemObjectStore {
     }
 
     fn delete(&self, key: &str) -> Result<()> {
+        if self.delete_failures.lock().unwrap().remove(key) {
+            return Err(Error::Storage(format!(
+                "injected delete failure for testing: {key}"
+            )));
+        }
         self.objects.lock().unwrap().remove(key);
         Ok(())
     }

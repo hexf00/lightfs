@@ -194,6 +194,24 @@ impl WriteBackEngine {
         if swept > 0 {
             eprintln!("lightfs wb: swept {swept} orphaned staging file(s)");
         }
+        // P0-a recovery sweep 1: batches a crash left in `committing`
+        // finalize here when no non-terminal task remains for them —
+        // the same verify-references-then-decide transaction the drain
+        // uses, never a state guessed from stale rows.
+        for pk in self.meta.committing_packs()? {
+            self.meta.wb_finalize_batch_if_terminal(&pk, self.now())?;
+        }
+        // P0-a recovery sweep 2: dead tasks that had already uploaded bytes
+        // leave orphan candidates. Enrollment re-checks "no live reference"
+        // in the registration transaction and confirms the object still
+        // exists before recording the durable deletion intent.
+        for key in self.meta.dead_task_orphans()? {
+            if self.objects.head(&key).is_ok()
+                && self.meta.gc_enqueue_orphan_object(&key, self.now())?
+            {
+                eprintln!("lightfs wb: orphan object {key} enrolled for deletion");
+            }
+        }
         Ok(())
     }
 
@@ -416,14 +434,22 @@ impl WriteBackEngine {
         let put = self.objects.put(&version_key, &content);
         self.metrics.s3_put.fetch_add(1, Ordering::Relaxed);
         let outcome = match put {
-            Ok(info) => self.meta.commit_content_cas(
-                task.node_id,
-                task.expected,
-                task.size,
-                self.now(),
-                &version_key,
-                &info.etag,
-            ),
+            Ok(info) => {
+                // Bytes are on the remote: from this point a terminal
+                // failure (dead-letter) leaves `version_key` as an orphan
+                // candidate — record it on the task so recover() can
+                // enroll it for the durable deletion task.
+                self.meta
+                    .wb_set_uploaded_key(task.id, &version_key, self.now())?;
+                self.meta.commit_content_cas(
+                    task.node_id,
+                    task.expected,
+                    task.size,
+                    self.now(),
+                    &version_key,
+                    &info.etag,
+                )
+            }
             Err(e) => Err(e),
         };
         match outcome {
@@ -599,6 +625,13 @@ impl WriteBackEngine {
         };
         let _ = put;
         self.meta.mark_pack_uploaded(&pack_key, self.now())?;
+        // P0-a: bind the claimed tasks to THIS batch before any member CAS —
+        // the batch is now `committing`, its members are tracked, and the
+        // termination decision keys off this binding.
+        let member_ids: Vec<i64> = entries.iter().map(|(t, _, _)| t.id).collect();
+        self.meta
+            .wb_bind_pack_keys(&member_ids, Some(&pack_key), self.now())?;
+        let mut batch_finalized = false;
         for (task, off, len) in entries {
             let hash = crate::pack::content_hash(&buf[off..off + len]);
             // Errors propagate: a get_node failure must not silently skip
@@ -667,7 +700,24 @@ impl WriteBackEngine {
                             "lightfs wb: task {id} dead after retries: {e}",
                             id = task.id
                         );
+                    } else {
+                        // requeued: stays non-terminal, the batch cannot
+                        // finalize until this task reaches a terminal state.
+                        continue;
                     }
+                }
+            }
+            // P0-a: every member terminal transition re-runs the (idempotent)
+            // batch termination decision in its own transaction — the pack
+            // becomes active/unreferenced exactly when the last member lands.
+            if !batch_finalized {
+                self.meta
+                    .wb_finalize_batch_if_terminal(&pack_key, self.now())?;
+                if matches!(
+                    self.meta.pack_state(&pack_key),
+                    Ok(Some((s, _))) if s != "committing"
+                ) {
+                    batch_finalized = true;
                 }
             }
         }
@@ -1689,5 +1739,68 @@ mod tests {
         let _ = write_via_rpc(&c, "/g", b"never drains", Some(0));
         c.unlink("/g").unwrap();
         assert_eq!(c.metrics.wb_cancelled.load(Ordering::Relaxed), 1);
+    }
+
+    /// P0-a: recover() resolves batches a crash left in `committing` and
+    /// enrolls dead-task orphan objects as durable deletion intents; the
+    /// enrolled object is then reclaimed by the gc executor (Core side).
+    #[test]
+    fn recover_finalizes_stale_batches_and_enrolls_dead_task_orphans() {
+        let meta = StdArc::new(SqliteMetadataStore::open_in_memory().unwrap());
+        let objects = StdArc::new(MemObjectStore::new());
+        let dir = std::env::temp_dir().join(format!(
+            "lightfs-wb-recover-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let opts = WbOptions {
+            staging_dir: dir.join("staging").to_string_lossy().to_string(),
+            drain_workers: 0,
+            batch_pack_bytes: 0,
+            batch_max_wait_ms: 0,
+            queue_max_tasks: 0,
+        };
+        let eng = WriteBackEngine::new(
+            meta.clone(),
+            objects.clone(),
+            StdArc::new(Metrics::default()),
+            &opts,
+            false,
+        )
+        .unwrap();
+
+        // A crash left this batch `committing` with no tasks left behind.
+        meta.register_pack("packs/stale.data", 10).unwrap();
+        meta.mark_pack_uploaded("packs/stale.data", 1).unwrap();
+        // A dead task whose bytes had already been uploaded: orphan candidate.
+        let n = meta
+            .create_node(1, "f", crate::metadata::NodeKind::File, 0o644, None)
+            .unwrap();
+        let staged = dir.join("wb-dead.data").to_string_lossy().to_string();
+        std::fs::write(&staged, b"x").unwrap();
+        let (task_id, _) = meta.wb_enqueue(n.id, &staged, 1, 0, 1).unwrap();
+        let orphan = "objects/1/w-orphan.data";
+        meta.wb_set_uploaded_key(task_id, orphan, 1).unwrap();
+        meta.wb_set_state(task_id, "dead", 1).unwrap();
+        objects.put(orphan, b"z").unwrap();
+
+        eng.recover().unwrap();
+
+        // Batch sweep: no non-terminal tasks -> terminated, retention starts.
+        let (st, unref) = meta.pack_state("packs/stale.data").unwrap().unwrap();
+        assert_eq!(st, "unreferenced");
+        assert!(unref.is_some());
+        // Orphan enrollment: the intent is durable; nothing is deleted here.
+        assert!(objects.head(orphan).is_ok());
+        // The gc executor (Core side) reclaims the enrolled object.
+        let c = Core::new(meta.clone(), objects.clone());
+        let (done, failed) = c.gc_execute_deletions(10).unwrap();
+        assert_eq!((done, failed), (1, 0));
+        assert!(objects.head(orphan).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -212,6 +212,83 @@ pub trait MetadataStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    // ---- S4.2 P0-a: pack lifecycle + durable deletion tasks. Defaults
+    // report the empty/unsupported outcome; only the SQLite backend
+    // implements them (the only backend this branch ships).
+
+    /// (state, unref_since) of one pack, or None when no row exists.
+    /// Test/gate surface for the lifecycle state machine.
+    fn pack_state(&self, key: &str) -> Result<Option<(String, Option<i64>)>> {
+        let _ = key;
+        Ok(None)
+    }
+    /// Pack keys currently in `committing` (recover's batch-finalize sweep).
+    fn committing_packs(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    /// Bind claimed tasks to a batch's pack key (or clear it for per-file
+    /// drains). Batches abandoned by the move finalize in the same
+    /// transaction once no non-terminal task remains for them.
+    fn wb_bind_pack_keys(&self, ids: &[i64], pack_key: Option<&str>, now: i64) -> Result<()> {
+        let _ = (ids, pack_key, now);
+        Ok(())
+    }
+    /// Batch termination decision: only when no non-terminal task still
+    /// carries `pack_key` is the final reference count verified in one
+    /// transaction — refs>0 → `active`, refs==0 → `unreferenced` from now.
+    fn wb_finalize_batch_if_terminal(&self, pack_key: &str, now: i64) -> Result<()> {
+        let _ = (pack_key, now);
+        Ok(())
+    }
+    /// Record the object key a task already uploaded (orphan provenance for
+    /// dead-lettered tasks).
+    fn wb_set_uploaded_key(&self, id: i64, key: &str, now: i64) -> Result<()> {
+        let _ = (id, key, now);
+        Ok(())
+    }
+    /// Object keys uploaded by dead tasks and referenced by no live node.
+    fn dead_task_orphans(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    /// Register deletion intent for a gc-eligible pack: transaction re-checks
+    /// "no live references AND still `unreferenced`" and flips the pack to
+    /// `deleting` (from which new references are refused). False = not eligible.
+    fn gc_register_pack_deletion(&self, key: &str, now: i64) -> Result<bool> {
+        let _ = (key, now);
+        Ok(false)
+    }
+    /// Register deletion intent for a superseded per-file object: re-checks
+    /// the superseded row exists AND no live node references the key.
+    fn gc_register_superseded_deletion(&self, key: &str, now: i64) -> Result<bool> {
+        let _ = (key, now);
+        Ok(false)
+    }
+    /// Register deletion intent for an orphan object (uploaded by a dead
+    /// task, referenced by nobody). Guards run in the registration transaction.
+    fn gc_enqueue_orphan_object(&self, key: &str, now: i64) -> Result<bool> {
+        let _ = (key, now);
+        Ok(false)
+    }
+    /// Claim deletion work: `deleting` rows from a crashed executor re-enter
+    /// the queue (the remote delete is idempotent), then pending/failed rows
+    /// move to `deleting` and are returned.
+    fn gc_claim_deletions(&self, limit: usize, now: i64) -> Result<Vec<GcDeletion>> {
+        let _ = (limit, now);
+        Ok(Vec::new())
+    }
+    /// Finalize a succeeded deletion: `done` plus the kind-specific local
+    /// cleanup (pack row / superseded row), one transaction.
+    fn gc_complete_deletion(&self, id: i64, now: i64) -> Result<()> {
+        let _ = (id, now);
+        Ok(())
+    }
+    /// Record a failed deletion attempt (state back to `failed`, retried by
+    /// the next pass; the intent is never lost).
+    fn gc_fail_deletion(&self, id: i64, err: &str, now: i64) -> Result<()> {
+        let _ = (id, err, now);
+        Ok(())
+    }
+
     // ---- S3.1 write-back prototype: the durable task queue lives in the
     // metadata store so staging + task commit share one durability story
     // (WAL SQLite). Default implementations report unsupported; the SQLite
@@ -300,4 +377,13 @@ pub struct WbTask {
     pub staging: String,
     pub size: i64,
     pub expected: i64,
+}
+
+/// One durable deletion task claimed for execution (P0-a).
+#[derive(Debug, Clone)]
+pub struct GcDeletion {
+    pub id: i64,
+    pub key: String,
+    /// 'pack' | 'object' — drives the local cleanup on completion.
+    pub kind: String,
 }

@@ -62,67 +62,24 @@ pub fn backup(cfg: &Config, output: &str) -> Result<()> {
     Ok(())
 }
 
-/// `lightfs gc`: purge retained (superseded) objects whose retention window
-/// has passed and that no live node references anymore. The live-reference
-/// guard makes this safe against crash windows between the supersede record
-/// and the metadata update.
+/// `lightfs gc`: P0-a gc dependency gate. Object deletion must not run
+/// until the backup-manifest protection lands (P0-b: canonical backup
+/// root, gc.lock, fail-closed manifests) — `lightfs backup` today cannot
+/// prove which objects a supported backup still references. Lifecycle
+/// states, candidates and durable deletion tasks keep being tracked in the
+/// metadata store; this command simply refuses to delete anything.
 pub fn gc(cfg: &Config) -> Result<()> {
     if cfg.retention.superseded_secs == 0 {
         return Err(Error::Config(
             "retention.superseded_secs = 0: retention is disabled, there is nothing to gc".into(),
         ));
     }
-    let eng = engine::open_embedded(cfg)?;
-    let cutoff = now_secs() - cfg.retention.superseded_secs as i64;
-    let mut purged = 0u64;
-    let mut failed = 0u64;
-    loop {
-        let keys = eng.core.metadata().gc_candidates(cutoff, 100)?;
-        if keys.is_empty() {
-            break;
-        }
-        for key in keys {
-            match eng.core.objects().delete(&key) {
-                Ok(()) => purged += 1,
-                Err(_) => {
-                    failed += 1;
-                    continue; // keep the row; next gc retries the object
-                }
-            }
-            eng.core.metadata().drop_superseded(&key)?;
-        }
-    }
-    // S3.1 pack gc: uploaded packs past the window with NO live references
-    // (the live-reference guard lives in gc_pack_candidates' SQL). Pending
-    // packs (never uploaded) are never candidates.
-    let mut purged_packs = 0u64;
-    let mut freed_bytes = 0i64;
-    loop {
-        let packs = eng.core.metadata().gc_pack_candidates(cutoff, 100)?;
-        if packs.is_empty() {
-            break;
-        }
-        for (key, bytes) in packs {
-            match eng.core.objects().delete(&key) {
-                Ok(()) => {
-                    purged_packs += 1;
-                    freed_bytes += bytes;
-                }
-                Err(_) => {
-                    failed += 1;
-                    continue; // keep the row; next gc retries the object
-                }
-            }
-            eng.core.metadata().drop_pack(&key)?;
-        }
-    }
-    let retained = eng.core.metadata().all_superseded()?.len();
-    let packs_left = eng.core.metadata().all_packs()?.len();
-    println!(
-        "gc: purged {purged} object(s) + {purged_packs} pack(s) ({freed_bytes}B), {failed} failed (kept for retry), {retained} still retained, {packs_left} pack rows (superseded_secs = {})",
-        cfg.retention.superseded_secs
-    );
-    Ok(())
+    Err(Error::Config(
+        "gc: object deletion is disabled until backup-manifest protection lands (P0-b); \
+         lifecycle states, candidates and deletion tasks keep being tracked, \
+         but no object is deleted"
+            .into(),
+    ))
 }
 
 fn now_secs() -> i64 {
