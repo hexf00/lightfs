@@ -748,5 +748,233 @@ fn s431_prune_removes_directory_then_fsyncs_root_within_one_lock() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ---- S4.3.2: prune persistence commit point + failure paths ------------
+// Every scenario below runs the REAL prune sequence with injectable
+// root-fsync / directory-removal ops (call-order counted — no sleeps, no
+// timing luck). After EVERY return path we re-acquire the maintenance lock
+// to prove the shared gc.lock was released (no stranded locks).
+
+/// Small gc-capable fixture: core + fake store with one qualified superseded
+/// candidate physically present, canonical root created.
+fn prune_gc_fixture(dir: &Path, key: &str) -> (Arc<Core>, Arc<MemObjectStore>, PathBuf) {
+    let (root, mem) = (dir.join("root"), Arc::new(MemObjectStore::new()));
+    let core = Arc::new(Core::with_retention(
+        Arc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+        mem.clone(),
+        0,
+    ));
+    mem.put(key, b"prune-fixture-bytes").unwrap();
+    core.metadata().record_superseded(key, 1).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    (core, mem, root)
+}
+
+fn gc_now(core: &Core, root: &Path) -> crate::cmd::GcSummary {
+    crate::cmd::gc_run(core, Some(root.to_str().unwrap()), 5, 0, now_secs() + 10).unwrap()
+}
+
+/// Asserts the lock is free by taking and dropping it.
+fn assert_lock_released(root: &Path) {
+    drop(MaintenanceLock::acquire(root, 1).unwrap());
+}
+
+/// 1) rename done, FIRST root fsync fails: persistence is unconfirmed.
+///    The pending dir must exist and block gc (fail-closed, zero deletes);
+///    a retry with the real ops converges.
+#[test]
+fn s432_prune_fsync1_fails_keeps_pending_blocks_gc_retry_converges() {
+    let dir = temp_dir("p32-fsync1");
+    let cfg = cfg_with(Some(&dir.join("root")), &dir.join("m.db"), 5);
+    let (core, mem, root) = prune_gc_fixture(&dir, "objects/9/w-p32.data");
+    write_backup_dir(&root, "bk", &valid_manifest(None, &["objects/z"]), None);
+
+    let mut fsync_calls = 0u32;
+    let mut no_remove =
+        |_p: &Path| -> Result<()> { panic!("remove must not run before the commit point") };
+    let e = super::backup_prune_impl(
+        &cfg,
+        "bk",
+        &mut |_p| {
+            fsync_calls += 1;
+            if fsync_calls == 1 {
+                Err(Error::Storage("injected fsync failure".into()))
+            } else {
+                Ok(())
+            }
+        },
+        &mut no_remove,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{e}").contains("UNCONFIRMED"),
+        "honest error required: {e}"
+    );
+    assert!(
+        !root.join("bk").exists(),
+        "renamed away in the current view"
+    );
+    assert!(root.join(".prune-pending-bk").exists(), "pending kept");
+    // The scanner fail-closes on the pending entry (never ignores it).
+    let e = super::scan_backups(root.to_str().unwrap()).unwrap_err();
+    assert!(format!("{e}").contains("unfinished backup prune"), "{e}");
+    // gc: zero object-delete calls while the pending entry blocks.
+    let e =
+        crate::cmd::gc_run(&core, Some(root.to_str().unwrap()), 5, 0, now_secs() + 10).unwrap_err();
+    assert!(format!("{e}").contains("fail-closed"), "{e}");
+    assert_eq!(
+        mem.delete_calls(),
+        0,
+        "no deletes under an unfinished prune"
+    );
+    assert_lock_released(&root);
+    // Retry with the REAL ops finishes the cleanup; protection released
+    // only now.
+    super::backup_prune(&cfg, "bk").unwrap();
+    assert!(!root.join(".prune-pending-bk").exists());
+    let scanned = super::scan_backups(root.to_str().unwrap()).unwrap();
+    assert!(scanned.is_empty(), "retired backup no longer scans");
+    gc_now(&core, &root);
+    assert!(
+        mem.head("objects/9/w-p32.data").is_err(),
+        "gc runs freely only after the prune commit point"
+    );
+    assert_lock_released(&root);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 2) commit point passed, pending-dir REMOVAL fails: retirement stands,
+///    pending still blocks gc; retry converges.
+#[test]
+fn s432_prune_removal_fails_pending_still_blocks_gc_retry_converges() {
+    let dir = temp_dir("p32-rm");
+    let cfg = cfg_with(Some(&dir.join("root")), &dir.join("m.db"), 5);
+    let (core, mem, root) = prune_gc_fixture(&dir, "objects/8/w-p32.data");
+    write_backup_dir(&root, "bk", &valid_manifest(None, &["objects/z"]), None);
+
+    let mut remove_calls = 0u32;
+    let e = super::backup_prune_impl(&cfg, "bk", &mut |_p| Ok(()), &mut |_p| {
+        remove_calls += 1;
+        Err(Error::Storage("injected removal failure".into()))
+    })
+    .unwrap_err();
+    assert!(
+        format!("{e}").contains("cannot remove pending prune"),
+        "{e}"
+    );
+    assert!(root.join(".prune-pending-bk").exists(), "pending kept");
+    assert!(
+        super::scan_backups(root.to_str().unwrap()).is_err(),
+        "fail-closed"
+    );
+    let e =
+        crate::cmd::gc_run(&core, Some(root.to_str().unwrap()), 5, 0, now_secs() + 10).unwrap_err();
+    assert!(format!("{e}").contains("fail-closed"), "{e}");
+    assert_eq!(mem.delete_calls(), 0, "protected until cleanup converges");
+    assert_lock_released(&root);
+    super::backup_prune(&cfg, "bk").unwrap();
+    assert!(!root.join(".prune-pending-bk").exists());
+    assert!(
+        super::scan_backups(root.to_str().unwrap())
+            .unwrap()
+            .is_empty()
+    );
+    assert_lock_released(&root);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 3) pending removed, SECOND root fsync fails: the commit point already
+///    passed, so the retirement stands and gc may run in the CURRENT view —
+///    but the error is honest, and a resurrected pending entry (the
+///    power-loss worst case this second fsync guards) fail-closes gc again.
+#[test]
+fn s432_prune_fsync2_fails_retired_but_error_and_resurrection_blocks() {
+    let dir = temp_dir("p32-fsync2");
+    let cfg = cfg_with(Some(&dir.join("root")), &dir.join("m.db"), 5);
+    let (core, mem, root) = prune_gc_fixture(&dir, "objects/7/w-p32.data");
+    write_backup_dir(&root, "bk", &valid_manifest(None, &["objects/z"]), None);
+
+    let mut fsync_calls = 0u32;
+    let e = super::backup_prune_impl(
+        &cfg,
+        "bk",
+        &mut |_p| {
+            fsync_calls += 1;
+            if fsync_calls == 2 {
+                Err(Error::Storage("injected fsync failure".into()))
+            } else {
+                Ok(())
+            }
+        },
+        &mut |p: &Path| {
+            // the real removal: the mock must reflect the state it claims
+            std::fs::remove_dir_all(p).map_err(|e| Error::Storage(format!("remove: {e}")))
+        },
+    )
+    .unwrap_err();
+    assert!(format!("{e}").contains("commit point passed"), "{e}");
+    assert!(!root.join("bk").exists());
+    assert!(
+        !root.join(".prune-pending-bk").exists(),
+        "removed before the failing fsync"
+    );
+    // Current view is clean and PAST the commit point: scanning succeeds
+    // without the backup, and gc is allowed (safe state; the fixture has no
+    // other candidates, so zero deletes happen here).
+    let scanned = super::scan_backups(root.to_str().unwrap()).unwrap();
+    assert!(scanned.is_empty());
+    gc_now(&core, &root);
+    assert_lock_released(&root);
+    // Worst case the failed fsync was guarding: the pending entry
+    // reappears after power loss — gc must fail closed again, never
+    // silently proceed, and the retired backup is never re-validated.
+    std::fs::create_dir_all(root.join(".prune-pending-bk")).unwrap();
+    let e = super::scan_backups(root.to_str().unwrap()).unwrap_err();
+    assert!(format!("{e}").contains("unfinished backup prune"), "{e}");
+    let deletes_before = mem.delete_calls();
+    let e =
+        crate::cmd::gc_run(&core, Some(root.to_str().unwrap()), 5, 0, now_secs() + 10).unwrap_err();
+    assert!(format!("{e}").contains("fail-closed"), "{e}");
+    assert_eq!(
+        mem.delete_calls(),
+        deletes_before,
+        "resurrected pending = no NEW deletes"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 4) clean path: prune completes, nothing pending, gc runs, lock released.
+#[test]
+fn s432_prune_clean_path_commits_and_releases_lock() {
+    let dir = temp_dir("p32-clean");
+    let cfg = cfg_with(Some(&dir.join("root")), &dir.join("m.db"), 5);
+    let (core, mem, root) = prune_gc_fixture(&dir, "objects/6/w-p32.data");
+    write_backup_dir(&root, "bk", &valid_manifest(None, &["objects/z"]), None);
+
+    super::backup_prune(&cfg, "bk").unwrap();
+    assert!(!root.join("bk").exists() && !root.join(".prune-pending-bk").exists());
+    let scanned = super::scan_backups(root.to_str().unwrap()).unwrap();
+    assert!(scanned.is_empty());
+    // After the commit point gc works end-to-end on real candidates.
+    gc_now(&core, &root);
+    assert!(mem.head("objects/6/w-p32.data").is_err());
+    assert_lock_released(&root);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Guard rail: a pending entry AND a live directory for the same id is an
+/// inconsistent state — refuse loudly instead of guessing.
+#[test]
+fn s432_prune_refuses_pending_plus_live_dir() {
+    let dir = temp_dir("p32-both");
+    let cfg = cfg_with(Some(&dir.join("root")), &dir.join("m.db"), 5);
+    let (_, _, root) = prune_gc_fixture(&dir, "objects/5/w-p32.data");
+    write_backup_dir(&root, "bk", &valid_manifest(None, &["objects/z"]), None);
+    std::fs::create_dir_all(root.join(".prune-pending-bk")).unwrap();
+    let e = super::backup_prune(&cfg, "bk").unwrap_err();
+    assert!(format!("{e}").contains("inconsistent state"), "{e}");
+    assert_lock_released(&root);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[allow(dead_code)]
 fn unused(_: HashSet<String>) {}

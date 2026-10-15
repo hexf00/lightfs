@@ -361,6 +361,18 @@ pub fn scan_backups(root: &str) -> Result<Vec<VerifiedBackup>> {
         if name == LOCK_NAME || name.starts_with(TMP_PREFIX) {
             continue;
         }
+        if name.starts_with(PRUNE_PENDING_PREFIX) {
+            // An unfinished prune: the backup inside is either not yet
+            // durably renamed or explicitly retired with an unconfirmed
+            // cleanup. NEVER a valid backup, NEVER ignorable — gc must
+            // stop until the prune is finished or retried.
+            let orig = name.strip_prefix(PRUNE_PENDING_PREFIX).unwrap_or(&name);
+            return Err(Error::Config(format!(
+                "{name}: unfinished backup prune — gc fail-closed; finish it with \
+                 `lightfs backup prune --id {orig}` (retry converges; the pending \
+                 directory is never re-validated as a backup)"
+            )));
+        }
         let bad = |why: String| {
             Error::Config(format!(
                 "backup {name}: {why} — gc fail-closed; \
@@ -408,10 +420,45 @@ pub fn protected_keys(root: &str, now: i64) -> Result<std::collections::HashSet<
     Ok(keys)
 }
 
-/// `lightfs backup prune --id ID`: remove one backup directory under the
-/// exclusive maintenance lock. This is the ONLY sanctioned way to remove a
-/// backup (including a corrupt one — fail-closed resolution is explicit).
+/// Directory name prefix of a prune that has not finished its cleanup. A
+/// pending entry is a FAIL-CLOSED condition for `scan_backups` (unlike
+/// `.tmp-*`): the backup it belongs to is either still fully present inside
+/// it (rename not yet confirmed durable) or has been explicitly retired
+/// with only the directory-entry removal unconfirmed — in both cases gc
+/// must not run until a human finishes or retries the prune.
+pub const PRUNE_PENDING_PREFIX: &str = ".prune-pending-";
+
+/// `lightfs backup prune --id ID`: retire one backup under the exclusive
+/// maintenance lock, with an explicit PERSISTENCE COMMIT POINT. Order:
+///
+///   1. rename the backup dir to `.prune-pending-<id>` (atomic; takes the
+///      backup out of the supported namespace in the current view);
+///   2. fsync the canonical root — CONFIRM step 1 persisted. This is the
+///      commit point: only after it may the prune be considered done;
+///   3. remove the pending dir, then fsync the root again (failure here is
+///      reported honestly but the retirement stands — a resurrected pending
+///      entry after power loss keeps gc fail-closed, never re-validating
+///      the backup).
+///
+/// Any failure before the commit point leaves the pending dir (or the
+/// original dir) in place and returns an error; gc stays fail-closed while
+/// a pending entry exists. Retrying `prune --id <id>` finishes the cleanup
+/// and converges.
 pub fn backup_prune(cfg: &Config, id: &str) -> Result<()> {
+    backup_prune_impl(cfg, id, &mut |p| fsync_dir(p), &mut |p| {
+        std::fs::remove_dir_all(p)
+            .map_err(|e| Error::Storage(format!("remove {}: {e}", p.display())))
+    })
+}
+
+/// Test seam: identical to [`backup_prune`] with injectable root-fsync and
+/// directory-removal operations (call-order counted in the tests).
+pub(crate) fn backup_prune_impl(
+    cfg: &Config,
+    id: &str,
+    fsync_root: &mut dyn FnMut(&Path) -> Result<()>,
+    remove_dir: &mut dyn FnMut(&Path) -> Result<()>,
+) -> Result<()> {
     let Some(root) = cfg.backup.root.as_deref() else {
         return Err(Error::Config(
             "[backup] root is not configured: there is no supported backup location".into(),
@@ -423,14 +470,56 @@ pub fn backup_prune(cfg: &Config, id: &str) -> Result<()> {
     let root_path = PathBuf::from(root);
     let _lock = MaintenanceLock::acquire(&root_path, cfg.backup.lock_timeout_secs)?;
     let dir = root_path.join(id);
+    let pending = root_path.join(format!("{PRUNE_PENDING_PREFIX}{id}"));
+
+    if pending.exists() {
+        // A previous prune of this id did not finish. Whether it reached
+        // the commit point is unknowable here — treat the pending dir as
+        // retired-but-uncleaned: NEVER re-validate it as a backup, just
+        // finish the removal. Its contents stop protecting objects the
+        // moment it left the supported namespace (gc was fail-closed the
+        // whole time).
+        if dir.exists() {
+            return Err(Error::Config(format!(
+                "backup {id}: both the live directory and a pending prune exist — \
+                 inconsistent state, refusing to proceed"
+            )));
+        }
+        remove_dir(&pending)
+            .map_err(|e| Error::Config(format!("cannot remove pending prune of {id}: {e}")))?;
+        fsync_root(&root_path)?;
+        println!("backup pruned (pending cleanup finished): {id}");
+        return Ok(());
+    }
+
     if !dir.is_dir() {
         return Err(Error::Config(format!(
             "backup {id} does not exist under {root}"
         )));
     }
-    std::fs::remove_dir_all(&dir)
-        .map_err(|e| Error::Config(format!("cannot remove backup {id}: {e}")))?;
-    fsync_dir(&root_path)?;
+
+    // Commit-point sequence. A failure in either of the first two steps
+    // leaves the pending dir behind: gc stays fail-closed until a retry
+    // converges — the backup can never silently leave protection.
+    std::fs::rename(&dir, &pending)
+        .map_err(|e| Error::Config(format!("cannot retire backup {id} (rename): {e}")))?;
+    fsync_root(&root_path).map_err(|e| {
+        Error::Config(format!(
+            "backup {id} renamed to {} but the root fsync failed ({e}); the rename's \
+             persistence is UNCONFIRMED — a pending prune blocks gc until this \
+             completes; retry `backup prune --id {id}`",
+            pending.display()
+        ))
+    })?;
+    // Committed: the backup has left the supported namespace durably.
+    remove_dir(&pending)
+        .map_err(|e| Error::Config(format!("cannot remove pending prune of {id}: {e}")))?;
+    fsync_root(&root_path).map_err(|e| {
+        Error::Config(format!(
+            "backup {id} is retired (commit point passed), but syncing the pending-dir \
+             removal failed ({e}); if a pending entry reappears, gc stays fail-closed"
+        ))
+    })?;
     println!("backup pruned: {id}");
     Ok(())
 }
