@@ -315,6 +315,21 @@ impl S3ObjectStore {
             Error::Storage(format!("s3 {status} on {key}: {}", truncate(body, 300)))
         }
     }
+    /// DELETE outcome mapping (S4.2.2 contract audit): object deletion is
+    /// idempotent at the KEY level — a missing key is success (spec: 204;
+    /// non-compliant endpoints or proxies may answer 404, which carries the
+    /// same meaning). A missing BUCKET is a namespace failure and must NOT
+    /// be swallowed as "already gone"; permissions, network and every
+    /// other failure stay errors (the deletion task retains and retries).
+    pub(crate) fn delete_outcome(status: u16, body: &str, key: &str) -> Result<()> {
+        if body.contains("NoSuchBucket") {
+            return Err(Error::Storage(format!("s3 delete {key}: no such bucket")));
+        }
+        if (200..300).contains(&status) || status == 404 {
+            return Ok(());
+        }
+        Err(Self::map_status(status, body, key))
+    }
 
     fn apply_headers<B>(
         &self,
@@ -1000,11 +1015,8 @@ impl ObjectStore for S3ObjectStore {
                 .call()
                 .map_err(map_transport)?;
             let status = resp.status().as_u16();
-            if !(200..300).contains(&status) {
-                let body = Self::read_body(&mut resp);
-                return Err(Self::map_status(status, &body, key));
-            }
-            Ok(())
+            let body = Self::read_body(&mut resp);
+            Self::delete_outcome(status, &body, key)
         })
     }
 
@@ -1200,6 +1212,32 @@ fn parse_endpoint(endpoint: &str) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- S4.2.2: DELETE-on-missing contract (pure, no network) -------------
+
+    #[test]
+    fn p0a22_delete_outcome_missing_key_is_idempotent_success() {
+        // Spec-compliant: 204 (or any 2xx) whether or not the key existed.
+        S3ObjectStore::delete_outcome(204, "", "packs/x").unwrap();
+        // Non-compliant endpoint/proxy answers 404 for a missing key on
+        // DELETE — same meaning, still success.
+        S3ObjectStore::delete_outcome(404, "NoSuchKey", "packs/x").unwrap();
+        S3ObjectStore::delete_outcome(404, "", "packs/x").unwrap();
+    }
+
+    #[test]
+    fn p0a22_delete_outcome_bucket_permission_and_server_errors_stay_errors() {
+        // A missing BUCKET is a namespace failure: never swallowable as
+        // "already gone" (map_status would have called it ObjectMissing).
+        let e = S3ObjectStore::delete_outcome(404, "NoSuchBucket", "packs/x").unwrap_err();
+        assert!(matches!(e, Error::Storage(_)), "got {e}");
+        assert!(!matches!(e, Error::ObjectMissing(_)));
+        // Permission / server failures keep the task alive for retry.
+        let e = S3ObjectStore::delete_outcome(403, "", "packs/x").unwrap_err();
+        assert!(matches!(e, Error::Storage(_)), "got {e}");
+        let e = S3ObjectStore::delete_outcome(500, "boom", "packs/x").unwrap_err();
+        assert!(matches!(e, Error::Storage(_)), "got {e}");
+    }
 
     #[test]
     fn endpoint_parse() {

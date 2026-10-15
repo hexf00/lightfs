@@ -358,9 +358,15 @@ impl Core {
         let mut done = 0u64;
         let mut failed = 0u64;
         for d in self.meta.gc_claim_deletions(limit, self.now())? {
+            // "Object confirmed absent" is deletion success at every layer
+            // that can report it (S4.2.2 contract audit): the S3 adapter
+            // normalizes 2xx/404-key-missing to Ok itself, NotFound and
+            // ObjectMissing stay defensive here. Namespace (NoSuchBucket →
+            // Storage), permission and transport errors are NOT in this
+            // arm — the task retains and retries.
             let res = match self.objects.delete(&d.key) {
                 Ok(()) => Ok(()),
-                Err(Error::NotFound(_)) => Ok(()),
+                Err(Error::NotFound(_)) | Err(Error::ObjectMissing(_)) => Ok(()),
                 Err(e) => Err(e),
             };
             match res {
@@ -1417,24 +1423,124 @@ mod tests {
         assert!(c.metadata().pack_state(p).unwrap().is_none());
     }
 
-    /// Red-test 11: a crash between the remote delete and the local
-    /// finalize re-enters the queue on the next pass and converges
-    /// (remote delete is idempotent).
+    /// Red-test 11, rewritten in S4.2.2 as a REAL deterministic timeline
+    /// (the old version never created a store object and never deleted one,
+    /// so "remote delete succeeded, local finalize crashed" was fiction):
+    ///
+    /// 1-2. pack metadata + a REAL object; pack advanced to unreferenced;
+    ///      deletion intent enrolled — and the metadata DB is PERSISTED and
+    ///      dropped, proving the intent is durable.
+    /// 3.   claim: the task and the pack sit in the deleting stage.
+    /// 4.   the object is ACTUALLY deleted from the store and verified
+    ///      absent; `gc_complete_deletion` is deliberately skipped.
+    /// 5-6. that is the crash window; recovery reopens the persisted DB.
+    /// 7.   the re-queued task runs against an absent object and still
+    ///      finalizes (idempotent remote delete).
+    /// 8.   task terminal, pack row cleaned, repeat pass is a no-op.
     #[test]
-    fn p0a_crash_before_finalize_requeues_and_converges() {
+    fn p0a22_remote_deleted_before_finalize_converges_on_recover() {
+        let dir = std::env::temp_dir().join(format!("lightfs-p0a22-crash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("m.db");
+        let mem = Arc::new(MemObjectStore::new());
+        let p = "packs/p0a22-crash.data";
+        // 1-2 (and drop the Core: the intent must live in the DB, not in
+        // any process state).
+        {
+            let c = Core::with_retention(
+                Arc::new(SqliteMetadataStore::open(db.to_str().unwrap()).unwrap()),
+                mem.clone(),
+                1,
+            );
+            c.metadata().register_pack(p, 100).unwrap();
+            c.metadata().mark_pack_uploaded(p, 1).unwrap();
+            c.metadata().wb_finalize_batch_if_terminal(p, 1).unwrap();
+            mem.put(p, b"real-pack-bytes").unwrap();
+            assert!(mem.head(p).is_ok(), "the pack object really exists");
+            let (packs, objects) = c.gc_enroll_candidates(i64::MAX).unwrap();
+            assert_eq!((packs, objects), (1, 0));
+        }
+        // 3. claim — the durable task and the pack are in `deleting`.
+        {
+            let c = Core::with_retention(
+                Arc::new(SqliteMetadataStore::open(db.to_str().unwrap()).unwrap()),
+                mem.clone(),
+                1,
+            );
+            let claimed = c.metadata().gc_claim_deletions(10, 1).unwrap();
+            assert_eq!(claimed.len(), 1);
+            assert_eq!(
+                (claimed[0].key.as_str(), claimed[0].kind.as_str()),
+                (p, "pack")
+            );
+            assert!(
+                c.metadata().pack_state(p).unwrap().is_some(),
+                "pack row retained while deleting"
+            );
+            // A claim with no live executor around re-queues the stale
+            // `deleting` row by design (crash residue): same task again,
+            // never lost.
+            let reclaimed = c.metadata().gc_claim_deletions(10, 1).unwrap();
+            assert_eq!(reclaimed.len(), 1);
+            assert_eq!(reclaimed[0].id, claimed[0].id, "the task is retained");
+            // 4. the remote delete REALLY happens; no local finalize.
+            mem.delete(p).unwrap();
+            assert!(mem.head(p).is_err(), "object verified absent");
+        }
+        // 5-6. crash window over; recovery reopens the persisted metadata.
+        let c = Core::with_retention(
+            Arc::new(SqliteMetadataStore::open(db.to_str().unwrap()).unwrap()),
+            mem.clone(),
+            1,
+        );
+        // 7. the stale deleting claim re-enters; the absent object does not
+        // block the local finalize.
+        let (done, failed) = c.gc_execute_deletions(10).unwrap();
+        assert_eq!((done, failed), (1, 0), "missing key counts as deleted");
+        // 8. terminal states, and a repeat pass is an idempotent no-op.
+        assert!(c.metadata().pack_state(p).unwrap().is_none());
+        assert!(c.metadata().gc_claim_deletions(10, 1).unwrap().is_empty());
+        let (done, failed) = c.gc_execute_deletions(10).unwrap();
+        assert_eq!((done, failed), (0, 0));
+        assert!(mem.head(p).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An object whose key is ALREADY absent when its deletion task first
+    /// executes converges on that first pass (the idempotent-success
+    /// contract), and the superseded ledger is finalized away.
+    #[test]
+    fn p0a22_absent_object_finalizes_on_first_execution() {
         let c = core();
-        let p = "packs/p0a-crash.data";
-        c.metadata().register_pack(p, 100).unwrap();
-        c.metadata().mark_pack_uploaded(p, 1).unwrap();
-        c.metadata().wb_finalize_batch_if_terminal(p, 1).unwrap();
-        c.gc_enroll_candidates(i64::MAX).unwrap();
-        // "Crash": the claim happened (deleting) but execution never did.
-        let claimed = c.metadata().gc_claim_deletions(10, c.now()).unwrap();
-        assert_eq!(claimed.len(), 1);
-        // Next pass: the stale claim re-enters, executes, finalizes.
+        c.create("/f", 0o644).unwrap();
+        let v1 = c
+            .write_stream(
+                "/f",
+                Some(0),
+                false,
+                &mut std::io::Cursor::new(b"one".to_vec()),
+                3,
+            )
+            .unwrap();
+        let old_key = v1.object_key.clone().unwrap();
+        c.write_stream(
+            "/f",
+            Some(1),
+            false,
+            &mut std::io::Cursor::new(b"two!".to_vec()),
+            4,
+        )
+        .unwrap();
+        let (packs, objects) = c.gc_enroll_candidates(i64::MAX).unwrap();
+        assert_eq!((packs, objects), (0, 1));
+        // The object vanishes out-of-band before the executor runs.
+        c.objects().delete(&old_key).unwrap();
+        assert!(c.objects().head(&old_key).is_err());
         let (done, failed) = c.gc_execute_deletions(10).unwrap();
         assert_eq!((done, failed), (1, 0));
-        assert!(c.metadata().pack_state(p).unwrap().is_none());
+        assert!(c.metadata().all_superseded().unwrap().is_empty());
+        assert!(c.metadata().gc_claim_deletions(10, 1).unwrap().is_empty());
     }
 
     /// Superseded per-file objects ride the same durable deletion task flow.
