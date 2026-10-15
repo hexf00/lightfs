@@ -50,7 +50,17 @@ impl FileLock {
             )));
         }
         // Best-effort diagnostics for the NEXT contender; never fatal.
-        let _ = std::fs::write(path, format!("pid {}\n", std::process::id()));
+        // Written through the SAME handle: the byte-range lock held on
+        // offset 0..1 rejects a second handle's overlapping write on
+        // Windows (ERROR_LOCK_VIOLATION), which silently left this file
+        // empty there; unix flock is advisory and never cared.
+        let _ = (|| -> std::io::Result<()> {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = &file;
+            f.set_len(0)?;
+            f.seek(SeekFrom::Start(0))?;
+            f.write_all(format!("pid {}\n", std::process::id()).as_bytes())
+        })();
         Ok(Self { _file: file })
     }
 }

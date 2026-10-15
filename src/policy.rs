@@ -785,7 +785,10 @@ fn validate_local_root(prefix: &str, root: &str) -> Result<(), PolicyError> {
         return Err(unsafe_root("root is empty"));
     }
     let tilde = root.starts_with("~/");
-    if !tilde && !root.starts_with('/') {
+    // Platform-correct absoluteness: on Windows an absolute root is
+    // drive-prefixed ("C:\\data"), which a '/'-string check would wrongly
+    // refuse — every local rule would be unusable there.
+    if !tilde && !std::path::Path::new(root).is_absolute() {
         return Err(unsafe_root("root must be absolute or start with \"~/\""));
     }
     if root == "/" || root == "~" || root == "~/" {
@@ -793,7 +796,15 @@ fn validate_local_root(prefix: &str, root: &str) -> Result<(), PolicyError> {
             "root must name a subdirectory, not a whole filesystem/home",
         ));
     }
-    for comp in root.split('/') {
+    // Namespace roots on any platform: "/" and Windows drive/UNC roots
+    // ("C:\\", "\\\\srv\\share") have no parent — refusing them is the
+    // same whole-filesystem handout refusal as above.
+    if !tilde && std::path::Path::new(root).parent().is_none() {
+        return Err(unsafe_root(
+            "root must name a subdirectory, not a whole filesystem/home",
+        ));
+    }
+    for comp in root.split(['/', '\\']) {
         if comp == ".." {
             return Err(unsafe_root("root contains \"..\" — refused, not resolved"));
         }

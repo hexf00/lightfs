@@ -163,11 +163,14 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// The backup root / backup directory fsync goes through the SAME
+/// platform implementation as the write-back staging namespace
+/// (`wb::sync_directory`): a bare `File::open` on a directory is refused
+/// outright on Windows (ACCESS_DENIED — directory handles require
+/// FILE_FLAG_BACKUP_SEMANTICS), which silently made every backup publish
+/// and prune fail there.
 fn fsync_dir(p: &Path) -> Result<()> {
-    let f =
-        std::fs::File::open(p).map_err(|e| Error::Storage(format!("open {}: {e}", p.display())))?;
-    f.sync_all()
-        .map_err(|e| Error::Storage(format!("fsync {}: {e}", p.display())))
+    crate::wb::sync_directory(p)
 }
 
 pub(crate) fn sqlite_quote(s: &str) -> String {

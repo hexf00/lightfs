@@ -143,10 +143,12 @@ type TaskRow = crate::metadata::WbTask;
 /// write may be acknowledged — otherwise a power loss can lose the name
 /// (and with it the bytes) while the content blocks were already on disk.
 /// No silent platform no-ops: both supported platforms really flush.
-/// Windows opens the directory handle with FILE_FLAG_BACKUP_SEMANTICS (the
-/// documented way to hold a directory handle) and FlushFileBuffers it;
-/// compile-checked on the windows-gnu target, not exercised on real
-/// windows hardware — reported as such, not claimed.
+/// Windows opens the directory handle with GENERIC_WRITE +
+/// FILE_FLAG_BACKUP_SEMANTICS (the documented way to hold a directory
+/// handle; FlushFileBuffers refuses read-only handles) and FlushFileBuffers
+/// it; the read-handle shape it replaces was proven failing on real
+/// windows-latest (CI run 38781719718), the write-handle recipe is
+/// exercised by the cfg(windows) unit test on the same runner.
 pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -160,8 +162,12 @@ pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     {
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        // GENERIC_WRITE is REQUIRED by FlushFileBuffers: a read-only
+        // directory handle opens fine but the flush fails with
+        // ACCESS_DENIED (empirically proven on windows-latest, run
+        // 38781719718 — the read-handle shape below used to be here).
         let dir = std::fs::OpenOptions::new()
-            .read(true)
+            .write(true)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)
             .map_err(|e| Error::Io(format!("open directory {} for sync: {e}", path.display())))?;

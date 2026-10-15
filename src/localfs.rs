@@ -980,7 +980,11 @@ mod tests {
         );
     }
 
+    // Unix-only: LocalFs (client-local authority) is POSIX-only by contract
+    // and refuses to open on Windows with an explicit Config error; these
+    // tests exercise that engine.
     #[test]
+    #[cfg(unix)]
     fn scratch_name_reserved() {
         let t = tmpdir("scratch");
         let fs = fs_at(&t.join("root"));
@@ -998,6 +1002,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn strict_sync_commit_replaces_atomically() {
         let t = tmpdir("commit");
         let root = t.join("root");
@@ -1024,6 +1029,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn identity_gone_on_unlink_during_session() {
         let t = tmpdir("gone");
         let fs = fs_at(&t.join("root"));
@@ -1046,7 +1052,9 @@ mod tests {
 // P-R1: concurrent commit semantics - sessions, CAS, namespaces
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+// Unix-only module: every test here drives LocalFs (client-local
+// authority), which refuses to open on Windows by contract.
+#[cfg(all(test, unix))]
 mod pr1_tests {
     use super::*;
     use crate::error::Error;
@@ -1307,7 +1315,8 @@ mod pr1_tests {
 // P-R addendum: commit-failure atomicity (parent-dir fsync)
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+// Unix-only module: same POSIX-only LocalFs contract as pr1_tests above.
+#[cfg(all(test, unix))]
 mod pr_fsync_tests {
     use super::*;
     use crate::error::Error;
