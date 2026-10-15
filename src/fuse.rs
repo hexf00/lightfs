@@ -140,6 +140,10 @@ fn errno(e: &Error) -> Errno {
         // policy router refuses renames across storage authorities.
         Error::Exdev(_) => Errno::EXDEV,
         Error::Cycle(_) | Error::InvalidPath(_) | Error::InvalidArgument(_) => Errno::EINVAL,
+        // Staging budget exhausted (capacity-exhausted): ENOSPC is the
+        // POSIX-honest signal (the budget guards disk space); never a
+        // silent retry, eviction, or degradation.
+        Error::Capacity(_) => Errno::ENOSPC,
         Error::Conflict { .. } => Errno::EIO,
         Error::Storage(_) | Error::Db(_) | Error::Io(_) | Error::Config(_) => Errno::EIO,
     }

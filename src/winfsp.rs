@@ -42,6 +42,8 @@ const EISDIR: c_int = 21;
 const EINVAL: c_int = 22;
 const ENOSYS: c_int = 40;
 const ENOTEMPTY: c_int = 41;
+/// POSIX ENOSPC (28): WB staging budget exhausted (capacity-exhausted).
+const ENOSPC: c_int = 28;
 /// POSIX EXDEV (18): rename across filesystems/policy backends.
 const EXDEV: c_int = 18;
 
@@ -344,6 +346,9 @@ fn errno(e: &Error) -> c_int {
         Error::DirectoryNotEmpty(_) => ENOTEMPTY,
         Error::Exdev(_) => EXDEV,
         Error::Cycle(_) | Error::InvalidPath(_) | Error::InvalidArgument(_) => EINVAL,
+        // Staging budget exhausted: ENOSPC is the POSIX-honest signal (the
+        // budget guards disk space); never a silent retry or eviction.
+        Error::Capacity(_) => ENOSPC,
         Error::Conflict { .. } => EIO,
         Error::Storage(_) | Error::Db(_) | Error::Io(_) | Error::Config(_) => EIO,
     }
