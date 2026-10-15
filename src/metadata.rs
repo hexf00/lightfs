@@ -360,7 +360,7 @@ pub trait MetadataStore: Send + Sync {
         Err(Error::Storage("write-back unsupported".into()))
     }
     /// Startup recovery: draining tasks go back to queued (their staging
-    /// file was renamed under them; the recorded path still points at it).
+    /// file is durable at its recorded path; no relocation involved).
     fn wb_requeue_draining(&self) -> Result<()> {
         Ok(())
     }

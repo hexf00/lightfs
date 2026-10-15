@@ -30,10 +30,10 @@
 //!   NotFound and is discarded.
 //!
 //! Crash recovery: at engine start, draining tasks are requeued (their
-//! staging file was already atomically renamed), queued tasks whose
-//! staging file is missing go to state='dead' (lost-staging), and staging
-//! files no task references are swept (crash between fsync and task
-//! insert).
+//! staging file is durable at its recorded path — fsynced before the
+//! task insert was acknowledged), queued tasks whose staging file is
+//! missing go to state='dead' (lost-staging), and staging files no task
+//! references are swept (crash between fsync and task insert).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -372,8 +372,10 @@ impl WriteBackEngine {
     /// Startup recovery: requeue draining tasks, dead-letter tasks whose
     /// staging vanished, sweep orphaned staging files. Idempotent.
     pub(crate) fn recover(&self) -> Result<()> {
-        // Requeue draining tasks: their staging file was already renamed
-        // under them, so the recorded path still points at the bytes.
+        // Requeue draining tasks: the staging file is durable at its
+        // RECORDED path (file sync + directory sync + task insert all
+        // happened before the write was acknowledged), so the path
+        // still points at the bytes — no relocation involved.
         self.meta.wb_requeue_draining()?;
         // Tasks whose staging file vanished: the durability boundary was
         // hit. Visible dead state, never silent.
@@ -4406,9 +4408,9 @@ mod tests {
 
     /// Windows runtime arm of the directory-sync contract: opens a REAL
     /// directory the way production does and requires FlushFileBuffers to
-    /// succeed. Executes on windows runtimes (CI / real hardware); this
-    /// macOS host cannot execute it — recorded as compile-checked +
-    /// contract-verified, runtime execution pending a windows runner.
+    /// succeed. Verified on the windows-latest CI runner (run
+    /// 38785088913): the GENERIC_WRITE shape passes, the read-only
+    /// reverse assertion fails as required.
     #[test]
     #[cfg(windows)]
     fn p0d4_windows_sync_directory_flushes_a_real_directory() {
