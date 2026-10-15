@@ -485,9 +485,28 @@ pub(crate) fn backup_prune_impl(
                  inconsistent state, refusing to proceed"
             )));
         }
+        // The retry builds its OWN persistence commit point BEFORE any
+        // removal: fsync the root so the current state (pending present,
+        // live dir absent) is durable first. Removing first would repeat
+        // the exact hole S4.3.2 closed on the main path — removal succeeds,
+        // the fsync fails, the pending entry vanishes from the current
+        // view, gc stops being fail-closed, and the original rename may
+        // never have persisted at all.
+        fsync_root(&root_path).map_err(|e| {
+            Error::Config(format!(
+                "pending prune of {id} kept: the pre-removal root fsync failed ({e}); \
+                 the pending entry keeps gc fail-closed; retry `backup prune --id {id}`"
+            ))
+        })?;
         remove_dir(&pending)
             .map_err(|e| Error::Config(format!("cannot remove pending prune of {id}: {e}")))?;
-        fsync_root(&root_path)?;
+        fsync_root(&root_path).map_err(|e| {
+            Error::Config(format!(
+                "pending prune of {id} removed and the retirement commit point passed, \
+                 but syncing the removal failed ({e}); if a pending entry reappears, \
+                 gc stays fail-closed"
+            ))
+        })?;
         println!("backup pruned (pending cleanup finished): {id}");
         return Ok(());
     }

@@ -918,11 +918,16 @@ fn s432_prune_fsync2_fails_retired_but_error_and_resurrection_blocks() {
         "removed before the failing fsync"
     );
     // Current view is clean and PAST the commit point: scanning succeeds
-    // without the backup, and gc is allowed (safe state; the fixture has no
-    // other candidates, so zero deletes happen here).
+    // without the backup, and gc is allowed — it actually deletes the
+    // fixture's one qualified superseded candidate (delete_calls 0 -> 1).
     let scanned = super::scan_backups(root.to_str().unwrap()).unwrap();
     assert!(scanned.is_empty());
     gc_now(&core, &root);
+    assert_eq!(
+        mem.delete_calls(),
+        1,
+        "past the commit point gc deletes the qualified candidate exactly once"
+    );
     assert_lock_released(&root);
     // Worst case the failed fsync was guarding: the pending entry
     // reappears after power loss — gc must fail closed again, never
@@ -972,6 +977,189 @@ fn s432_prune_refuses_pending_plus_live_dir() {
     std::fs::create_dir_all(root.join(".prune-pending-bk")).unwrap();
     let e = super::backup_prune(&cfg, "bk").unwrap_err();
     assert!(format!("{e}").contains("inconsistent state"), "{e}");
+    assert_lock_released(&root);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- S4.3.3: the pending RETRY path must have its own commit point -----
+// The retry branch previously did remove(pending) -> fsync(root): a removal
+// that succeeded followed by a failed fsync would make the pending entry
+// vanish from the current view — gc stops being fail-closed — while the
+// original rename may never have persisted. Fixed order: fsync root FIRST
+// (the retry's commit point), THEN remove, then fsync again.
+
+fn pending_only_fixture(tag: &str) -> (Config, Arc<Core>, Arc<MemObjectStore>, PathBuf, PathBuf) {
+    let dir = temp_dir(tag);
+    let cfg = cfg_with(Some(&dir.join("root")), &dir.join("m.db"), 5);
+    let (core, mem, root) = prune_gc_fixture(&dir, "objects/3/w-p33.data");
+    // A leftover pending prune (contents intact, live dir absent).
+    write_backup_dir(
+        &root,
+        ".prune-pending-bk",
+        &valid_manifest(None, &["objects/z"]),
+        None,
+    );
+    assert!(!root.join("bk").exists());
+    (cfg, core, mem, root, dir)
+}
+
+/// A. retry's FIRST fsync fails: nothing is removed, gc stays fail-closed
+///    with zero delete calls, lock released; a real retry converges.
+#[test]
+fn s433_retry_fsync1_fails_keeps_pending_zero_deletes() {
+    let (cfg, core, mem, root, dir) = pending_only_fixture("p33-retry-fsync1");
+    let mut remove_calls = 0u32;
+    let e = super::backup_prune_impl(
+        &cfg,
+        "bk",
+        &mut |_p| Err(Error::Storage("injected pre-removal fsync failure".into())),
+        &mut |_p| {
+            remove_calls += 1;
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert!(
+        format!("{e}").contains("pre-removal root fsync failed"),
+        "honest error required: {e}"
+    );
+    assert_eq!(
+        remove_calls, 0,
+        "removal must not run before the retry commit point"
+    );
+    assert!(root.join(".prune-pending-bk").exists(), "pending kept");
+    let e = super::scan_backups(root.to_str().unwrap()).unwrap_err();
+    assert!(format!("{e}").contains("unfinished backup prune"), "{e}");
+    let e =
+        crate::cmd::gc_run(&core, Some(root.to_str().unwrap()), 5, 0, now_secs() + 10).unwrap_err();
+    assert!(format!("{e}").contains("fail-closed"), "{e}");
+    assert_eq!(
+        mem.delete_calls(),
+        0,
+        "zero deletes while the retry is uncommitted"
+    );
+    assert_lock_released(&root);
+    super::backup_prune(&cfg, "bk").unwrap();
+    assert!(
+        !root.join(".prune-pending-bk").exists(),
+        "real retry converges"
+    );
+    assert!(
+        super::scan_backups(root.to_str().unwrap())
+            .unwrap()
+            .is_empty()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B. retry's commit-point fsync succeeds, removal fails: pending remains
+///    (the mock does not delete), everything fail-closed, zero deletes;
+///    a real retry converges.
+#[test]
+fn s433_retry_commit_ok_removal_fails_retry_converges() {
+    let (cfg, core, mem, root, dir) = pending_only_fixture("p33-retry-rm");
+    let e = super::backup_prune_impl(&cfg, "bk", &mut |_p| Ok(()), &mut |_p| {
+        Err(Error::Storage("injected removal failure".into()))
+    })
+    .unwrap_err();
+    assert!(
+        format!("{e}").contains("cannot remove pending prune"),
+        "{e}"
+    );
+    assert!(root.join(".prune-pending-bk").exists(), "pending kept");
+    assert!(
+        super::scan_backups(root.to_str().unwrap()).is_err(),
+        "fail-closed"
+    );
+    let e =
+        crate::cmd::gc_run(&core, Some(root.to_str().unwrap()), 5, 0, now_secs() + 10).unwrap_err();
+    assert!(format!("{e}").contains("fail-closed"), "{e}");
+    assert_eq!(
+        mem.delete_calls(),
+        0,
+        "zero deletes while the pending entry blocks"
+    );
+    assert_lock_released(&root);
+    super::backup_prune(&cfg, "bk").unwrap();
+    assert!(!root.join(".prune-pending-bk").exists());
+    assert!(
+        super::scan_backups(root.to_str().unwrap())
+            .unwrap()
+            .is_empty()
+    );
+    assert_lock_released(&root);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// C. retry removes the pending dir but the SECOND fsync fails: the commit
+///    point already passed, so the error is honest while the current view is
+///    clean and usable; a resurrected pending entry (power-loss worst case)
+///    fail-closes scanner and gc again with zero NEW deletes.
+#[test]
+fn s433_retry_fsync2_fails_commit_passed_resurrection_blocks() {
+    let (cfg, core, mem, root, dir) = pending_only_fixture("p33-retry-fsync2");
+    let mut fsync_calls = 0u32;
+    let e = super::backup_prune_impl(
+        &cfg,
+        "bk",
+        &mut |_p| {
+            fsync_calls += 1;
+            if fsync_calls == 2 {
+                Err(Error::Storage("injected fsync failure".into()))
+            } else {
+                Ok(())
+            }
+        },
+        &mut |p: &Path| {
+            std::fs::remove_dir_all(p).map_err(|e| Error::Storage(format!("remove: {e}")))
+        },
+    )
+    .unwrap_err();
+    assert!(format!("{e}").contains("commit point passed"), "{e}");
+    assert!(
+        !root.join(".prune-pending-bk").exists(),
+        "removed before the failing fsync"
+    );
+    assert!(
+        super::scan_backups(root.to_str().unwrap())
+            .unwrap()
+            .is_empty()
+    );
+    assert_lock_released(&root);
+    // Power-loss worst case: the pending entry comes back — scanner and gc
+    // must fail closed again, with zero NEW object-delete calls.
+    std::fs::create_dir_all(root.join(".prune-pending-bk")).unwrap();
+    let e = super::scan_backups(root.to_str().unwrap()).unwrap_err();
+    assert!(format!("{e}").contains("unfinished backup prune"), "{e}");
+    let deletes_before = mem.delete_calls();
+    let e =
+        crate::cmd::gc_run(&core, Some(root.to_str().unwrap()), 5, 0, now_secs() + 10).unwrap_err();
+    assert!(format!("{e}").contains("fail-closed"), "{e}");
+    assert_eq!(
+        mem.delete_calls(),
+        deletes_before,
+        "no NEW deletes in the resurrected state"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// D. retry with the REAL ops: converges cleanly, scanner recovers, gc runs
+///    end-to-end, lock released.
+#[test]
+fn s433_retry_clean_path_converges() {
+    let (cfg, core, mem, root, dir) = pending_only_fixture("p33-retry-clean");
+    super::backup_prune(&cfg, "bk").unwrap();
+    assert!(!root.join(".prune-pending-bk").exists() && !root.join("bk").exists());
+    assert!(
+        super::scan_backups(root.to_str().unwrap())
+            .unwrap()
+            .is_empty()
+    );
+    gc_now(&core, &root);
+    assert!(
+        mem.head("objects/3/w-p33.data").is_err(),
+        "gc works again after the retry"
+    );
     assert_lock_released(&root);
     let _ = std::fs::remove_dir_all(&dir);
 }
