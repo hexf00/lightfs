@@ -308,10 +308,11 @@ impl Core {
         &self.meta
     }
 
-    // ---- S4.2 P0-a: durable object deletion (gc). Candidates are enrolled
-    // as deletion intents and executed against the object store with
-    // transactional guards; the production CLI refuses to run this until
-    // P0-b's backup-manifest protection exists (gc dependency gate).
+    // ---- S4.2 P0-a / S4.3 P0-b: durable object deletion (gc). Candidates
+    // are enrolled as deletion intents and executed against the object
+    // store with transactional guards. The production CLI is the ONLY
+    // caller, behind the P0-b gates: [backup] root configured, maintenance
+    // lock held, every published manifest verified fail-closed.
 
     /// Enroll gc candidates as durable deletion intents: unreferenced packs
     /// past their retention window and superseded per-file objects. Keys in
@@ -320,6 +321,16 @@ impl Core {
     /// expires or is pruned. Each registration re-checks its guards inside
     /// its own transaction and returns false when the predicate no longer
     /// holds.
+    ///
+    /// Candidate eligibility is per-source and time-based only: packs via
+    /// `unref_since <= cutoff`, superseded via `superseded_at <= cutoff`.
+    /// `cutoff = now` (retention off) means a candidate qualifies the moment
+    /// it exists — under retention-off, retirement registers durable
+    /// deletion tasks and writes NO new superseded rows, so superseded
+    /// candidates can only be leftovers from a retention-on era; deploying
+    /// retention-off declares there is no retention window, and those
+    /// leftovers are reclaimable immediately (manifest protection still
+    /// applies on top).
     ///
     /// Production callers: ONLY `lightfs gc` (cmd::gc), which holds the
     /// maintenance lock and has verified every published manifest first.

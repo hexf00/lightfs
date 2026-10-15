@@ -41,6 +41,24 @@ cp config/example.toml cfg.toml      # edit endpoint/bucket/credentials
 
 CLI: `lightfs {embedded|server|mount|fsck|backup|gc|create-bucket|version}`
 
+## Backup & gc
+
+Backups are directories under the canonical `[backup] root`: a `meta.db`
+snapshot, a versioned object manifest exported from that snapshot, and a
+sha256-pinned `backup.json`, published atomically. Each is protected
+forever unless created with `--expires-in SECS`; remove one with
+`backup prune --id ID`.
+
+`gc` is the only path that deletes objects, and it is safe by gates: with
+no `[backup] root` configured it refuses to delete anything; it verifies
+EVERY manifest in the root first (one corrupt backup fails the whole pass,
+zero deletions); keys listed in valid unexpired manifests survive.
+Retention off (`superseded_secs = 0`) does not disable gc — retirement
+then registers durable deletion tasks, which gc drains (candidates qualify
+immediately). Configuring a root does not protect legacy backups kept
+outside it — inventory and retire/re-publish them first; see the
+`[backup]` section of `config/example.toml`.
+
 ## Symlink semantics
 
 Symlink targets are stored verbatim and returned verbatim by `readlink`.

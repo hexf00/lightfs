@@ -590,5 +590,163 @@ fn p0b_gc_end_to_end_enroll_execute_and_protection_filter() {
     let _ = std::fs::remove_dir_all(&f.dir);
 }
 
+// ---- S4.3.1: retention-off gc semantics --------------------------------
+// Retention OFF (`retention_secs = 0`) must NOT disable gc: retirement under
+// retention-off registers durable deletion tasks, and gc is the only thing
+// that drains them. The [backup]-root / lock / manifest gates apply unchanged.
+
+fn rtoff_core(mem: Arc<MemObjectStore>) -> Arc<Core> {
+    Arc::new(Core::with_retention(
+        Arc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+        mem,
+        0,
+    ))
+}
+
+/// 1) retention-off + valid root/manifest + qualified superseded candidate:
+///    the task enrolls at cutoff=now and executes to completion.
+#[test]
+fn s431_retention_off_gc_enrolls_and_completes_qualified_task() {
+    let dir = temp_dir("rtoff-run");
+    let (root, mem) = (dir.join("root"), Arc::new(MemObjectStore::new()));
+    let core = rtoff_core(mem.clone());
+    let k = "objects/9/w-rtoff.data";
+    mem.put(k, b"rtoff-bytes").unwrap();
+    // Retention-on era leftover: superseded row registered in the past.
+    core.metadata().record_superseded(k, 1).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    let s = crate::cmd::gc_run(&core, Some(root.to_str().unwrap()), 5, 0, now_secs() + 10).unwrap();
+    assert_eq!(
+        s.enrolled.1, 1,
+        "candidate qualifies at cutoff=now (retention off)"
+    );
+    assert_eq!(
+        s.done, 1,
+        "the registered task executes under retention-off"
+    );
+    assert!(mem.head(k).is_err(), "object actually deleted");
+    assert!(
+        core.metadata().all_superseded().unwrap().is_empty(),
+        "superseded row finalized away"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 2) retention-off + manifest-protected object: the object survives, its
+///    pre-existing deletion task is kept (not marked done).
+#[test]
+fn s431_retention_off_gc_keeps_protected_object_and_task() {
+    let dir = temp_dir("rtoff-prot");
+    let (root, mem) = (dir.join("root"), Arc::new(MemObjectStore::new()));
+    let core = rtoff_core(mem.clone());
+    let k = "objects/8/w-rtoff-prot.data";
+    mem.put(k, b"protected-bytes").unwrap();
+    core.metadata().record_superseded(k, 1).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    // A backup published AFTER the task was registered still protects it.
+    core.metadata()
+        .gc_register_superseded_deletion(k, 2)
+        .unwrap();
+    write_backup_dir(&root, "bk", &valid_manifest(None, &[k]), None);
+    let s = crate::cmd::gc_run(&core, Some(root.to_str().unwrap()), 5, 0, now_secs() + 10).unwrap();
+    assert_eq!(s.enrolled.1, 0, "protected key is not re-enrolled");
+    assert_eq!(s.skipped_protected, 1, "the existing task is skipped, kept");
+    assert!(mem.head(k).is_ok(), "manifest-protected object survives");
+    let claimed = core.metadata().gc_claim_deletions(10, 1).unwrap();
+    assert_eq!(claimed.len(), 1, "task NOT marked done: still claimable");
+    assert_eq!(claimed[0].key, k);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 3) retention-off + no [backup] root: zero object-delete calls.
+#[test]
+fn s431_retention_off_without_root_makes_zero_delete_calls() {
+    let mem = Arc::new(MemObjectStore::new());
+    let core = rtoff_core(mem.clone());
+    let k = "objects/7/w-rtoff-noroot.data";
+    mem.put(k, b"bytes").unwrap();
+    core.metadata().record_superseded(k, 1).unwrap();
+    let e = crate::cmd::gc_run(&core, None, 5, 0, now_secs() + 10).unwrap_err();
+    assert!(
+        format!("{e}").contains("root is not configured"),
+        "fail-closed message: {e}"
+    );
+    assert_eq!(
+        mem.delete_calls(),
+        0,
+        "no object may be touched without the backup-root gate"
+    );
+    assert!(mem.head(k).is_ok(), "object intact");
+}
+
+/// 4) retention-off + one unverifiable manifest: the whole pass aborts with
+///    zero delete calls.
+#[test]
+fn s431_retention_off_corrupt_manifest_fails_closed_zero_deletes() {
+    let dir = temp_dir("rtoff-corrupt");
+    let (root, mem) = (dir.join("root"), Arc::new(MemObjectStore::new()));
+    let core = rtoff_core(mem.clone());
+    let k = "objects/6/w-rtoff-corrupt.data";
+    mem.put(k, b"bytes").unwrap();
+    core.metadata().record_superseded(k, 1).unwrap();
+    std::fs::create_dir_all(root.join("bk-broken")).unwrap();
+    std::fs::write(root.join("bk-broken").join(MANIFEST_NAME), b"{ not json").unwrap();
+    let e =
+        crate::cmd::gc_run(&core, Some(root.to_str().unwrap()), 5, 0, now_secs() + 10).unwrap_err();
+    assert!(format!("{e}").contains("fail-closed"), "{e}");
+    assert_eq!(mem.delete_calls(), 0, "corrupt manifest = zero deletes");
+    assert!(mem.head(k).is_ok(), "object intact");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// S4.3.1 prune persistence order: within the SAME lock hold, the backup
+/// directory is removed, THEN the canonical root is fsynced — and any
+/// failure is an error, never a silent success. Observable consequences
+/// asserted here: after prune the directory is gone and a full re-scan of
+/// the root is clean (no trace of the pruned id); a failing prune (missing
+/// id) reports an error and leaves every other backup untouched. Real
+/// power-loss is NOT claimed — this verifies the code order, see report §2.
+#[test]
+fn s431_prune_removes_directory_then_fsyncs_root_within_one_lock() {
+    let dir = temp_dir("prune-order");
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let cfg = cfg_with(Some(&root), &dir.join("m.db"), 5);
+    // Two real backups; prune one, verify the other survives and the scan
+    // is clean — the post-remove root fsync is what makes the removal a
+    // durable directory state before the lock is dropped.
+    write_backup_dir(
+        &root,
+        "bk-gone",
+        &valid_manifest(None, &["objects/x"]),
+        None,
+    );
+    write_backup_dir(
+        &root,
+        "bk-keep",
+        &valid_manifest(None, &["objects/y"]),
+        None,
+    );
+
+    crate::backup::backup_prune(&cfg, "bk-gone").unwrap();
+    assert!(
+        !root.join("bk-gone").exists(),
+        "directory removed while locked"
+    );
+    let scanned = super::scan_backups(root.to_str().unwrap()).unwrap();
+    let ids: Vec<&str> = scanned.iter().map(|b| b.id.as_str()).collect();
+    assert_eq!(ids, vec!["bk-keep"], "root re-scans clean after the fsync");
+
+    // Failure is an error (not silent): pruning a missing id fails loudly
+    // and removes nothing else.
+    let e = crate::backup::backup_prune(&cfg, "bk-gone").unwrap_err();
+    assert!(format!("{e}").contains("does not exist"), "{e}");
+    assert!(
+        root.join("bk-keep").exists(),
+        "the surviving backup is untouched"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[allow(dead_code)]
 fn unused(_: HashSet<String>) {}

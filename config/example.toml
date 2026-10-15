@@ -37,6 +37,13 @@ superseded_secs = 604800
 # protects its listed keys. Corrupt/unknown backups in the root fail the
 # whole gc (fail-closed); resolve with `lightfs backup prune --id ID`.
 # Backups live forever unless --expires-in is given at creation.
+#
+# FIRST-TIME ENABLEMENT: configuring a root does NOT auto-protect old
+# backups kept OUTSIDE the root (e.g. legacy single-file `lightfs backup
+# OUT.db` snapshots). Inventory every historical backup and retire,
+# re-publish under this root, or remove it — before letting gc run. gc
+# itself verifies every manifest in the root first and refuses to delete
+# anything if any backup is unverifiable.
 [backup]
 # root = "/var/lib/lightfs/backups"
 # How long gc waits for the inter-process maintenance lock (gc.lock) before

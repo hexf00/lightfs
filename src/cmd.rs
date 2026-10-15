@@ -34,6 +34,13 @@ pub fn backup_prune(cfg: &Config, id: &str) -> Result<()> {
 /// closed on any problem), then enroll reclaimable candidates and execute
 /// their durable deletion tasks — never touching manifest-protected keys.
 /// Shared by the CLI (`lightfs gc`) and the acceptance tests (fake store).
+///
+/// `retention_secs = 0` (retention off) does NOT disable gc: retirement
+/// under retention-off registers durable deletion tasks instead of
+/// superseded rows, so gc is the ONLY path that drains them. The cutoff
+/// becomes `now`, i.e. candidates qualify from the moment they are
+/// registered — which is exactly what "no retention window" means.
+/// The [backup]-root / lock / manifest-verification gates apply unchanged.
 #[derive(Debug)]
 pub struct GcSummary {
     pub backups: usize,
@@ -83,16 +90,16 @@ pub fn gc_run(
 }
 
 /// `lightfs gc` (P0-b): the ONLY production path to real object deletion.
-/// Gate order is load-bearing: retention on → [backup] root configured →
-/// maintenance lock → every manifest verified fail-closed → protected keys
-/// filtered → durable deletion tasks. The lock covers the whole window, so
-/// a backup publishing concurrently is structurally excluded.
+/// Gate order is load-bearing: [backup] root configured → maintenance lock
+/// → every manifest verified fail-closed → protected keys filtered →
+/// durable deletion tasks. The lock covers the whole window, so a backup
+/// publishing concurrently is structurally excluded.
+///
+/// Retention OFF (`superseded_secs = 0`) does not gate gc: retirement then
+/// registers durable deletion tasks (no superseded window), and gc is the
+/// only thing that drains them. `retention_secs` only shapes the candidate
+/// cutoff (0 → candidates qualify as soon as they are registered).
 pub fn gc(cfg: &Config) -> Result<()> {
-    if cfg.retention.superseded_secs == 0 {
-        return Err(Error::Config(
-            "retention.superseded_secs = 0: retention is disabled, there is nothing to gc".into(),
-        ));
-    }
     let eng = engine::open_embedded(cfg)?;
     let summary = gc_run(
         &eng.core,
