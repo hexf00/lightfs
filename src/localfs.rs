@@ -751,8 +751,10 @@ impl LocalFs {
         Ok(())
     }
 
-    /// Test-only: force the parent-dir fsync step to fail.
-    #[cfg(test)]
+    /// Test-only: force the parent-dir fsync step to fail. Unix-only: its
+    /// callers exercise the POSIX parent-dir fsync, and the whole
+    /// client-local engine refuses to open on Windows.
+    #[cfg(all(test, unix))]
     pub(crate) fn inject_dir_fsync_failure(&self, on: bool) {
         self.dir_fsync_fault.store(on, Ordering::SeqCst);
     }
@@ -889,8 +891,14 @@ impl WriteSession for LocalWriteSession<'_> {
 
 #[cfg(test)]
 mod tests {
+    // Unix-only: every remaining test in here builds a LocalFs, which
+    // refuses to open on Windows by contract.
+    #[cfg(unix)]
     use super::*;
 
+    // Unix-only: every remaining caller builds a LocalFs, which refuses
+    // to open on Windows by contract.
+    #[cfg(unix)]
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
             "lightfs-localfs-{tag}-{}-{}",
@@ -904,6 +912,7 @@ mod tests {
         d
     }
 
+    #[cfg(unix)]
     fn fs_at(root: &Path) -> LocalFs {
         // (the canonical root may differ textually from `root` on hosts
         // with symlinked temp dirs - macOS /var -> /private/var - which is

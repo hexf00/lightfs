@@ -3,7 +3,8 @@
 //! lock files, no retry protocol needed. Unix uses `flock(LOCK_EX|LOCK_NB)`
 //! (per open file description, so two descriptors in ONE process also
 //! conflict); Windows uses `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK|
-//! LOCKFILE_FAIL_IMMEDIATELY)` on a 1-byte range (per handle, same rule).
+//! LOCKFILE_FAIL_IMMEDIATELY)` on one byte at offset 1024 (per handle,
+//! same rule; the offset keeps the holder diagnostics at 0..16 readable).
 //!
 //! Consumers: the write-back engine's single-writer locks (staging dir +
 //! capacity ledger, see `wb::WriteBackEngine::new`) and the backup
@@ -50,18 +51,49 @@ impl FileLock {
             )));
         }
         // Best-effort diagnostics for the NEXT contender; never fatal.
-        // Written through the SAME handle: the byte-range lock held on
-        // offset 0..1 rejects a second handle's overlapping write on
-        // Windows (ERROR_LOCK_VIOLATION), which silently left this file
-        // empty there; unix flock is advisory and never cared.
+        // Fixed-width, written at offset 0 through the SAME handle: the
+        // lock byte sits at offset 1024, far outside this area, so the
+        // next contender can READ it (a byte-range lock blocks other
+        // handles from touching the locked bytes — a lock at offset 0
+        // made the holder line unreadable on Windows) and no truncation
+        // is ever needed.
         let _ = (|| -> std::io::Result<()> {
             use std::io::{Seek, SeekFrom, Write};
+            let line = format!("pid {}", std::process::id());
+            let mut buf = [b' '; 16];
+            let n = line.len().min(15);
+            buf[..n].copy_from_slice(&line.as_bytes()[..n]);
+            buf[15] = b'\n';
             let mut f = &file;
-            f.set_len(0)?;
             f.seek(SeekFrom::Start(0))?;
-            f.write_all(format!("pid {}\n", std::process::id()).as_bytes())
+            f.write_all(&buf)
         })();
         Ok(Self { _file: file })
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // The kernel releases byte-range locks when the handle closes
+        // anyway; the explicit unlock makes release immediate and
+        // independent of close ordering (belt and braces — the unix
+        // arm has nothing to do, flock dies with the fd).
+        #[cfg(windows)]
+        unsafe {
+            use std::os::windows::io::AsRawHandle;
+            let mut ov = range_overlapped();
+            let _ = UnlockFileEx(
+                self._file.as_raw_handle() as *mut core::ffi::c_void,
+                0,
+                1,
+                0,
+                &mut ov,
+            );
+        }
+        #[cfg(unix)]
+        {
+            // no explicit unlock exists for flock; the fd closes below
+        }
     }
 }
 
@@ -76,34 +108,7 @@ pub(crate) fn try_lock_raw(file: &File) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::io::AsRawHandle;
-        #[repr(C)]
-        struct Overlapped {
-            internal: usize,
-            internal_high: usize,
-            offset: u32,
-            offset_high: u32,
-            event: *mut core::ffi::c_void,
-        }
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn LockFileEx(
-                file: *mut core::ffi::c_void,
-                flags: u32,
-                reserved: u32,
-                count_low: u32,
-                count_high: u32,
-                overlapped: *mut Overlapped,
-            ) -> i32;
-        }
-        const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x1;
-        const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x2;
-        let mut ov = Overlapped {
-            internal: 0,
-            internal_high: 0,
-            offset: 0,
-            offset_high: 0,
-            event: core::ptr::null_mut(),
-        };
+        let mut ov = range_overlapped();
         unsafe {
             LockFileEx(
                 AsRawHandle::as_raw_handle(file) as *mut core::ffi::c_void,
@@ -115,6 +120,59 @@ pub(crate) fn try_lock_raw(file: &File) -> bool {
             ) != 0
         }
     }
+}
+
+#[cfg(windows)]
+const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x1;
+#[cfg(windows)]
+const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x2;
+
+// Offset 1024: byte-range locks block OTHER handles from the locked
+// bytes, so the lock must sit outside the diagnostics area at offset
+// 0..16 (a lock at offset 0 made the "pid …" holder line unreadable on
+// Windows). Locking beyond EOF is valid and standard on Windows.
+#[cfg(windows)]
+const LOCK_RANGE_OFFSET: u32 = 1024;
+
+#[cfg(windows)]
+#[repr(C)]
+struct Overlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    event: *mut core::ffi::c_void,
+}
+
+#[cfg(windows)]
+fn range_overlapped() -> Overlapped {
+    Overlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: LOCK_RANGE_OFFSET,
+        offset_high: 0,
+        event: core::ptr::null_mut(),
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn LockFileEx(
+        file: *mut core::ffi::c_void,
+        flags: u32,
+        reserved: u32,
+        count_low: u32,
+        count_high: u32,
+        overlapped: *mut Overlapped,
+    ) -> i32;
+    fn UnlockFileEx(
+        file: *mut core::ffi::c_void,
+        reserved: u32,
+        count_low: u32,
+        count_high: u32,
+        overlapped: *mut Overlapped,
+    ) -> i32;
 }
 
 /// Resolve a resource (staging directory, database file, backup root) to

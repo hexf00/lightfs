@@ -488,6 +488,8 @@ mod tests {
     use crate::config::{Config, MetadataSection};
     use crate::core::Core;
     use crate::policy::RawRule;
+    // Only CountingFs (unix-gated) uses these.
+    #[cfg(unix)]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn tmpdir(tag: &str) -> PathBuf {
@@ -538,11 +540,15 @@ mod tests {
 
     /// Remote stand-in that counts every call: mount-time probes are the
     /// only traffic a local-prefix workload may cause (P4-6).
+    /// Unix-only: its single user (`local_ops_never_reach_remote`) mounts
+    /// a local rule through LocalFs, which refuses to open on Windows.
+    #[cfg(unix)]
     struct CountingFs {
         inner: Arc<dyn FsApi>,
         calls: AtomicUsize,
     }
 
+    #[cfg(unix)]
     impl CountingFs {
         fn new(inner: Arc<dyn FsApi>) -> Self {
             Self {
@@ -555,6 +561,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl FsApi for CountingFs {
         fn lookup(&self, path: &str) -> Result<Node> {
             self.calls.fetch_add(1, Ordering::Relaxed);
@@ -666,6 +673,7 @@ mod tests {
     // P4-2: full lifecycle under one client-local rule, byte-accurate,
     // including the on-disk authority and a remount.
     #[test]
+    #[cfg(unix)]
     fn local_rule_full_lifecycle() {
         let t = tmpdir("p2");
         let root = t.join("root");
@@ -735,6 +743,7 @@ mod tests {
     // whatever now occupies the old path, and a session that spans a
     // rename commits through the file's NEW location.
     #[test]
+    #[cfg(unix)]
     fn identity_routes_by_id_not_path() {
         let t = tmpdir("p3");
         let sec = section(vec![local_rule("/p", &t.join("root"))]);
@@ -768,6 +777,7 @@ mod tests {
 
     // P4-4: cross-backend rename = EXDEV, both sides intact.
     #[test]
+    #[cfg(unix)]
     fn exdev_cross_backend() {
         let t = tmpdir("p4");
         let core = mem_core("p4");
@@ -803,6 +813,7 @@ mod tests {
     // P4-5: shadowed remote content refuses the mount by default;
     // explicit allow_shadow accepts with a loud warning.
     #[test]
+    #[cfg(unix)]
     fn shadow_refuse_by_default_allow_warns() {
         let t = tmpdir("p5");
         let core = mem_core("p5");
@@ -839,6 +850,7 @@ mod tests {
     // backend - not namespace ops, not by-id ops. The ONLY remote call is
     // the mount-time shadow probe.
     #[test]
+    #[cfg(unix)]
     fn local_ops_never_reach_remote() {
         let t = tmpdir("p6");
         let core = mem_core("p6");
@@ -1008,6 +1020,7 @@ mod tests {
 
     // P4-7: unsafe roots and unsupported config fail loudly.
     #[test]
+    #[cfg(unix)]
     fn unsafe_roots_and_bad_config_refused() {
         let t = tmpdir("p7");
         let core = mem_core("p7");
@@ -1049,6 +1062,7 @@ mod tests {
 
     // P4-8: two rules, two roots, fully independent.
     #[test]
+    #[cfg(unix)]
     fn two_roots_independent() {
         let t = tmpdir("p8");
         let sec = section(vec![
@@ -1081,6 +1095,7 @@ mod tests {
     // (CAS conflicts, rename, error propagation), and the local rule
     // leaves the remote namespace untouched (P4-6's real assertion).
     #[test]
+    #[cfg(unix)]
     fn remote_baseline_through_router() {
         let t = tmpdir("p9");
         let core = mem_core("p9");

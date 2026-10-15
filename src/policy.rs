@@ -787,8 +787,10 @@ fn validate_local_root(prefix: &str, root: &str) -> Result<(), PolicyError> {
     let tilde = root.starts_with("~/");
     // Platform-correct absoluteness: on Windows an absolute root is
     // drive-prefixed ("C:\\data"), which a '/'-string check would wrongly
-    // refuse — every local rule would be unusable there.
-    if !tilde && !std::path::Path::new(root).is_absolute() {
+    // refuse — every local rule would be unusable there. The '/' prefix
+    // stays accepted (unix spellings, and Rust counts drive-less rooted
+    // paths as relative on Windows).
+    if !tilde && !root.starts_with('/') && !std::path::Path::new(root).is_absolute() {
         return Err(unsafe_root("root must be absolute or start with \"~/\""));
     }
     if root == "/" || root == "~" || root == "~/" {
