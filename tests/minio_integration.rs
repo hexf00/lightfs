@@ -283,12 +283,15 @@ fn point_in_time_restore_minio() {
             eng.core.commit_write(&h).unwrap();
         }
     }
-    let backup_path = std::env::temp_dir()
-        .join(format!("lightfs-pit-backup-{}.db", std::process::id()))
-        .to_string_lossy()
-        .to_string();
-    let _ = std::fs::remove_file(&backup_path);
-    lightfs::cmd::backup(&cfg, &backup_path).unwrap();
+    let backup_root =
+        std::env::temp_dir().join(format!("lightfs-pit-backup-root-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&backup_root);
+    let mut backup_cfg = cfg.clone();
+    backup_cfg.backup.root = Some(backup_root.to_string_lossy().to_string());
+    lightfs::cmd::backup(&backup_cfg, None).unwrap();
+    let published = lightfs::backup::scan_backups(backup_root.to_str().unwrap()).unwrap();
+    assert_eq!(published.len(), 1, "exactly one backup published");
+    let snapshot_db = published[0].dir.join("meta.db");
 
     // Damage everything recoverable: overwrite, delete, and add.
     {
@@ -313,7 +316,7 @@ fn point_in_time_restore_minio() {
         .to_string_lossy()
         .to_string();
     let _ = std::fs::remove_file(&restore_cfg.metadata.path);
-    std::fs::copy(&backup_path, &restore_cfg.metadata.path).unwrap();
+    std::fs::copy(&snapshot_db, &restore_cfg.metadata.path).unwrap();
     {
         let eng = lightfs::engine::open_embedded(&restore_cfg).unwrap();
         assert_eq!(eng.core.read("/keep", 0, 100).unwrap(), keep_v1);
@@ -331,29 +334,27 @@ fn point_in_time_restore_minio() {
             report.render()
         );
         // Post-backup leftovers are expected and classified (not missing).
-        // Node ids are reused after unlink (plain INTEGER PRIMARY KEY), so
-        // /post's commits (id 3, reused from the deleted /zap) show up as
-        // STALE versions of the restored /zap rather than orphans. The
-        // metadata-only create adds no object of its own, so exactly the
-        // two content objects remain stale. All inert: nothing references
-        // them and restored-db gc only touches recorded retained rows.
-        assert_eq!(report.orphan_objects.len(), 0, "{}", report.render());
-        assert_eq!(report.stale_versions.len(), 2, "{}", report.render());
+        // nodes.id is AUTOINCREMENT (R4: no id reuse), so /post got a fresh
+        // node id absent from the restored snapshot — its object is a true
+        // ORPHAN. /keep's post-backup version shares the restored node's id,
+        // so it classifies as a STALE version of /keep instead. All inert:
+        // the restored db references neither, and restored-db gc only
+        // touches recorded retained rows.
+        assert_eq!(report.orphan_objects.len(), 1, "{}", report.render());
+        assert_eq!(report.stale_versions.len(), 1, "{}", report.render());
         assert_eq!(report.retained_objects.len(), 0, "{}", report.render());
     }
     for f in [
         cfg.metadata.path.clone(),
         restore_cfg.metadata.path.clone(),
-        backup_path.clone(),
         format!("{}-wal", cfg.metadata.path),
         format!("{}-shm", cfg.metadata.path),
         format!("{}-wal", restore_cfg.metadata.path),
         format!("{}-shm", restore_cfg.metadata.path),
-        format!("{}-wal", backup_path),
-        format!("{}-shm", backup_path),
     ] {
         let _ = std::fs::remove_file(f);
     }
+    let _ = std::fs::remove_dir_all(&backup_root);
 }
 
 #[test]

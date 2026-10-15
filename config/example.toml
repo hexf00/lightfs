@@ -29,3 +29,16 @@ max_age_seconds = 3600
 # window has passed. 0 = delete immediately (backups become metadata-only).
 [retention]
 superseded_secs = 604800
+
+# Canonical backup root (P0-b). `lightfs backup` publishes one directory per
+# backup here: meta.db snapshot + versioned object manifest + backup.json,
+# atomically renamed into place. `lightfs gc` REFUSES to delete objects
+# unless this is configured — every valid, unexpired manifest in the root
+# protects its listed keys. Corrupt/unknown backups in the root fail the
+# whole gc (fail-closed); resolve with `lightfs backup prune --id ID`.
+# Backups live forever unless --expires-in is given at creation.
+[backup]
+# root = "/var/lib/lightfs/backups"
+# How long gc waits for the inter-process maintenance lock (gc.lock) before
+# giving up. A crashed holder releases it automatically (OS-level flock).
+lock_timeout_secs = 600

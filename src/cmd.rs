@@ -12,74 +12,107 @@ pub fn server(cfg: &Config) -> Result<()> {
     crate::server::serve(eng, &cfg.server.bind)
 }
 
-/// `lightfs backup`: consistent point-in-time snapshot of the SQLite
-/// metadata (VACUUM INTO works on a live WAL database and yields a compact
-/// standalone file). Object bytes are NOT in the backup — they live in the
-/// bucket. With retention enabled ([retention] superseded_secs > 0),
-/// replaced/deleted objects stay in the bucket for the retention window, so
-/// restoring this snapshot recovers point-in-time CONTENT. Retention
-/// disabled = metadata-only restore (overwritten/deleted content is gone).
-pub fn backup(cfg: &Config, output: &str) -> Result<()> {
-    use std::path::Path;
-    if Path::new(output).exists() {
-        return Err(Error::Config(format!(
-            "backup target {output} already exists (refusing to overwrite)"
-        )));
-    }
-    ensure_parent_dir_pub(output);
-    let conn = rusqlite::Connection::open(&cfg.metadata.path)
-        .map_err(|e| Error::Config(format!("cannot open metadata {}: {e}", cfg.metadata.path)))?;
-    conn.execute_batch(&format!("VACUUM INTO {}", sqlite_quote(output)))
-        .map_err(|e| Error::Config(format!("backup failed: {e}")))?;
-
-    // Report the recovery guarantee of THIS snapshot from its own tables.
-    let nodes: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
-    let (superseded, oldest): (i64, Option<i64>) = conn
-        .query_row(
-            "SELECT COUNT(*), MIN(superseded_at) FROM superseded_objects",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap_or((0, None));
-    println!("metadata backup written: {output}");
-    println!("  nodes: {nodes}; retained superseded objects: {superseded}");
-    if cfg.retention.superseded_secs == 0 {
-        eprintln!(
-            "  WARNING: retention disabled (retention.superseded_secs = 0). This backup \
-             restores NAMES ONLY — content overwritten or deleted after it is unrecoverable."
-        );
-    } else {
-        let age = oldest
-            .map(|t| now_secs() - t)
-            .unwrap_or(0)
-            .clamp(0, cfg.retention.superseded_secs as i64);
-        println!(
-            "  content restorable while objects are retained (superseded_secs = {}); \
-             oldest retained object is {age}s old",
-            cfg.retention.superseded_secs
-        );
-    }
+/// `lightfs backup [--expires-in SECS]` (P0-b): atomically publish one
+/// backup directory under the canonical `[backup] root` — a `VACUUM INTO`
+/// metadata snapshot, a versioned object manifest exported FROM THE
+/// SNAPSHOT ITSELF, and `backup.json` pinning the manifest's sha256. Helds
+/// the maintenance lock from before the snapshot until after the rename.
+/// See `crate::backup` for the full contract.
+pub fn backup(cfg: &Config, expires_in: Option<u64>) -> Result<()> {
+    crate::backup::backup_now(cfg, expires_in)?;
     Ok(())
 }
 
-/// `lightfs gc`: P0-a gc dependency gate. Object deletion must not run
-/// until the backup-manifest protection lands (P0-b: canonical backup
-/// root, gc.lock, fail-closed manifests) — `lightfs backup` today cannot
-/// prove which objects a supported backup still references. Lifecycle
-/// states, candidates and durable deletion tasks keep being tracked in the
-/// metadata store; this command simply refuses to delete anything.
+/// `lightfs backup prune --id ID` (P0-b): remove one backup under the
+/// exclusive maintenance lock — the ONLY sanctioned way to resolve a
+/// fail-closed corrupt backup.
+pub fn backup_prune(cfg: &Config, id: &str) -> Result<()> {
+    crate::backup::backup_prune(cfg, id)
+}
+
+/// One gated gc pass over `core`: verify EVERY published manifest (fail
+/// closed on any problem), then enroll reclaimable candidates and execute
+/// their durable deletion tasks — never touching manifest-protected keys.
+/// Shared by the CLI (`lightfs gc`) and the acceptance tests (fake store).
+#[derive(Debug)]
+pub struct GcSummary {
+    pub backups: usize,
+    pub protected_keys: usize,
+    pub enrolled: (usize, usize),
+    pub done: u64,
+    pub failed: u64,
+    pub skipped_protected: u64,
+}
+
+pub fn gc_run(
+    core: &crate::core::Core,
+    backup_root: Option<&str>,
+    lock_timeout_secs: u64,
+    retention_secs: u64,
+    now: i64,
+) -> Result<GcSummary> {
+    let Some(root) = backup_root else {
+        return Err(Error::Config(
+            "gc: [backup] root is not configured — there is no way to know which objects \
+             historical backups still reference; refusing to delete anything"
+                .into(),
+        ));
+    };
+    let root_path = std::path::PathBuf::from(root);
+    // The lock spans manifest verification through deletion finalization:
+    // a backup can never publish (or a prune remove) while its protection
+    // set is being read and acted on.
+    let _lock = crate::backup::MaintenanceLock::acquire(&root_path, lock_timeout_secs)?;
+    let verified = crate::backup::scan_backups(root)?;
+    let mut protected = std::collections::HashSet::new();
+    for b in &verified {
+        if b.expires_at.is_none_or(|t| t > now) {
+            protected.extend(b.keys.iter().cloned());
+        }
+    }
+    let enrolled = core.gc_enroll_candidates(now - retention_secs as i64, &protected)?;
+    let (done, failed, skipped_protected) = core.gc_execute_deletions(1000, &protected)?;
+    Ok(GcSummary {
+        backups: verified.len(),
+        protected_keys: protected.len(),
+        enrolled,
+        done,
+        failed,
+        skipped_protected,
+    })
+}
+
+/// `lightfs gc` (P0-b): the ONLY production path to real object deletion.
+/// Gate order is load-bearing: retention on → [backup] root configured →
+/// maintenance lock → every manifest verified fail-closed → protected keys
+/// filtered → durable deletion tasks. The lock covers the whole window, so
+/// a backup publishing concurrently is structurally excluded.
 pub fn gc(cfg: &Config) -> Result<()> {
     if cfg.retention.superseded_secs == 0 {
         return Err(Error::Config(
             "retention.superseded_secs = 0: retention is disabled, there is nothing to gc".into(),
         ));
     }
-    Err(Error::Config(
-        "gc: object deletion is disabled until backup-manifest protection lands (P0-b); \
-         lifecycle states, candidates and deletion tasks keep being tracked, \
-         but no object is deleted"
-            .into(),
-    ))
+    let eng = engine::open_embedded(cfg)?;
+    let summary = gc_run(
+        &eng.core,
+        cfg.backup.root.as_deref(),
+        cfg.backup.lock_timeout_secs,
+        cfg.retention.superseded_secs,
+        now_secs(),
+    )?;
+    println!(
+        "gc: {} backup(s) verified, {} protected key(s), enrolled {} pack(s) + {} object(s), \
+         deleted {}, failed {} (kept for retry), skipped-protected {}",
+        summary.backups,
+        summary.protected_keys,
+        summary.enrolled.0,
+        summary.enrolled.1,
+        summary.done,
+        summary.failed,
+        summary.skipped_protected,
+    );
+    Ok(())
 }
 
 fn now_secs() -> i64 {
@@ -87,20 +120,6 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64
-}
-
-/// Single-quoted SQL string literal.
-fn sqlite_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
-}
-
-/// Public alias so cmd.rs does not reach into engine internals.
-fn ensure_parent_dir_pub(path: &str) {
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        if !parent.as_os_str().is_empty() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-    }
 }
 
 /// `lightfs create-bucket`: one-time bootstrap for a fresh bucket. Real

@@ -848,6 +848,7 @@ mod tests {
     use crate::core::Core;
     use crate::metadata::sqlite::SqliteMetadataStore;
     use crate::object_store::mem::MemObjectStore;
+    use std::collections::HashSet;
     use std::sync::Arc as StdArc;
 
     fn wb_core(tag: &str) -> Core {
@@ -1824,7 +1825,7 @@ mod tests {
         assert!(objects.head(orphan).is_ok());
         // The gc executor (Core side) reclaims the enrolled object.
         let c = Core::new(meta.clone(), objects.clone());
-        let (done, failed) = c.gc_execute_deletions(10).unwrap();
+        let (done, failed, _) = c.gc_execute_deletions(10, &HashSet::new()).unwrap();
         assert_eq!((done, failed), (1, 0));
         assert!(objects.head(orphan).is_err());
         let _ = std::fs::remove_dir_all(&dir);

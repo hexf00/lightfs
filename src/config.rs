@@ -33,6 +33,10 @@ pub struct Config {
     /// Strictly validated at mount: unknown fields inside are errors.
     #[serde(default)]
     pub policy: Option<crate::policy::PolicySection>,
+    /// P0-b: canonical backup root + maintenance-lock tuning. Absent root
+    /// = `lightfs backup` refuses and `gc` refuses to delete any object.
+    #[serde(default)]
+    pub backup: BackupSection,
 }
 
 /// S3.1 pack prototype knobs. All off/neutral by default.
@@ -179,6 +183,31 @@ impl Default for RetentionSection {
     }
 }
 
+/// P0-b backup-protection configuration. The canonical root is the ONLY
+/// supported backup location: every supported backup is a subdirectory
+/// there (atomically published, versioned manifest), and `gc.lock` lives
+/// there as the backup/gc/prune mutual-exclusion lock.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BackupSection {
+    /// Canonical backup root directory. `None` (section absent) = no
+    /// supported backup location: `lightfs backup` errors and `gc` refuses
+    /// to delete objects (fail closed, no legacy fallback).
+    pub root: Option<String>,
+    /// Seconds a maintenance-lock waiter may block before erroring out
+    /// (never silently skipped). Applies to backup, gc and backup prune.
+    pub lock_timeout_secs: u64,
+}
+
+impl Default for BackupSection {
+    fn default() -> Self {
+        Self {
+            root: None,
+            lock_timeout_secs: 600,
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -228,6 +257,7 @@ impl Config {
                 commit: CommitSection::default(),
                 writeback: WritebackSection::default(),
                 policy: None,
+                backup: Default::default(),
             }),
         }
     }

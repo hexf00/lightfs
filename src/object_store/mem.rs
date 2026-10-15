@@ -27,6 +27,8 @@ pub struct MemObjectStore {
     /// Test-only injection: the next delete of a key present here returns
     /// ObjectMissing instead of Ok (absent-object branch coverage).
     missing_deletes: Mutex<std::collections::HashSet<String>>,
+    /// Total delete() invocations (fail-closed tests assert it stays 0).
+    delete_calls: std::sync::atomic::AtomicU64,
 }
 
 impl Default for MemObjectStore {
@@ -43,6 +45,7 @@ impl MemObjectStore {
             delete_failures: Mutex::new(std::collections::HashSet::new()),
             head_failures: Mutex::new(std::collections::HashSet::new()),
             missing_deletes: Mutex::new(std::collections::HashSet::new()),
+            delete_calls: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -65,6 +68,11 @@ impl MemObjectStore {
     /// absent-object branch deterministically.
     pub fn inject_object_missing_delete(&self, key: &str) {
         self.missing_deletes.lock().unwrap().insert(key.to_string());
+    }
+
+    /// Test-only: how many delete() calls reached this store.
+    pub fn delete_calls(&self) -> u64 {
+        self.delete_calls.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn info(&self, key: &str, e: &Entry) -> ObjectInfo {
@@ -158,6 +166,8 @@ impl ObjectStore for MemObjectStore {
     }
 
     fn delete(&self, key: &str) -> Result<()> {
+        self.delete_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.delete_failures.lock().unwrap().remove(key) {
             return Err(Error::Storage(format!(
                 "injected delete failure for testing: {key}"

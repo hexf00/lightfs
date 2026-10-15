@@ -314,25 +314,34 @@ impl Core {
     // P0-b's backup-manifest protection exists (gc dependency gate).
 
     /// Enroll gc candidates as durable deletion intents: unreferenced packs
-    /// past their retention window and superseded per-file objects. Each
-    /// registration re-checks its guards inside its own transaction and
-    /// returns false when the predicate no longer holds.
+    /// past their retention window and superseded per-file objects. Keys in
+    /// `protected` (the verified, unexpired backup manifests) are skipped —
+    /// they stay reclaimable candidates for a later pass, after the backup
+    /// expires or is pruned. Each registration re-checks its guards inside
+    /// its own transaction and returns false when the predicate no longer
+    /// holds.
     ///
-    /// `#[cfg(test)]` on purpose: enrollment as a bulk sweep exists only for
-    /// the deletion-task tests. Production objects reach the intent ledger
-    /// through their own paths (retire/unlink/recover); the production
-    /// entry point for reclamation is `lightfs gc`, which refuses to run
-    /// until P0-b's backup-manifest protection exists.
-    #[cfg(test)]
-    pub(crate) fn gc_enroll_candidates(&self, cutoff: i64) -> Result<(usize, usize)> {
+    /// Production callers: ONLY `lightfs gc` (cmd::gc), which holds the
+    /// maintenance lock and has verified every published manifest first.
+    pub(crate) fn gc_enroll_candidates(
+        &self,
+        cutoff: i64,
+        protected: &std::collections::HashSet<String>,
+    ) -> Result<(usize, usize)> {
         let mut packs = 0usize;
         let mut objects = 0usize;
         for (key, _) in self.meta.gc_pack_candidates(cutoff, 1000)? {
+            if protected.contains(&key) {
+                continue;
+            }
             if self.meta.gc_register_pack_deletion(&key, self.now())? {
                 packs += 1;
             }
         }
         for key in self.meta.gc_candidates(cutoff, 1000)? {
+            if protected.contains(&key) {
+                continue;
+            }
             if self
                 .meta
                 .gc_register_superseded_deletion(&key, self.now())?
@@ -346,18 +355,26 @@ impl Core {
     /// Execute claimed deletion tasks: remote delete (idempotent — a key
     /// already gone, e.g. a crash after the remote delete but before the
     /// local finalize, counts as success) then the transactional finalize.
-    /// Failures persist as retryable rows; the intent is never lost.
+    /// Failures persist as retryable rows; the intent is never lost. Keys
+    /// in `protected` are left untouched in the `deleting` stage (the next
+    /// gc's claim re-queues them) — a protected intent is never completed.
     ///
-    /// `#[cfg(test)]` on purpose: this is the single function that turns
-    /// deletion intents into real remote deletes, and until P0-b lands NO
-    /// production caller may exist at all (the future sanctioned caller is
-    /// the gated `lightfs gc`). Compiling it out of non-test builds makes
-    /// "no bypass" a property of the binary, not of call-site discipline.
-    #[cfg(test)]
-    pub(crate) fn gc_execute_deletions(&self, limit: usize) -> Result<(u64, u64)> {
+    /// Production callers: ONLY `lightfs gc` (cmd::gc), behind the P0-b
+    /// gate: maintenance lock held, every published manifest verified, and
+    /// [backup] root configured. There is no other entry to real deletion.
+    pub(crate) fn gc_execute_deletions(
+        &self,
+        limit: usize,
+        protected: &std::collections::HashSet<String>,
+    ) -> Result<(u64, u64, u64)> {
         let mut done = 0u64;
         let mut failed = 0u64;
+        let mut skipped_protected = 0u64;
         for d in self.meta.gc_claim_deletions(limit, self.now())? {
+            if protected.contains(&d.key) {
+                skipped_protected += 1;
+                continue;
+            }
             // "Object confirmed absent" is deletion success at every layer
             // that can report it (S4.2.2 contract audit): the S3 adapter
             // normalizes 2xx/404-key-missing to Ok itself, NotFound and
@@ -381,7 +398,7 @@ impl Core {
                 }
             }
         }
-        Ok((done, failed))
+        Ok((done, failed, skipped_protected))
     }
 
     pub fn objects(&self) -> &Arc<dyn ObjectStore> {
@@ -1403,12 +1420,16 @@ mod tests {
         c.metadata().mark_pack_uploaded(p, 1).unwrap();
         c.metadata().wb_finalize_batch_if_terminal(p, 1).unwrap();
         // Past the retention window: the pack enrolls as a deletion intent.
-        let (packs, objects) = c.gc_enroll_candidates(i64::MAX).unwrap();
+        let (packs, objects) = c
+            .gc_enroll_candidates(i64::MAX, &std::collections::HashSet::new())
+            .unwrap();
         assert_eq!((packs, objects), (1, 0));
         // First execution fails on the remote: the task survives as failed
         // and the pack row stays `deleting` (no refs can be created).
         mem.inject_delete_failure(p);
-        let (done, failed) = c.gc_execute_deletions(10).unwrap();
+        let (done, failed, _) = c
+            .gc_execute_deletions(10, &std::collections::HashSet::new())
+            .unwrap();
         assert_eq!((done, failed), (0, 1));
         assert!(c.metadata().pack_state(p).unwrap().is_some());
         assert!(
@@ -1418,7 +1439,9 @@ mod tests {
                 .is_empty()
         );
         // Second execution succeeds: pack row finalized away.
-        let (done, failed) = c.gc_execute_deletions(10).unwrap();
+        let (done, failed, _) = c
+            .gc_execute_deletions(10, &std::collections::HashSet::new())
+            .unwrap();
         assert_eq!((done, failed), (1, 0));
         assert!(c.metadata().pack_state(p).unwrap().is_none());
     }
@@ -1458,7 +1481,9 @@ mod tests {
             c.metadata().wb_finalize_batch_if_terminal(p, 1).unwrap();
             mem.put(p, b"real-pack-bytes").unwrap();
             assert!(mem.head(p).is_ok(), "the pack object really exists");
-            let (packs, objects) = c.gc_enroll_candidates(i64::MAX).unwrap();
+            let (packs, objects) = c
+                .gc_enroll_candidates(i64::MAX, &std::collections::HashSet::new())
+                .unwrap();
             assert_eq!((packs, objects), (1, 0));
         }
         // 3. claim — the durable task and the pack are in `deleting`.
@@ -1496,12 +1521,16 @@ mod tests {
         );
         // 7. the stale deleting claim re-enters; the absent object does not
         // block the local finalize.
-        let (done, failed) = c.gc_execute_deletions(10).unwrap();
+        let (done, failed, _) = c
+            .gc_execute_deletions(10, &std::collections::HashSet::new())
+            .unwrap();
         assert_eq!((done, failed), (1, 0), "missing key counts as deleted");
         // 8. terminal states, and a repeat pass is an idempotent no-op.
         assert!(c.metadata().pack_state(p).unwrap().is_none());
         assert!(c.metadata().gc_claim_deletions(10, 1).unwrap().is_empty());
-        let (done, failed) = c.gc_execute_deletions(10).unwrap();
+        let (done, failed, _) = c
+            .gc_execute_deletions(10, &std::collections::HashSet::new())
+            .unwrap();
         assert_eq!((done, failed), (0, 0));
         assert!(mem.head(p).is_err());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1532,12 +1561,16 @@ mod tests {
             4,
         )
         .unwrap();
-        let (packs, objects) = c.gc_enroll_candidates(i64::MAX).unwrap();
+        let (packs, objects) = c
+            .gc_enroll_candidates(i64::MAX, &std::collections::HashSet::new())
+            .unwrap();
         assert_eq!((packs, objects), (0, 1));
         // The object vanishes out-of-band before the executor runs.
         c.objects().delete(&old_key).unwrap();
         assert!(c.objects().head(&old_key).is_err());
-        let (done, failed) = c.gc_execute_deletions(10).unwrap();
+        let (done, failed, _) = c
+            .gc_execute_deletions(10, &std::collections::HashSet::new())
+            .unwrap();
         assert_eq!((done, failed), (1, 0));
         assert!(c.metadata().all_superseded().unwrap().is_empty());
         assert!(c.metadata().gc_claim_deletions(10, 1).unwrap().is_empty());
@@ -1560,12 +1593,16 @@ mod tests {
         c.metadata().register_pack(p, 100).unwrap();
         c.metadata().mark_pack_uploaded(p, 1).unwrap();
         c.metadata().wb_finalize_batch_if_terminal(p, 1).unwrap();
-        let (packs, objects) = c.gc_enroll_candidates(i64::MAX).unwrap();
+        let (packs, objects) = c
+            .gc_enroll_candidates(i64::MAX, &std::collections::HashSet::new())
+            .unwrap();
         assert_eq!((packs, objects), (1, 0));
         // The store reports ObjectMissing for this key's delete.
         mem.inject_object_missing_delete(p);
 
-        let (done, failed) = c.gc_execute_deletions(10).unwrap();
+        let (done, failed, _) = c
+            .gc_execute_deletions(10, &std::collections::HashSet::new())
+            .unwrap();
         assert_eq!(
             (done, failed),
             (1, 0),
@@ -1579,7 +1616,9 @@ mod tests {
             c.metadata().gc_claim_deletions(10, 1).unwrap().is_empty(),
             "no retry residue"
         );
-        let (done, failed) = c.gc_execute_deletions(10).unwrap();
+        let (done, failed, _) = c
+            .gc_execute_deletions(10, &std::collections::HashSet::new())
+            .unwrap();
         assert_eq!((done, failed), (0, 0), "idempotent repeat");
     }
 
@@ -1606,9 +1645,13 @@ mod tests {
             4,
         )
         .unwrap();
-        let (packs, objects) = c.gc_enroll_candidates(i64::MAX).unwrap();
+        let (packs, objects) = c
+            .gc_enroll_candidates(i64::MAX, &std::collections::HashSet::new())
+            .unwrap();
         assert_eq!((packs, objects), (0, 1), "the superseded v1 key enrolls");
-        let (done, _) = c.gc_execute_deletions(10).unwrap();
+        let (done, _, _) = c
+            .gc_execute_deletions(10, &std::collections::HashSet::new())
+            .unwrap();
         assert_eq!(done, 1);
         assert!(c.objects().get(&old_key, None).is_err(), "v1 bytes gone");
         assert!(c.metadata().all_superseded().unwrap().is_empty());
