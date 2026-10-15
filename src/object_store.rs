@@ -1,6 +1,7 @@
 //! ObjectStore abstraction: the data plane. Backends: S3-compatible
 //! (MinIO/OSS/AWS) and an in-memory store used by network-free tests.
 
+pub mod contract;
 pub mod mem;
 pub mod s3;
 
@@ -19,7 +20,14 @@ pub struct Range {
 pub struct ObjectInfo {
     pub key: String,
     pub size: u64,
+    /// Content fingerprint. CONTRACT: non-empty for every successfully
+    /// stored object — metadata persists it as the node fingerprint and the
+    /// read cache treats an empty etag as uncacheable, so a backend that
+    /// cannot produce one is not a valid ObjectStore.
     pub etag: String,
+    /// No contract: backends without bucket versioning return `None`, and a
+    /// value from one call need not round-trip through another (the S3 GET
+    /// path does not parse it). Never load-bearing.
     pub version_id: Option<String>,
 }
 
@@ -38,24 +46,57 @@ pub struct ListPage {
 }
 
 pub trait ObjectStore: Send + Sync {
-    /// Store full content for `key`. Overwrites atomically.
+    /// Store full content for `key`. Overwrites atomically: once `put`
+    /// returns Ok, every later `get`/`head` observes the new content in
+    /// full — never a mix of generations. The returned info carries the
+    /// stored key, the exact size and a NON-EMPTY etag (see ObjectInfo).
     fn put(&self, key: &str, data: &[u8]) -> Result<ObjectInfo>;
     /// Store content for `key` streaming exactly `len` bytes from `reader`.
-    /// Bounded memory: the backend must not buffer the whole object.
+    /// Bounded memory: the backend must not buffer the whole object (a
+    /// plain-PUT path for small `len` is fine — the contract bounds
+    /// AGGREGATE memory, not every implementation branch). Reads EXACTLY
+    /// `len` bytes: a reader that ends early fails the call. The remote
+    /// state after a failed `put_stream` is UNSPECIFIED — the caller owns
+    /// the key namespace and must not assume the object is absent.
     fn put_stream(&self, key: &str, reader: &mut dyn Read, len: u64) -> Result<ObjectInfo>;
-    /// Read `key`, optionally a byte range.
+    /// Read `key`, optionally a byte range. A missing key is
+    /// `Error::ObjectMissing`. With a range, the returned bytes are
+    /// `[start, min(start+len, object_size))` and `ObjectData.offset`
+    /// equals the requested `start`. CALLER RESPONSIBILITY (core clamps
+    /// before the store sees a range): `start < object_size` and
+    /// `len > 0`. `start >= size` or `len == 0` is deliberately NOT part
+    /// of this contract — backends legitimately differ there (in-memory
+    /// returns empty data, S3 answers 416) and callers must never rely on
+    /// either.
     fn get(&self, key: &str, range: Option<Range>) -> Result<ObjectData>;
     /// Stream `key` (optionally a range): returns a reader and the exact
     /// number of bytes it will yield. Bounded memory on the backend side.
+    /// Range semantics as [`ObjectStore::get`].
     fn get_stream(&self, key: &str, range: Option<Range>) -> Result<(Box<dyn Read + Send>, u64)>;
+    /// Metadata for `key`; a missing key is `Error::ObjectMissing`.
     fn head(&self, key: &str) -> Result<ObjectInfo>;
-    /// Presigned GET URL where supported (S3); None otherwise.
+    /// Presigned GET URL where supported (S3); None otherwise. OPTIONAL
+    /// capability: `None` is always an acceptable answer.
     fn presign_get(&self, _key: &str, _expires_secs: u64) -> Option<String> {
         None
     }
     /// Delete `key`; deleting a missing key is not an error (idempotent).
     fn delete(&self, key: &str) -> Result<()>;
-    /// List keys under `prefix`, one page at a time (keys ascending).
+    /// List keys under `prefix`, one page at a time: keys ascending,
+    /// at most `max` items per page, no keys outside the prefix, and a
+    /// consecutive walk (feeding each page's `next_token` back) yields
+    /// every matching key exactly once. Tokens are opaque: a backend may
+    /// use any string (the in-memory backend uses the last key, S3 uses
+    /// continuation tokens — callers must not parse either).
+    ///
+    /// CALLER RESPONSIBILITY (not part of this contract): keys where one
+    /// key is another key's directory prefix (`b` together with `b/y`).
+    /// Real backends genuinely disagree there — S3's flat namespace
+    /// returns both, while MinIO (RELEASE.2025-04-22, verified on
+    /// darwin/arm64 and linux/arm64) silently drops the whole subtree
+    /// under `b` from every listing. LightFS never creates such keys
+    /// (content, version and staging keys are all single-leaf paths under
+    /// a directory-shaped prefix), and callers must keep it that way.
     fn list(&self, prefix: &str, token: Option<&str>, max: usize) -> Result<ListPage>;
     /// True when the backend can reach its remote endpoint.
     fn ping(&self) -> Result<()>;

@@ -431,3 +431,33 @@ fn symlinks_with_minio_fsck_and_reopen() {
     let _ = std::fs::remove_file(format!("{}-wal", cfg.metadata.path));
     let _ = std::fs::remove_file(format!("{}-shm", cfg.metadata.path));
 }
+
+// ---------------------------------------------------------------------------
+// OS-1 (S4.6): the shared ObjectStore contract suite against the REAL S3
+// backend. Same assertions the in-memory backend runs in the lib tests —
+// the suite lives in `lightfs::object_store::contract` so a new backend
+// proves itself by running it, not by copying a checklist. Environment
+// failures (MinIO down) must not read as contract failures: ping first.
+#[test]
+fn object_store_contract_suite_minio() {
+    let cfg = match minio_config("os1-contract") {
+        Ok(c) => c,
+        Err(_) => return, // MinIO gate not set; the mem backend covers the suite
+    };
+    use lightfs::object_store::s3::S3ObjectStore;
+    let store = S3ObjectStore::new(cfg.s3_config()).expect("s3 config");
+    store.ensure_bucket().expect("ensure bucket");
+    store
+        .ping()
+        .expect("MinIO must be reachable before the contract suite (environment, not contract)");
+
+    let ns = format!(
+        "os1-contract-{}-{:x}/",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    lightfs::object_store::contract::run_contract_suite(&store, &ns);
+}
