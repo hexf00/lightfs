@@ -85,11 +85,9 @@ impl MaintenanceLock {
             .read(true)
             .open(root.join(LOCK_NAME))
             .map_err(|e| Error::Config(format!("cannot open maintenance lock: {e}")))?;
-        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
         loop {
-            let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-            if rc == 0 {
+            if crate::fslock::try_lock_raw(&file) {
                 return Ok(Self { _file: file });
             }
             if std::time::Instant::now() >= deadline {

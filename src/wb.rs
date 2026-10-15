@@ -76,6 +76,12 @@ pub struct WbOptions {
     /// Exhaustion fails the write with `Error::Capacity` — never a spin
     /// (dead bytes never drain, waiting cannot help) and never an eviction.
     pub staging_budget_bytes: u64,
+    /// P0-c acceptance supplement: path of the ledger lock, `<db>.engine-lock`
+    /// next to the SQLite file, taken by the engine alongside the staging-dir
+    /// lock so a capacity ledger admits exactly one live writer even across
+    /// configs that share the DB but not the staging dir. `None` for
+    /// in-memory test ledgers (nothing on disk to exclude).
+    pub ledger_lock_path: Option<String>,
 }
 
 pub struct WriteBackEngine {
@@ -88,6 +94,14 @@ pub struct WriteBackEngine {
     batch_max_wait_ms: u64,
     queue_max_tasks: usize,
     staging_budget_bytes: u64,
+    /// P0-c acceptance supplement: single-writer locks, held for the whole
+    /// engine lifetime. `staging` guards the staging DIRECTORY (two engines
+    /// sharing it would sweep each other's staging files as orphans);
+    /// `ledger` guards the capacity-ledger DB (reconcile would void the
+    /// other engine's reservations). Kernel-released on process death.
+    /// Held, never read — keeping the fields alive keeps the OS locks.
+    _staging_lock: crate::fslock::FileLock,
+    _ledger_lock: Option<crate::fslock::FileLock>,
     /// Signalled whenever a task is enqueued so idle workers wake.
     wake: Condvar,
     idle: Mutex<usize>,
@@ -135,11 +149,40 @@ impl WriteBackEngine {
         retention_supersede: bool,
     ) -> Result<Self> {
         std::fs::create_dir_all(&opts.staging_dir)?;
+        // P0-c acceptance supplement: single-writer enforcement. Until now
+        // "one engine per staging dir / capacity ledger" was a comment, not
+        // a mechanism — a second engine could open the same staging dir and
+        // its recover() would sweep the first engine's staging files as
+        // orphans and void its reservations. Both locks are kernel-owned
+        // (die with the process) and held for THIS struct's lifetime, so a
+        // second engine fails loudly while the first is alive and can start
+        // cleanly once it is gone. Acquired BEFORE any recover/reconcile.
+        let staging_path = Path::new(&opts.staging_dir).join("engine.lock");
+        let staging_lock = crate::fslock::FileLock::try_acquire(&staging_path).map_err(|e| {
+            Error::Config(format!(
+                "write-back staging directory {} is already owned by a live engine \
+                 (only one engine may own a staging directory and its capacity ledger): {e}",
+                opts.staging_dir
+            ))
+        })?;
+        let ledger_lock = match &opts.ledger_lock_path {
+            Some(p) => Some(
+                crate::fslock::FileLock::try_acquire(Path::new(p)).map_err(|e| {
+                    Error::Config(format!(
+                        "capacity ledger {p} is already owned by a live engine \
+                     (only one engine may write one ledger): {e}"
+                    ))
+                })?,
+            ),
+            None => None,
+        };
         Ok(Self {
             meta,
             objects,
             metrics,
             staging_dir: PathBuf::from(&opts.staging_dir),
+            _staging_lock: staging_lock,
+            _ledger_lock: ledger_lock,
             retention_supersede,
             batch_pack_bytes: opts.batch_pack_bytes,
             batch_max_wait_ms: opts.batch_max_wait_ms,
@@ -1152,6 +1195,8 @@ mod tests {
                 batch_max_wait_ms: 0,
                 queue_max_tasks: 0,
                 staging_budget_bytes: 0,
+
+                ledger_lock_path: None,
             }),
         )
         .unwrap()
@@ -1313,6 +1358,8 @@ mod tests {
                 batch_max_wait_ms: 0, // no straggler wait in tests
                 queue_max_tasks: queue_max,
                 staging_budget_bytes: 0,
+
+                ledger_lock_path: None,
             }),
         )
         .unwrap()
@@ -1524,6 +1571,8 @@ mod tests {
                 batch_max_wait_ms: 0,
                 queue_max_tasks: 0,
                 staging_budget_bytes: 0,
+
+                ledger_lock_path: None,
             }),
         )
         .unwrap();
@@ -1740,6 +1789,8 @@ mod tests {
             batch_max_wait_ms: 0,
             queue_max_tasks: 0,
             staging_budget_bytes: 0,
+
+            ledger_lock_path: None,
         };
         let body = b"survives a crash";
         let store: StdArc<dyn crate::object_store::ObjectStore> =
@@ -1899,6 +1950,8 @@ mod tests {
                 batch_max_wait_ms: 0,
                 queue_max_tasks: 0,
                 staging_budget_bytes: 0,
+
+                ledger_lock_path: None,
             }),
         )
         .unwrap();
@@ -1982,6 +2035,8 @@ mod tests {
                 batch_max_wait_ms: 0,
                 queue_max_tasks: 0,
                 staging_budget_bytes: 0,
+
+                ledger_lock_path: None,
             }),
         )
         .unwrap();
@@ -2085,6 +2140,8 @@ mod tests {
             batch_max_wait_ms: 0,
             queue_max_tasks: 0,
             staging_budget_bytes: 0,
+
+            ledger_lock_path: None,
         };
         let eng = WriteBackEngine::new(
             meta.clone(),
@@ -2152,6 +2209,8 @@ mod tests {
             batch_max_wait_ms: 0,
             queue_max_tasks: 0,
             staging_budget_bytes: 0,
+
+            ledger_lock_path: None,
         };
         let eng = WriteBackEngine::new(
             meta.clone(),
@@ -2283,6 +2342,7 @@ mod tests {
                 batch_max_wait_ms: 0,
                 queue_max_tasks: 0,
                 staging_budget_bytes: budget,
+                ledger_lock_path: None,
             }),
         )
         .unwrap();
@@ -2398,6 +2458,8 @@ mod tests {
                     batch_max_wait_ms: 0,
                     queue_max_tasks: 0,
                     staging_budget_bytes: 0,
+
+                    ledger_lock_path: None,
                 }),
             )
             .unwrap();
@@ -2427,6 +2489,8 @@ mod tests {
                 batch_max_wait_ms: 0,
                 queue_max_tasks: 0,
                 staging_budget_bytes: 0,
+
+                ledger_lock_path: None,
             }),
         )
         .unwrap();
@@ -2439,6 +2503,9 @@ mod tests {
         );
         // dead bytes keep occupying: an explicit budget that only fits the
         // dead file refuses further writes with the explicit error.
+        // (P0-c supplement: the staging dir admits one live engine, so the
+        // previous engine exits before the budgeted reopen.)
+        drop(c);
         let c2 = Core::with_options(
             StdArc::new(SqliteMetadataStore::open(&meta_path.to_string_lossy()).unwrap()),
             StdArc::new(MemObjectStore::new()),
@@ -2451,6 +2518,8 @@ mod tests {
                 batch_max_wait_ms: 0,
                 queue_max_tasks: 0,
                 staging_budget_bytes: 100,
+
+                ledger_lock_path: None,
             }),
         )
         .unwrap();
@@ -2486,6 +2555,8 @@ mod tests {
                 batch_max_wait_ms: 0,
                 queue_max_tasks: 0,
                 staging_budget_bytes: 0,
+
+                ledger_lock_path: None,
             }),
         )
         .unwrap();
@@ -2634,6 +2705,8 @@ mod tests {
                 batch_max_wait_ms: 0,
                 queue_max_tasks: 0,
                 staging_budget_bytes: 0,
+
+                ledger_lock_path: None,
             }),
         )
         .unwrap();
@@ -2687,6 +2760,8 @@ mod tests {
                 batch_max_wait_ms: 0,
                 queue_max_tasks: 0,
                 staging_budget_bytes: 0,
+
+                ledger_lock_path: None,
             }),
         )
         .unwrap();
@@ -2703,5 +2778,282 @@ mod tests {
             big.len()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- P0-c acceptance supplement: single-writer enforcement ------------
+
+    fn p0c2_opts(staging: &Path, ledger: Option<String>) -> WbOptions {
+        WbOptions {
+            staging_dir: staging.to_string_lossy().to_string(),
+            drain_workers: 0,
+            batch_pack_bytes: 0,
+            batch_max_wait_ms: 0,
+            queue_max_tasks: 0,
+            staging_budget_bytes: 1000,
+            ledger_lock_path: ledger,
+        }
+    }
+
+    /// `.unwrap_err()` needs the Ok type to be Debug (the engine is not);
+    /// match the refusal out instead.
+    fn p0c2_expect_refused(r: Result<WriteBackEngine>) -> Error {
+        match r {
+            Ok(_) => panic!("second engine must be refused while the first is live"),
+            Err(e) => e,
+        }
+    }
+
+    fn p0c2_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lightfs-p0c2-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("staging")).unwrap();
+        dir
+    }
+
+    /// A (dual-engine conflict): while the first engine is live — with
+    /// staged bytes AND an in-flight reservation — a second engine is
+    /// refused on every sharing axis (same staging dir; same ledger with a
+    /// different staging dir; same staging dir with a different ledger).
+    /// After the first engine exits, the second starts, reconciles safely
+    /// (in-flight reservation of the dead engine voided, live staged bytes
+    /// kept) and owns both locks.
+    #[test]
+    fn p0c2_second_engine_refused_while_first_is_active() {
+        let dir = p0c2_dir("dual");
+        let db = dir.join("m.db");
+        let ledger = format!("{}.engine-lock", db.display());
+        let staging = dir.join("staging");
+        let meta = StdArc::new(SqliteMetadataStore::open(&db.to_string_lossy()).unwrap());
+        let objects = StdArc::new(MemObjectStore::new());
+        let eng = WriteBackEngine::new(
+            meta.clone(),
+            objects.clone(),
+            StdArc::new(Metrics::default()),
+            &p0c2_opts(&staging, Some(ledger.clone())),
+            false,
+        )
+        .unwrap();
+        // Live state the second engine's reconcile would corrupt: one
+        // staged file plus one reservation still in flight.
+        let n = meta
+            .create_node(1, "f", crate::metadata::NodeKind::File, 0o644, None)
+            .unwrap();
+        eng.write_deferred(&n, 0, &mut std::io::Cursor::new(vec![b'a'; 100]), 100)
+            .unwrap();
+        meta.wb_capacity_reserve(50, 1000).unwrap();
+        assert_eq!(
+            meta.wb_capacity_snapshot().unwrap(),
+            (100, 50),
+            "first engine holds staged bytes and an in-flight reservation"
+        );
+
+        // Same staging dir (fresh ledger even): refused — this is the
+        // orphan-sweep hazard (the second engine's recover would delete the
+        // first engine's staging files).
+        let r = WriteBackEngine::new(
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            objects.clone(),
+            StdArc::new(Metrics::default()),
+            &p0c2_opts(&staging, None),
+            false,
+        );
+        let e = p0c2_expect_refused(r);
+        assert!(format!("{e}").contains("staging directory"), "{e}");
+
+        // Different staging dir, same ledger: refused — reconcile there
+        // would void this engine's reservations.
+        let staging2 = dir.join("staging2");
+        std::fs::create_dir_all(&staging2).unwrap();
+        let r = WriteBackEngine::new(
+            meta.clone(),
+            objects.clone(),
+            StdArc::new(Metrics::default()),
+            &p0c2_opts(&staging2, Some(ledger.clone())),
+            false,
+        );
+        let e = p0c2_expect_refused(r);
+        assert!(format!("{e}").contains("capacity ledger"), "{e}");
+
+        // First engine exits: the second starts cleanly, reconciles, and
+        // takes over both locks.
+        drop(eng);
+        let eng2 = WriteBackEngine::new(
+            meta.clone(),
+            objects.clone(),
+            StdArc::new(Metrics::default()),
+            &p0c2_opts(&staging, Some(ledger)),
+            false,
+        )
+        .unwrap();
+        eng2.recover().unwrap();
+        assert_eq!(
+            eng2.reconcile_capacity_and_report().unwrap(),
+            (100, 0),
+            "live staged bytes kept; the dead engine's in-flight reservation voided"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B (deleted file, ledger not yet released): the drain confirmed the
+    /// physical delete and the process died before `staged_bytes` caught
+    /// up. Restart + reconcile must drop the phantom bytes, keep the
+    /// occupancy of files that still exist (dead letter), and apply the
+    /// orphan contract (counted on disk, released on confirmed sweep).
+    #[test]
+    fn p0c2_crash_between_delete_and_release_reconciles() {
+        let core = cap_core("p0c2b", 10_000, 0);
+        core.create("/f", 0o644).unwrap();
+        let n = core.lookup("/f").unwrap();
+        write_deferred_for_test(&core, &n, &[b'a'; 100], 100).unwrap();
+        write_deferred_for_test(&core, &n, &[b'b'; 200], 200).unwrap();
+        let meta = core.metadata().clone();
+        let objects = core.objects().clone();
+        let staging_dir = core.wb().unwrap().staging_dir().to_path_buf();
+        let mut tasks = meta.wb_active_tasks().unwrap();
+        tasks.sort_by_key(|t| t.size);
+        assert_eq!(tasks.len(), 2);
+        let (t_small, t_big) = (tasks[0].clone(), tasks[1].clone());
+        assert_eq!((t_small.size, t_big.size), (100, 200));
+        assert_eq!(
+            meta.wb_capacity_snapshot().unwrap(),
+            (300, 0),
+            "the ledger is correct up to the simulated crash"
+        );
+        // The crash window: physical delete confirmed, ledger update never
+        // happened. 200 phantom bytes.
+        std::fs::remove_file(&t_big.staging).unwrap();
+        // A dead letter that still occupies its real file, and an orphan
+        // nobody has a task row for.
+        meta.wb_set_state(t_small.id, "dead", 1).unwrap();
+        let orphan = staging_dir.join("wb-orphan-p0c2b.data");
+        std::fs::write(&orphan, vec![b'o'; 50]).unwrap();
+
+        // Restart: the ledger is rebuilt from REAL files only.
+        drop(core);
+        let eng = WriteBackEngine::new(
+            meta.clone(),
+            objects,
+            StdArc::new(Metrics::default()),
+            &p0c2_opts(&staging_dir, None),
+            false,
+        )
+        .unwrap();
+        eng.recover().unwrap();
+        assert_eq!(
+            eng.reconcile_capacity_and_report().unwrap(),
+            (100, 0),
+            "phantom 200B dropped; dead letter's 100B kept; orphan 50B swept+released"
+        );
+        assert!(
+            !meta
+                .wb_active_tasks()
+                .unwrap()
+                .iter()
+                .any(|t| t.id == t_big.id || t.id == t_small.id),
+            "the deleted-file task is dead-lettered (staging vanished), not resurrected"
+        );
+        assert!(
+            Path::new(&t_small.staging).exists(),
+            "dead letter file kept"
+        );
+        assert!(!orphan.exists(), "orphan swept");
+        let _ = std::fs::remove_dir_all(staging_dir.parent().unwrap());
+    }
+
+    /// C (concurrent recovery vs writes cannot arise): a SECOND PROCESS
+    /// holding the staging lock is refused entry while alive, and the lock
+    /// is released by the kernel the moment that process is SIGKILLed —
+    /// no stale lock, no retry protocol. The child is this same test
+    /// binary running `p0c2_lock_child_helper`.
+    #[test]
+    fn p0c2_cross_process_exclusion_and_release_on_death() {
+        let dir = p0c2_dir("xproc");
+        let staging = dir.join("staging");
+        let ready = dir.join("child.ready");
+        let exe = std::env::current_exe().unwrap();
+        let child = std::process::Command::new(&exe)
+            .args(["p0c2_lock_child_helper", "--nocapture"])
+            .env("LIGHTFS_P0C2_CHILD_STAGING", &staging)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // Kill the child on every path: a failing parent must not leak a
+        // lock-holding process.
+        struct Guard(std::process::Child);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut guard = Guard(child);
+        let mut waited = 0u32;
+        while !ready.exists() && waited < 10_000 {
+            std::thread::sleep(Duration::from_millis(20));
+            waited += 20;
+        }
+        assert!(ready.exists(), "child never acquired the lock");
+        let r = WriteBackEngine::new(
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            StdArc::new(MemObjectStore::new()),
+            StdArc::new(Metrics::default()),
+            &p0c2_opts(&staging, None),
+            false,
+        );
+        let e = p0c2_expect_refused(r);
+        assert!(
+            format!("{e}").contains("already owned by a live engine"),
+            "{e}"
+        );
+        // SIGKILL the holder: the kernel drops the lock immediately.
+        let _ = guard.0.kill();
+        let _ = guard.0.wait();
+        let eng = WriteBackEngine::new(
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            StdArc::new(MemObjectStore::new()),
+            StdArc::new(Metrics::default()),
+            &p0c2_opts(&staging, None),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            eng.reconcile_capacity_and_report().unwrap(),
+            (0, 0),
+            "clean start after the previous holder died"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Helper for `p0c2_cross_process_exclusion_and_release_on_death`:
+    /// takes the staging lock in THIS process, signals readiness, and holds
+    /// until SIGKILLed. A no-op when the env var is absent (plain suite
+    /// run), so the normal test sweep passes through instantly.
+    #[test]
+    fn p0c2_lock_child_helper() {
+        let Some(staging) = std::env::var_os("LIGHTFS_P0C2_CHILD_STAGING") else {
+            return;
+        };
+        let staging = PathBuf::from(staging);
+        let _engine = WriteBackEngine::new(
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            StdArc::new(MemObjectStore::new()),
+            StdArc::new(Metrics::default()),
+            &p0c2_opts(&staging, None),
+            false,
+        )
+        .expect("child takes the fresh staging lock");
+        let ready = staging.parent().unwrap().join("child.ready");
+        std::fs::write(ready, b"lock held").unwrap();
+        loop {
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }

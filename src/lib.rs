@@ -7,6 +7,7 @@ pub mod core;
 pub mod engine;
 pub mod error;
 pub mod fsck;
+pub(crate) mod fslock;
 pub mod localfs;
 pub mod routing;
 

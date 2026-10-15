@@ -66,3 +66,9 @@ lock_timeout_secs = 600
 ## physically removed, and a restart re-derives the ledger from the real
 ## staging files).
 #staging_budget_bytes = 0
+## Single-writer enforcement (P0-c acceptance supplement): the engine takes
+## an OS lock on <staging_dir>/engine.lock and on <db>.engine-lock for its
+## whole lifetime. A second engine on the same staging directory or the
+## same metadata DB fails loudly at startup; a killed holder releases the
+## locks by itself. `lightfs gc` / `lightfs fsck` do NOT take these locks
+## (they never stage anything) and stay usable while the server runs.

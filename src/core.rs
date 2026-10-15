@@ -2332,6 +2332,8 @@ mod tests {
                 batch_max_wait_ms: 0,
                 queue_max_tasks: 0,
                 staging_budget_bytes: 0,
+
+                ledger_lock_path: None,
             }),
         )
         .unwrap()

@@ -7,3 +7,6 @@ nohup.out
 *.db
 *.db-wal
 *.db-shm
+# default relative staging_dir (./staging) junk from local runs; real
+# deployments configure an absolute path outside the repo
+staging/

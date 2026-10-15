@@ -100,7 +100,10 @@ pub fn gc_run(
 /// only thing that drains them. `retention_secs` only shapes the candidate
 /// cutoff (0 → candidates qualify as soon as they are registered).
 pub fn gc(cfg: &Config) -> Result<()> {
-    let eng = engine::open_embedded(cfg)?;
+    // Maintenance entry: no write-back engine (P0-c supplement) — gc stages
+    // and drains nothing and must run while the live server owns the
+    // staging directory and the capacity ledger.
+    let eng = engine::open_embedded_maintenance(cfg)?;
     let summary = gc_run(
         &eng.core,
         cfg.backup.root.as_deref(),
@@ -158,7 +161,9 @@ pub fn create_bucket(cfg: &Config, public: bool) -> Result<()> {
 /// `lightfs fsck`: report metadata/object divergence; `--fix` adopts the
 /// data plane's state into metadata (never deletes anything).
 pub fn fsck(cfg: &Config, fix_problems: bool) -> Result<()> {
-    let eng = engine::open_embedded(cfg)?;
+    // Maintenance entry: no write-back engine (P0-c supplement), same
+    // reasoning as `gc`.
+    let eng = engine::open_embedded_maintenance(cfg)?;
     let report = crate::fsck::fsck(&eng.core)?;
     print!("{}", report.render());
     if fix_problems {

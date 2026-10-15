@@ -62,17 +62,22 @@ fn resolve_wb_workers(configured: usize, env: Option<&str>) -> Result<usize> {
 
 /// Build the Core from config, wiring the S3.1 prototype engines (pack /
 /// write-back) when enabled. Shared by embedded and server startup.
+/// `enable_wb = false` (maintenance commands) never constructs the
+/// write-back engine: `gc`/`fsck` stage and drain nothing, and they must
+/// stay usable on a write-back deployment while the live server owns the
+/// staging directory and the capacity ledger.
 fn build_core(
     cfg: &Config,
     meta: Arc<dyn MetadataStore>,
     objects: Arc<dyn ObjectStore>,
+    enable_wb: bool,
 ) -> Result<Core> {
     let pack = if cfg.pack.enabled {
         Some(cfg.pack.clone())
     } else {
         None
     };
-    let wb = if cfg.commit.mode == "writeback" {
+    let wb = if enable_wb && cfg.commit.mode == "writeback" {
         Some(crate::wb::WbOptions {
             staging_dir: cfg.writeback.staging_dir.clone(),
             drain_workers: cfg.writeback.drain_workers,
@@ -80,6 +85,10 @@ fn build_core(
             batch_max_wait_ms: cfg.writeback.batch_max_wait_ms,
             queue_max_tasks: cfg.writeback.queue_max_tasks,
             staging_budget_bytes: cfg.writeback.staging_budget_bytes,
+            // P0-c supplement: ledger lock anchored next to the SQLite file,
+            // so two configs sharing one DB but not the staging dir also
+            // refuse the second engine.
+            ledger_lock_path: Some(format!("{}.engine-lock", cfg.metadata.path)),
         })
     } else {
         None
@@ -103,7 +112,7 @@ pub fn open_embedded(cfg: &Config) -> Result<Engine> {
     let objects: Arc<dyn ObjectStore> = Arc::new(S3ObjectStore::new(cfg.s3_config())?);
     objects.ping()?;
     Ok(Engine {
-        core: Arc::new(build_core(cfg, meta, objects)?),
+        core: Arc::new(build_core(cfg, meta, objects, true)?),
     })
 }
 
@@ -114,7 +123,22 @@ pub fn open_embedded_mem(cfg: &Config) -> Result<Engine> {
     let meta: Arc<dyn MetadataStore> = Arc::new(SqliteMetadataStore::open(&cfg.metadata.path)?);
     let objects: Arc<dyn ObjectStore> = Arc::new(crate::object_store::mem::MemObjectStore::new());
     Ok(Engine {
-        core: Arc::new(build_core(cfg, meta, objects)?),
+        core: Arc::new(build_core(cfg, meta, objects, true)?),
+    })
+}
+
+/// Maintenance entry (`lightfs gc`, `lightfs fsck`): metadata + object
+/// stores WITHOUT the write-back engine. These commands stage and drain
+/// nothing; skipping the WB engine keeps them lock-free so they run against
+/// a write-back deployment while the live server owns the staging directory
+/// and the capacity ledger.
+pub fn open_embedded_maintenance(cfg: &Config) -> Result<Engine> {
+    ensure_parent_dir(&cfg.metadata.path);
+    let meta: Arc<dyn MetadataStore> = Arc::new(SqliteMetadataStore::open(&cfg.metadata.path)?);
+    let objects: Arc<dyn ObjectStore> = Arc::new(S3ObjectStore::new(cfg.s3_config())?);
+    objects.ping()?;
+    Ok(Engine {
+        core: Arc::new(build_core(cfg, meta, objects, false)?),
     })
 }
 
