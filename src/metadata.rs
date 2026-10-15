@@ -331,11 +331,24 @@ pub trait MetadataStore: Send + Sync {
         let _ = id;
         Ok(())
     }
-    /// Bump the retry counter; dead-letter at `max_attempts`. Returns true
-    /// when the task was requeued for another attempt.
-    fn wb_retry_or_dead(&self, id: i64, max_attempts: u32, now: i64) -> Result<bool> {
-        let _ = (id, max_attempts, now);
+    /// Bump the retry counter and record the S4.4 error class; dead-letter
+    /// at `max_attempts`. Returns true when the task was requeued for
+    /// another attempt.
+    fn wb_retry_or_dead(&self, id: i64, max_attempts: u32, now: i64, class: &str) -> Result<bool> {
+        let _ = (id, max_attempts, now, class);
         Err(Error::Storage("write-back unsupported".into()))
+    }
+    /// Dead-letter a task with its terminal S4.4 error class (persisted on
+    /// the row: `conflict` / `upload-transient` / `upload-permanent` /
+    /// `staging-lost` / `unknown`).
+    fn wb_mark_dead(&self, id: i64, class: &str, now: i64) -> Result<()> {
+        let _ = (id, class, now);
+        Err(Error::Storage("write-back unsupported".into()))
+    }
+    /// Test-only readback of every task's observable fields.
+    #[cfg(test)]
+    fn wb_task_rows(&self) -> Result<Vec<WbTaskRowDebug>> {
+        Ok(Vec::new())
     }
     fn wb_set_state(&self, id: i64, state: &str, now: i64) -> Result<()> {
         let _ = (id, state, now);
@@ -428,6 +441,10 @@ pub struct WbTask {
     pub size: i64,
     pub expected: i64,
 }
+
+/// Test-only readback row for [`MetadataStore::wb_task_rows`].
+#[cfg(test)]
+pub type WbTaskRowDebug = (i64, String, i64, Option<String>);
 
 /// One durable deletion task claimed for execution (P0-a).
 #[derive(Debug, Clone)]

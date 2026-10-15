@@ -65,7 +65,8 @@ CREATE TABLE IF NOT EXISTS wb_tasks (
     attempts INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL,
     pack_key TEXT,
-    uploaded_key TEXT
+    uploaded_key TEXT,
+    error_class TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_wb_tasks_node ON wb_tasks(node_id, state);
 CREATE INDEX IF NOT EXISTS idx_wb_tasks_pack ON wb_tasks(pack_key, state);
@@ -130,6 +131,7 @@ const REQUIRED_TABLE_COLUMNS: [(&str, &[&str]); 6] = [
             "updated_at",
             "pack_key",
             "uploaded_key",
+            "error_class",
         ],
     ),
     (
@@ -389,7 +391,16 @@ impl SqliteMetadataStore {
         }
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // S4.4 P0-d: synchronous=FULL — every commit fsyncs the WAL, so a
+        // committed ack survives host power loss, not just process death.
+        // In WAL mode NORMAL only syncs at checkpoint: a crash could roll
+        // back ACKED transactions (consistent, but acked-yet-lost) — that
+        // gap breaks both the write-back enqueue ack and Strict's CAS
+        // commit barrier. Measured cost (p0d_sqlite_sync_microbench, macOS
+        // arm64/APFS): enqueue-tx p95 318µs→198µs, sustained ~8.0k→6.7k
+        // tx/s — sub-millisecond against ~19ms S3 PUTs; not a regression
+        // this service cannot carry.
+        conn.pragma_update(None, "synchronous", "FULL")?;
         conn.execute_batch(SCHEMA)?;
         // Root: id 1, no parent. Ignore conflict on reopen.
         conn.execute(
@@ -406,6 +417,14 @@ impl SqliteMetadataStore {
     /// identity and the -wal/-shm sidecar anchor); `None` for `:memory:`.
     pub fn db_path(&self) -> Option<&std::path::Path> {
         self.db_path.as_deref()
+    }
+
+    /// The LIVE connection's `PRAGMA synchronous` value (0=off 1=normal
+    /// 2=full) — the durability contract is asserted against what the
+    /// connection actually runs, never against a configuration string.
+    pub fn synchronous_mode(&self) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row("PRAGMA synchronous", [], |r| r.get(0))?)
     }
 
     /// Definition-level contract for an EXISTING database — it reads what
@@ -1394,11 +1413,11 @@ impl MetadataStore for SqliteMetadataStore {
         Ok(())
     }
 
-    fn wb_retry_or_dead(&self, id: i64, max_attempts: u32, now: i64) -> Result<bool> {
+    fn wb_retry_or_dead(&self, id: i64, max_attempts: u32, now: i64, class: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE wb_tasks SET attempts = attempts + 1, updated_at = ?2 WHERE id = ?1",
-            params![id, now],
+            "UPDATE wb_tasks SET attempts = attempts + 1, error_class = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, class, now],
         )?;
         let attempts: i64 = conn.query_row(
             "SELECT attempts FROM wb_tasks WHERE id = ?1",
@@ -1419,6 +1438,15 @@ impl MetadataStore for SqliteMetadataStore {
         Ok(true)
     }
 
+    fn wb_mark_dead(&self, id: i64, class: &str, now: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE wb_tasks SET state = 'dead', error_class = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, class, now],
+        )?;
+        Ok(())
+    }
+
     fn wb_set_state(&self, id: i64, state: &str, now: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -1426,6 +1454,24 @@ impl MetadataStore for SqliteMetadataStore {
             params![id, state, now],
         )?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn wb_task_rows(&self) -> Result<Vec<crate::metadata::WbTaskRowDebug>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT id, state, attempts, error_class FROM wb_tasks ORDER BY id")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     fn wb_requeue_draining(&self) -> Result<()> {
@@ -2702,5 +2748,152 @@ mod tests {
             s.gc_enqueue_orphan_object("objects/x/w-dead.data", 6)
                 .unwrap()
         );
+    }
+
+    /// S4.4 P0-d microbenchmark (run explicitly: `cargo test --lib
+    /// p0d_sqlite_sync_microbench -- --ignored --nocapture`): NORMAL vs
+    /// synchronous=FULL on a REAL file database with the production
+    /// schema and production transaction shapes — (1) single-commit
+    /// latency of an enqueue-shaped transaction, (2) sustained
+    /// transaction throughput, (3) a representative
+    /// create-node+enqueue+finish workload. Reports p50/p95/throughput;
+    /// asserts only that the pragma is observable per mode (the numbers
+    /// feed the configuration decision, they are not a pass/fail gate).
+    #[test]
+    #[ignore]
+    fn p0d_sqlite_sync_microbench() {
+        use std::time::Instant;
+        let dir = std::env::temp_dir().join(format!(
+            "lightfs-p0d-syncbench-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for mode in ["NORMAL", "FULL"] {
+            let db = dir.join(format!("{mode}.db"));
+            let conn = Connection::open(&db).unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            conn.pragma_update(None, "synchronous", mode).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            conn.execute(
+                "INSERT INTO wb_capacity (id, staged_bytes, reserved_bytes) VALUES (1, 0, 0)",
+                [],
+            )
+            .unwrap();
+            let live: i64 = conn
+                .query_row("PRAGMA synchronous", [], |r| r.get(0))
+                .unwrap();
+            let want = if mode == "FULL" { 2 } else { 1 };
+            assert_eq!(live, want, "PRAGMA synchronous must be live-observable");
+
+            // (1) single-commit latency: enqueue-shaped transaction
+            // (INSERT task row + capacity staged conversion), one commit each.
+            let mut lat_us: Vec<u128> = Vec::new();
+            for i in 0..300 {
+                let t = Instant::now();
+                let tx = conn.unchecked_transaction().unwrap();
+                tx.execute(
+                    "INSERT INTO wb_tasks (node_id, staging, size, expected, state, updated_at) VALUES (?1, ?2, ?3, 1, 'queued', ?4)",
+                    rusqlite::params![i as i64, format!("wb-{i}.data"), 4096i64, now()],
+                )
+                .unwrap();
+                tx.execute(
+                    "UPDATE wb_capacity SET staged_bytes = staged_bytes + 4096 WHERE id = 1",
+                    [],
+                )
+                .unwrap();
+                tx.commit().unwrap();
+                lat_us.push(t.elapsed().as_micros());
+            }
+            lat_us.sort();
+            let (p50, p95) = (
+                lat_us[lat_us.len() / 2],
+                lat_us[(lat_us.len() as f64 * 0.95) as usize],
+            );
+
+            // (2) sustained enqueue-shaped throughput for 1.5s.
+            let mut n = 0u64;
+            let t0 = Instant::now();
+            while t0.elapsed().as_millis() < 1500 {
+                let tx = conn.unchecked_transaction().unwrap();
+                tx.execute(
+                    "INSERT INTO wb_tasks (node_id, staging, size, expected, state, updated_at) VALUES (?1, ?2, ?3, 1, 'queued', ?4)",
+                    rusqlite::params![1000 + n as i64, format!("wb-s{n}.data"), 4096i64, now()],
+                )
+                .unwrap();
+                tx.execute(
+                    "UPDATE wb_capacity SET staged_bytes = staged_bytes + 4096 WHERE id = 1",
+                    [],
+                )
+                .unwrap();
+                tx.commit().unwrap();
+                n += 1;
+            }
+
+            // (3) representative create/write/commit workload:
+            // node row + task row + finish (delete) per iteration.
+            let mut lat3: Vec<u128> = Vec::new();
+            for i in 0..150 {
+                let t = Instant::now();
+                let tx = conn.unchecked_transaction().unwrap();
+                tx.execute(
+                    "INSERT INTO nodes (parent_id, name, kind, size, mtime, mode) VALUES (1, ?1, 'file', 0, ?2, 420)",
+                    rusqlite::params![format!("f-{mode}-{i}"), now()],
+                )
+                .unwrap();
+                let node_id: i64 = tx
+                    .query_row("SELECT last_insert_rowid()", [], |r| r.get(0))
+                    .unwrap();
+                tx.execute(
+                    "INSERT INTO wb_tasks (node_id, staging, size, expected, state, updated_at) VALUES (?1, ?2, ?3, 1, 'draining', ?4)",
+                    rusqlite::params![node_id, format!("wb-n{i}.data"), 65536i64, now()],
+                )
+                .unwrap();
+                tx.execute(
+                    "DELETE FROM wb_tasks WHERE node_id = ?1",
+                    rusqlite::params![node_id],
+                )
+                .unwrap();
+                tx.commit().unwrap();
+                lat3.push(t.elapsed().as_micros());
+            }
+            lat3.sort();
+            let (p50_3, p95_3) = (
+                lat3[lat3.len() / 2],
+                lat3[(lat3.len() as f64 * 0.95) as usize],
+            );
+            eprintln!(
+                "P0D-SYNC-BENCH {mode}: enqueue-tx p50={p50}us p95={p95}us; sustained={n}tx/1.5s ({:.0}tx/s); create+write+commit p50={p50_3}us p95={p95_3}us",
+                n as f64 / 1.5
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S4.4 P0-d: the durability pragma must be observable on the LIVE
+    /// connection — file-backed databases run synchronous=FULL (acked
+    /// commits survive host power loss), and the accessor reports what the
+    /// connection actually runs, not a configuration string.
+    #[test]
+    fn p0d_sqlite_synchronous_full_is_live() {
+        let dir = std::env::temp_dir().join(format!(
+            "lightfs-p0d-pragma-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = SqliteMetadataStore::open(dir.join("m.db").to_str().unwrap()).unwrap();
+        assert_eq!(s.synchronous_mode().unwrap(), 2, "file-backed: FULL");
+        let m = SqliteMetadataStore::open_in_memory().unwrap();
+        assert_eq!(m.synchronous_mode().unwrap(), 2, "in-memory: same policy");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

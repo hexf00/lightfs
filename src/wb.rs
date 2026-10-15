@@ -112,9 +112,121 @@ pub struct WriteBackEngine {
     /// set outside #[cfg(test)] builds.
     #[cfg(test)]
     pub(crate) test_hook_before_open: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// S4.4 P0-d (R15) test-only seam: records the order of the three
+    /// durability steps of a deferred write (file sync → staging-dir sync →
+    /// enqueue) and injects a failure at a chosen step. Never set outside
+    /// #[cfg(test)] builds; production always performs the real operations.
+    #[cfg(test)]
+    pub(crate) sync_probe: Mutex<Option<SyncProbe>>,
+}
+
+/// S4.4 P0-d (R15) injection seam, see `WriteBackEngine::sync_probe`.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct SyncProbe {
+    /// Completed durability steps, in call order.
+    pub log: Mutex<Vec<&'static str>>,
+    /// Steps that fail (the step is still recorded, the real operation is
+    /// skipped and the error propagates to the flush caller).
+    pub fail_on: Vec<&'static str>,
 }
 
 type TaskRow = crate::metadata::WbTask;
+
+/// Make a directory entry durable (S4.4 P0-d): after a file's CONTENT is
+/// synced, the directory holding its name must also be synced before the
+/// write may be acknowledged — otherwise a power loss can lose the name
+/// (and with it the bytes) while the content blocks were already on disk.
+/// No silent platform no-ops: both supported platforms really flush.
+/// Windows opens the directory handle with FILE_FLAG_BACKUP_SEMANTICS (the
+/// documented way to hold a directory handle) and FlushFileBuffers it;
+/// compile-checked on the windows-gnu target, not exercised on real
+/// windows hardware — reported as such, not claimed.
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = std::fs::File::open(path)
+            .map_err(|e| Error::Io(format!("open directory {} for sync: {e}", path.display())))?;
+        dir.sync_all()
+            .map_err(|e| Error::Io(format!("fsync directory {}: {e}", path.display())))?;
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .map_err(|e| Error::Io(format!("open directory {} for sync: {e}", path.display())))?;
+        dir.sync_all().map_err(|e| {
+            Error::Io(format!(
+                "FlushFileBuffers directory {}: {e}",
+                path.display()
+            ))
+        })?;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(Error::Io(
+            "directory sync unsupported on this platform — refusing to pretend it succeeded".into(),
+        ))
+    }
+}
+
+/// S4.4 P0-d dead-letter error classes, persisted on `wb_tasks.error_class`.
+/// The retry-admission contract lives in [`retry_admissible`]; the drain
+/// workers only AUTO-requeue what classifies as transient.
+pub const CLASS_CONFLICT: &str = "conflict";
+pub const CLASS_UPLOAD_TRANSIENT: &str = "upload-transient";
+pub const CLASS_UPLOAD_PERMANENT: &str = "upload-permanent";
+pub const CLASS_STAGING_LOST: &str = "staging-lost";
+/// The honest label for an error that cannot be judged: never treated as
+/// retryable (neither auto nor by a future operator command).
+pub const CLASS_UNKNOWN: &str = "unknown";
+
+/// Retry admission for a DEAD task's class (P2's future `wb dead retry`
+/// decides on this; it is deliberately independent of any CLI):
+/// conflicts can never be retried (the winner stands), lost staging has
+/// nothing to upload, unjudged errors must not masquerade as retryable.
+/// Test-enforced contract today; P2's operator command builds on it.
+#[cfg(test)]
+pub(crate) fn retry_admissible(class: &str) -> bool {
+    matches!(class, CLASS_UPLOAD_TRANSIENT | CLASS_UPLOAD_PERMANENT)
+}
+
+/// Classify an object-upload failure by its ERROR ORIGIN, not by position
+/// in the drain code. The S3 layer has three shapes: `s3 transport: …`
+/// (network), `s3 {status} on {key}: …` (HTTP response), and anything else
+/// (protocol/parse — an upload outcome we cannot vouch for).
+pub(crate) fn classify_object_upload_failure(e: &Error) -> &'static str {
+    match e {
+        Error::Storage(m) => {
+            if m.starts_with("s3 transport:") {
+                return CLASS_UPLOAD_TRANSIENT;
+            }
+            if let Some(status) = m
+                .strip_prefix("s3 ")
+                .and_then(|rest| rest.split(' ').next())
+                .and_then(|code| code.parse::<u16>().ok())
+            {
+                // transient: server-side overload/failure or explicit
+                // retryable client conditions (rate limit, request timeout)
+                if status >= 500 || status == 429 || status == 408 {
+                    return CLASS_UPLOAD_TRANSIENT;
+                }
+                // any other remote verdict (403 permissions, 400 shape,
+                // bucket policy...) — retrying cannot fix the cause
+                return CLASS_UPLOAD_PERMANENT;
+            }
+            CLASS_UNKNOWN
+        }
+        _ => CLASS_UNKNOWN,
+    }
+}
 
 /// Result of probing a node's pending staged content (S3.5.1 three-state
 /// contract - the old `Option<Vec<u8>>` could not distinguish "no pending"
@@ -199,6 +311,8 @@ impl WriteBackEngine {
             stop: AtomicBool::new(false),
             #[cfg(test)]
             test_hook_before_open: Mutex::new(None),
+            #[cfg(test)]
+            sync_probe: Mutex::new(None),
         })
     }
 
@@ -223,7 +337,8 @@ impl WriteBackEngine {
         // hit. Visible dead state, never silent.
         for t in self.active_tasks()? {
             if !Path::new(&t.staging).exists() {
-                self.set_state(t.id, "dead")?;
+                self.meta
+                    .wb_mark_dead(t.id, CLASS_STAGING_LOST, self.now())?;
                 eprintln!(
                     "lightfs wb: task {id} for node {node} dead: staging file missing (lost staging?)",
                     id = t.id,
@@ -339,6 +454,42 @@ impl WriteBackEngine {
         self.meta.wb_set_state(id, state, self.now())
     }
 
+    /// R15 seam: record a durability step; when the probe names this step
+    /// as a failure point, skip the real operation and fail the flush.
+    #[cfg(test)]
+    fn sync_step(&self, step: &'static str) -> Result<()> {
+        let mut guard = self.sync_probe.lock().unwrap();
+        if let Some(p) = guard.as_mut() {
+            p.log.lock().unwrap().push(step);
+            if p.fail_on.contains(&step) {
+                return Err(Error::Io(format!("injected {step} failure")));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn sync_step(&self, _step: &'static str) -> Result<()> {
+        Ok(())
+    }
+
+    /// An unenqueued staging file (file-sync or dir-sync failed, or the
+    /// enqueue transaction never committed): the write was NOT acked, so
+    /// the bytes have no owner. Delete them and free the reservation; a
+    /// failed delete keeps the bytes accounted (invariant 4) for recover()
+    /// to sweep — never released while they may still occupy the disk.
+    fn discard_unenqueued(&self, staging: &Path, len: i64) {
+        match std::fs::remove_file(staging) {
+            Ok(()) => {
+                let _ = self.meta.wb_release_reserved(len);
+            }
+            Err(rm) => eprintln!(
+                "lightfs wb: unenqueued staging {} kept ({rm}); its reservation stays until reconcile",
+                staging.display()
+            ),
+        }
+    }
+
     /// Deferred write entry (replaces write_stream's PUT+CAS in
     /// write-back mode). Stage → record → ack. Returns the PROJECTED node:
     /// committed version plus one per still-pending task for the node, so
@@ -408,33 +559,56 @@ impl WriteBackEngine {
                 std::io::copy(reader, &mut w)?;
                 w.flush()?;
             }
-            f.sync_all()?; // the durability contract: staged bytes survive process death
+            // the durability contract: staged bytes survive process death
+            self.sync_step("file-sync")?;
+            f.sync_all()?;
             Ok(())
         })();
         if let Err(e) = staged {
             // The half-written file is physically gone; only then does the
             // reservation come back (invariant 4 inverted: never release
             // capacity for bytes that might still occupy the disk).
-            match std::fs::remove_file(&staging) {
-                Ok(()) => {
-                    let _ = self.meta.wb_release_reserved(len as i64);
-                }
-                Err(rm) => eprintln!(
-                    "lightfs wb: half-written staging {} kept ({rm}); its reservation stays until reconcile",
-                    staging.display()
-                ),
-            }
+            self.discard_unenqueued(&staging, len as i64);
             return Err(e);
+        }
+        // S4.4 P0-d: the file's NAME must be durable before the task that
+        // promises those bytes is committed — a crash after the enqueue but
+        // before the name lands would leave a task pointing at bytes whose
+        // directory entry was lost. Ordered: file sync → dir sync →
+        // enqueue → ack. A failure here is an explicit flush error: the
+        // write was NOT acknowledged, so dropping the unenqueued staging
+        // file (and its reservation) is the correct recovery.
+        if let Err(e) = (|| {
+            self.sync_step("dir-sync")?;
+            sync_directory(&self.staging_dir)
+        })() {
+            self.discard_unenqueued(&staging, len as i64);
+            return Err(Error::Io(format!(
+                "staging namespace not durable; write not acknowledged: {e}"
+            )));
         }
         // Converts the reservation to staged accounting in the SAME
         // transaction that records the task (invariant 3).
-        let (projected_version, replaced_staging) = self.meta.wb_enqueue(
-            node.id,
-            staging.to_string_lossy().as_ref(),
-            len as i64,
-            expected,
-            self.now(),
-        )?;
+        let (projected_version, replaced_staging) = match (|| {
+            self.sync_step("enqueue")?;
+            self.meta.wb_enqueue(
+                node.id,
+                staging.to_string_lossy().as_ref(),
+                len as i64,
+                expected,
+                self.now(),
+            )
+        })() {
+            Ok(ok) => ok,
+            Err(e) => {
+                // The task row never committed: the bytes have no owner and
+                // the ack never went out. Same recovery as a crash here —
+                // drop the file (freeing its reservation); if the delete
+                // fails the bytes stay accounted for recover() to sweep.
+                self.discard_unenqueued(&staging, len as i64);
+                return Err(e);
+            }
+        };
         if let Some((old, old_size)) = replaced_staging {
             self.metrics.wb_coalesced.fetch_add(1, Ordering::Relaxed);
             // Coalesced away; the row no longer references it. Its bytes
@@ -566,7 +740,8 @@ impl WriteBackEngine {
         let mut f = match std::fs::File::open(&task.staging) {
             Ok(f) => f,
             Err(e) => {
-                self.set_state(task.id, "dead")?;
+                self.meta
+                    .wb_mark_dead(task.id, CLASS_STAGING_LOST, self.now())?;
                 eprintln!(
                     "lightfs wb: task {id} dead: staging unreadable: {e}",
                     id = task.id
@@ -577,7 +752,8 @@ impl WriteBackEngine {
         let actual_len = match f.metadata() {
             Ok(m) => m.len() as i64,
             Err(e) => {
-                self.set_state(task.id, "dead")?;
+                self.meta
+                    .wb_mark_dead(task.id, CLASS_STAGING_LOST, self.now())?;
                 eprintln!(
                     "lightfs wb: task {id} dead: staging stat failed: {e}",
                     id = task.id
@@ -586,7 +762,8 @@ impl WriteBackEngine {
             }
         };
         if actual_len != task.size {
-            self.set_state(task.id, "dead")?;
+            self.meta
+                .wb_mark_dead(task.id, CLASS_STAGING_LOST, self.now())?;
             eprintln!(
                 "lightfs wb: task {id} dead: staged {got} bytes != declared {want}",
                 id = task.id,
@@ -656,7 +833,8 @@ impl WriteBackEngine {
                 self.metrics.conflicts.fetch_add(1, Ordering::Relaxed);
                 self.metrics.wb_conflicts.fetch_add(1, Ordering::Relaxed);
                 let _ = self.objects.delete(&version_key);
-                self.set_state(task.id, "dead")?;
+                self.meta
+                    .wb_mark_dead(task.id, CLASS_CONFLICT, self.now())?;
                 eprintln!(
                     "lightfs wb: task {id} for node {node} dead: CAS conflict (winner kept)",
                     id = task.id,
@@ -673,14 +851,31 @@ impl WriteBackEngine {
             }
             Err(e) => {
                 let _ = self.objects.delete(&version_key);
-                // transient: back to the queue with a bounded retry budget
-                if !self.meta.wb_retry_or_dead(task.id, 3, self.now())? {
+                // S4.4: the class comes from the error's ORIGIN — transient
+                // upload failures requeue with a bounded budget; permanent
+                // remote verdicts and unjudgeable errors dead-letter now
+                // (retrying cannot fix a permission or a bucket policy).
+                let class = classify_object_upload_failure(&e);
+                if class == CLASS_UPLOAD_TRANSIENT
+                    && self.meta.wb_retry_or_dead(task.id, 3, self.now(), class)?
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                    return Ok(());
+                }
+                if class == CLASS_UPLOAD_TRANSIENT {
                     eprintln!(
-                        "lightfs wb: task {id} dead after retries: {e}",
+                        "lightfs wb: task {id} dead after retries ({class}): {e}",
                         id = task.id
                     );
+                } else if class == CLASS_UPLOAD_PERMANENT {
+                    eprintln!(
+                        "lightfs wb: task {id} dead ({class}): {e} — fix the cause before retrying",
+                        id = task.id
+                    );
+                } else {
+                    eprintln!("lightfs wb: task {id} dead ({class}): {e}", id = task.id);
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                self.meta.wb_mark_dead(task.id, class, self.now())?;
             }
         }
         Ok(())
@@ -828,18 +1023,36 @@ impl WriteBackEngine {
         }
         if let Err(e) = put {
             // upload failed: nothing references the pack yet — undo row
-            // + object, requeue the batch with the retry budget.
+            // + object, then S4.4 classification: transient failures
+            // requeue with the retry budget; permanent remote verdicts and
+            // unjudgeable outcomes dead-letter their members immediately.
             let _ = self.objects.delete(&pack_key);
             let _ = self.meta.drop_pack(&pack_key);
+            let class = classify_object_upload_failure(&e);
             for (task, _, _) in &entries {
-                if !self.meta.wb_retry_or_dead(task.id, 3, self.now())? {
+                if class == CLASS_UPLOAD_TRANSIENT
+                    && self.meta.wb_retry_or_dead(task.id, 3, self.now(), class)?
+                {
+                    continue;
+                }
+                if class == CLASS_UPLOAD_PERMANENT {
                     eprintln!(
-                        "lightfs wb: task {id} dead after retries: {e}",
+                        "lightfs wb: task {id} dead ({class}): {e} — fix the cause before retrying",
                         id = task.id
                     );
+                } else if class == CLASS_UPLOAD_TRANSIENT {
+                    eprintln!(
+                        "lightfs wb: task {id} dead after retries ({class}): {e}",
+                        id = task.id
+                    );
+                } else {
+                    eprintln!("lightfs wb: task {id} dead ({class}): {e}", id = task.id);
                 }
+                self.meta.wb_mark_dead(task.id, class, self.now())?;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            if class == CLASS_UPLOAD_TRANSIENT {
+                std::thread::sleep(Duration::from_millis(50));
+            }
             return Ok(());
         }
         self.meta.mark_pack_uploaded(&pack_key, self.now())?;
@@ -901,7 +1114,8 @@ impl WriteBackEngine {
                     self.metrics
                         .pack_dead_bytes
                         .fetch_add(len, Ordering::Relaxed);
-                    self.set_state(task.id, "dead")?;
+                    self.meta
+                        .wb_mark_dead(task.id, CLASS_CONFLICT, self.now())?;
                     eprintln!(
                         "lightfs wb: task {id} for node {node} dead: CAS conflict (pack sibling bytes kept for gc)",
                         id = task.id,
@@ -916,11 +1130,16 @@ impl WriteBackEngine {
                     self.remove_staged(&task);
                 }
                 Err(e) => {
-                    // transient CAS failure: retry via the queue. The entry
-                    // will be re-staged as its own task in a later pack.
-                    if !self.meta.wb_retry_or_dead(task.id, 3, self.now())? {
+                    // Metadata-layer CAS failure (not a conflict): the
+                    // requeue behavior is unchanged; exhaustion dead-letters
+                    // as `unknown` — an unjudgeable error is never recorded
+                    // as a retryable upload failure.
+                    if !self
+                        .meta
+                        .wb_retry_or_dead(task.id, 3, self.now(), CLASS_UNKNOWN)?
+                    {
                         eprintln!(
-                            "lightfs wb: task {id} dead after retries: {e}",
+                            "lightfs wb: task {id} dead after retries (unknown): {e}",
                             id = task.id
                         );
                     } else {
@@ -1306,6 +1525,14 @@ mod tests {
         assert!(c.wb().unwrap().drain_once().unwrap());
         // drain B's task: CAS conflict → dead-letter, A's bytes stand
         assert!(c.wb().unwrap().drain_once().unwrap());
+        // S4.4: the dead letter carries the `conflict` class, never retryable
+        {
+            let rows = c.metadata().wb_task_rows().unwrap();
+            assert!(
+                rows.iter().any(|(_, state, _, class)| state == "dead"
+                    && class.as_deref() == Some(CLASS_CONFLICT))
+            );
+        }
         let after = c.lookup("/f").unwrap();
         assert_eq!(
             c.objects()
@@ -1508,7 +1735,10 @@ mod tests {
                     && self.fail_first.swap(false, Ordering::Relaxed)
                 {
                     return Err(crate::error::Error::Storage(
-                        "simulated upload outage".into(),
+                        // transport-shaped on purpose: an outage IS a
+                        // transient failure, and S4.4 classification keys
+                        // off the error's origin shape
+                        "s3 transport: simulated upload outage".into(),
                     ));
                 }
                 self.inner.put(key, data)
@@ -1525,7 +1755,10 @@ mod tests {
                     && self.fail_first.swap(false, Ordering::Relaxed)
                 {
                     return Err(crate::error::Error::Storage(
-                        "simulated upload outage".into(),
+                        // transport-shaped on purpose: an outage IS a
+                        // transient failure, and S4.4 classification keys
+                        // off the error's origin shape
+                        "s3 transport: simulated upload outage".into(),
                     ));
                 }
                 self.inner.put_stream(key, reader, len)
@@ -3318,5 +3551,608 @@ mod tests {
             }
         };
         let _ = std::fs::remove_dir_all(dir.parent().unwrap().join(dir.file_name().unwrap()));
+    }
+
+    // ------------------------------------------------------------------
+    // S4.4 P0-d: R15 durability order (staging namespace), R17 error
+    // classes + retry admission, R16 process-crash recovery (G1).
+    // ------------------------------------------------------------------
+
+    /// Read the engine's recorded durability steps.
+    #[cfg(test)]
+    fn p0d_log(wb: &WriteBackEngine) -> Vec<&'static str> {
+        wb.sync_probe
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|p| p.log.lock().unwrap().clone())
+            .unwrap_or_default()
+    }
+
+    /// R15: the success path performs file sync, THEN staging-dir sync,
+    /// THEN the enqueue commit — in that order, before any ack.
+    #[test]
+    fn p0d_r15_durability_order_is_file_sync_dir_sync_enqueue() {
+        let c = wb_core("r15order");
+        c.create("/f", 0o644).unwrap();
+        let node = c.lookup("/f").unwrap();
+        let wb = c.wb().unwrap();
+        *wb.sync_probe.lock().unwrap() = Some(SyncProbe::default());
+        let out = write_deferred_for_test(&c, &node, b"r15", 3).unwrap();
+        assert_eq!(out.version, 1);
+        assert_eq!(
+            p0d_log(wb),
+            vec!["file-sync", "dir-sync", "enqueue"],
+            "durability steps must run in this order before the ack"
+        );
+        assert_eq!(wb.queue_counts(), (1, 0, 0));
+    }
+
+    /// R15: a failed FILE sync must not run any later step and must not
+    /// acknowledge — the unenqueued staging file is dropped and its
+    /// reservation released.
+    #[test]
+    fn p0d_r15_file_sync_failure_refuses_the_ack() {
+        let c = wb_core("r15filesync");
+        c.create("/f", 0o644).unwrap();
+        let node = c.lookup("/f").unwrap();
+        let wb = c.wb().unwrap();
+        *wb.sync_probe.lock().unwrap() = Some(SyncProbe {
+            fail_on: vec!["file-sync"],
+            ..SyncProbe::default()
+        });
+        let e = write_deferred_for_test(&c, &node, b"r15", 3).unwrap_err();
+        assert!(format!("{e}").contains("file-sync"), "{e}");
+        assert_eq!(
+            p0d_log(wb),
+            vec!["file-sync"],
+            "nothing after the failed step"
+        );
+        assert_eq!(wb.queue_counts(), (0, 0, 0), "no task may exist");
+        assert_eq!(
+            wb.reconcile_capacity_and_report().unwrap(),
+            (0, 0),
+            "bytes dropped with the ack"
+        );
+    }
+
+    /// R15: a failed staging-DIR sync must not enqueue and must not
+    /// acknowledge — the file name was not proven durable, so the task
+    /// that promises those bytes must never commit.
+    #[test]
+    fn p0d_r15_dir_sync_failure_refuses_the_ack() {
+        let c = wb_core("r15dirsync");
+        c.create("/f", 0o644).unwrap();
+        let node = c.lookup("/f").unwrap();
+        let wb = c.wb().unwrap();
+        *wb.sync_probe.lock().unwrap() = Some(SyncProbe {
+            fail_on: vec!["dir-sync"],
+            ..SyncProbe::default()
+        });
+        let e = write_deferred_for_test(&c, &node, b"r15", 3).unwrap_err();
+        assert!(format!("{e}").contains("dir-sync"), "{e}");
+        assert_eq!(p0d_log(wb), vec!["file-sync", "dir-sync"]);
+        assert_eq!(wb.queue_counts(), (0, 0, 0), "enqueue must not have run");
+        assert_eq!(wb.reconcile_capacity_and_report().unwrap(), (0, 0));
+    }
+
+    /// R15 + task §2: a failed enqueue (SQLite commit never happened) must
+    /// not acknowledge, and the now-ownerless staging bytes are dropped
+    /// with their reservation — the same recovery the crash path gets.
+    #[test]
+    fn p0d_r15_enqueue_failure_drops_unenqueued_staging() {
+        let c = wb_core("r15enqueue");
+        c.create("/f", 0o644).unwrap();
+        let node = c.lookup("/f").unwrap();
+        let wb = c.wb().unwrap();
+        *wb.sync_probe.lock().unwrap() = Some(SyncProbe {
+            fail_on: vec!["enqueue"],
+            ..SyncProbe::default()
+        });
+        let e = write_deferred_for_test(&c, &node, b"r15", 3).unwrap_err();
+        assert!(format!("{e}").contains("enqueue"), "{e}");
+        assert_eq!(p0d_log(wb), vec!["file-sync", "dir-sync", "enqueue"]);
+        assert_eq!(wb.queue_counts(), (0, 0, 0));
+        assert_eq!(wb.reconcile_capacity_and_report().unwrap(), (0, 0));
+    }
+
+    /// R17: classification keys off the error ORIGIN (transport shape /
+    /// HTTP status / unrecognizable), and the admission table is exactly
+    /// the contract — conflicts and lost staging never retry, permanent
+    /// verdicts are admitted only for an operator who fixes the cause,
+    /// unjudgeable errors are never retryable.
+    #[test]
+    fn p0d_r17_error_class_origin_and_admission_table() {
+        use crate::error::Error;
+        assert_eq!(
+            classify_object_upload_failure(&Error::Storage(
+                "s3 transport: connection reset by peer".into()
+            )),
+            CLASS_UPLOAD_TRANSIENT
+        );
+        assert_eq!(
+            classify_object_upload_failure(&Error::Storage(
+                "s3 503 on objects/x/k: SlowDown".into()
+            )),
+            CLASS_UPLOAD_TRANSIENT
+        );
+        assert_eq!(
+            classify_object_upload_failure(&Error::Storage(
+                "s3 429 on objects/x/k: TooManyRequests".into()
+            )),
+            CLASS_UPLOAD_TRANSIENT
+        );
+        assert_eq!(
+            classify_object_upload_failure(&Error::Storage(
+                "s3 408 on objects/x/k: RequestTimeout".into()
+            )),
+            CLASS_UPLOAD_TRANSIENT
+        );
+        assert_eq!(
+            classify_object_upload_failure(&Error::Storage(
+                "s3 403 on objects/x/k: AccessDenied".into()
+            )),
+            CLASS_UPLOAD_PERMANENT
+        );
+        assert_eq!(
+            classify_object_upload_failure(&Error::Storage(
+                "s3 400 on objects/x/k: MalformedXML".into()
+            )),
+            CLASS_UPLOAD_PERMANENT
+        );
+        assert_eq!(
+            classify_object_upload_failure(&Error::Storage("part missing ETag".into())),
+            CLASS_UNKNOWN,
+            "an unrecognizable upload outcome is never guessed into a retryable class"
+        );
+        assert!(!retry_admissible(CLASS_CONFLICT));
+        assert!(!retry_admissible(CLASS_STAGING_LOST));
+        assert!(!retry_admissible(CLASS_UNKNOWN));
+        assert!(retry_admissible(CLASS_UPLOAD_TRANSIENT));
+        assert!(retry_admissible(CLASS_UPLOAD_PERMANENT));
+    }
+
+    /// Object store failing put_stream ONCE with a caller-chosen error
+    /// shape (per-file drain path, the one production drain_task uses).
+    struct P0dFailOnce {
+        inner: MemObjectStore,
+        armed: std::sync::atomic::AtomicBool,
+        msg: &'static str,
+    }
+    impl P0dFailOnce {
+        fn new(msg: &'static str) -> Self {
+            Self {
+                inner: MemObjectStore::new(),
+                armed: std::sync::atomic::AtomicBool::new(true),
+                msg,
+            }
+        }
+    }
+    impl crate::object_store::ObjectStore for P0dFailOnce {
+        fn put(
+            &self,
+            key: &str,
+            data: &[u8],
+        ) -> crate::error::Result<crate::object_store::ObjectInfo> {
+            self.inner.put(key, data)
+        }
+        fn put_stream(
+            &self,
+            key: &str,
+            reader: &mut dyn std::io::Read,
+            len: u64,
+        ) -> crate::error::Result<crate::object_store::ObjectInfo> {
+            if self.armed.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                return Err(crate::error::Error::Storage(self.msg.into()));
+            }
+            self.inner.put_stream(key, reader, len)
+        }
+        fn get(
+            &self,
+            key: &str,
+            range: Option<crate::object_store::Range>,
+        ) -> crate::error::Result<crate::object_store::ObjectData> {
+            self.inner.get(key, range)
+        }
+        fn get_stream(
+            &self,
+            key: &str,
+            range: Option<crate::object_store::Range>,
+        ) -> crate::error::Result<(Box<dyn std::io::Read + Send>, u64)> {
+            self.inner.get_stream(key, range)
+        }
+        fn head(&self, key: &str) -> crate::error::Result<crate::object_store::ObjectInfo> {
+            self.inner.head(key)
+        }
+        fn delete(&self, key: &str) -> crate::error::Result<()> {
+            self.inner.delete(key)
+        }
+        fn list(
+            &self,
+            prefix: &str,
+            token: Option<&str>,
+            max: usize,
+        ) -> crate::error::Result<crate::object_store::ListPage> {
+            self.inner.list(prefix, token, max)
+        }
+        fn ping(&self) -> crate::error::Result<()> {
+            self.inner.ping()
+        }
+    }
+
+    /// Core over a custom object store, manual per-file drain.
+    fn p0d_core_with_store(tag: &str, store: StdArc<dyn crate::object_store::ObjectStore>) -> Core {
+        let dir = std::env::temp_dir().join(format!(
+            "lightfs-p0d-{tag}-{}-{}",
+            std::process::id(),
+            tmp_unique()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Core::with_options(
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            store,
+            crate::core::DEFAULT_SUPERSEDED_SECS,
+            None,
+            Some(WbOptions {
+                staging_dir: dir.join("staging").to_string_lossy().to_string(),
+                drain_workers: 0,
+                batch_pack_bytes: 0,
+                batch_max_wait_ms: 0,
+                queue_max_tasks: 0,
+                staging_budget_bytes: 0,
+
+                ledger_lock_path: None,
+            }),
+        )
+        .unwrap()
+    }
+
+    /// R17: a 503-shaped upload failure is transient — the task requeues
+    /// with `upload-transient` persisted, and the next drain succeeds.
+    #[test]
+    fn p0d_r17_upload_transient_requeues_with_class_then_recovers() {
+        let c = p0d_core_with_store(
+            "r17t",
+            StdArc::new(P0dFailOnce::new("s3 503 on objects/x/k: SlowDown")),
+        );
+        c.create("/f", 0o644).unwrap();
+        write_via_rpc(&c, "/f", b"transient body", Some(0));
+        assert!(
+            c.wb().unwrap().drain_once().unwrap(),
+            "first drain requeues"
+        );
+        assert_eq!(
+            c.wb().unwrap().queue_counts(),
+            (1, 0, 0),
+            "back in the queue"
+        );
+        let rows = c.metadata().wb_task_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "queued");
+        assert_eq!(
+            rows[0].3.as_deref(),
+            Some(CLASS_UPLOAD_TRANSIENT),
+            "the class is persisted while the task waits"
+        );
+        assert!(
+            c.wb().unwrap().drain_once().unwrap(),
+            "second drain succeeds"
+        );
+        assert_eq!(c.wb().unwrap().queue_counts(), (0, 0, 0));
+        let after = c.lookup("/f").unwrap();
+        assert_eq!(
+            c.objects()
+                .get(after.object_key.as_deref().unwrap(), None)
+                .unwrap()
+                .data,
+            b"transient body"
+        );
+    }
+
+    /// R17: a 403-shaped upload failure is a permanent remote verdict —
+    /// dead-lettered IMMEDIATELY (no auto requeue) with the class
+    /// persisted and an explicit fix-the-cause reminder; the staged bytes
+    /// stay accounted per P0-c dead-byte rules, and the class IS
+    /// operator-retryable (admission true) for the future P2 command.
+    #[test]
+    fn p0d_r17_upload_permanent_dead_letters_immediately_with_class() {
+        let c = p0d_core_with_store(
+            "r17p",
+            StdArc::new(P0dFailOnce::new("s3 403 on objects/x/k: AccessDenied")),
+        );
+        c.create("/f", 0o644).unwrap();
+        write_via_rpc(&c, "/f", b"permanent body", Some(0));
+        assert!(c.wb().unwrap().drain_once().unwrap());
+        assert_eq!(
+            c.wb().unwrap().queue_counts(),
+            (0, 0, 1),
+            "one drain is enough: dead, never requeued"
+        );
+        let rows = c.metadata().wb_task_rows().unwrap();
+        assert_eq!(rows[0].1, "dead");
+        assert_eq!(rows[0].2, 0, "no retry attempt was spent");
+        assert_eq!(rows[0].3.as_deref(), Some(CLASS_UPLOAD_PERMANENT));
+        assert!(retry_admissible(CLASS_UPLOAD_PERMANENT));
+        assert_eq!(
+            c.wb().unwrap().reconcile_capacity_and_report().unwrap(),
+            (14, 0),
+            "dead bytes stay staged/accounted until physically dropped"
+        );
+    }
+
+    /// R17: an unrecognizable upload outcome is `unknown` — dead-lettered
+    /// immediately and never admissible, so it can never masquerade as a
+    /// retryable failure.
+    #[test]
+    fn p0d_r17_unknown_error_never_requeues() {
+        let c = p0d_core_with_store("r17u", StdArc::new(P0dFailOnce::new("part missing ETag")));
+        c.create("/f", 0o644).unwrap();
+        write_via_rpc(&c, "/f", b"unknown body", Some(0));
+        assert!(c.wb().unwrap().drain_once().unwrap());
+        assert_eq!(c.wb().unwrap().queue_counts(), (0, 0, 1));
+        let rows = c.metadata().wb_task_rows().unwrap();
+        assert_eq!(rows[0].1, "dead");
+        assert_eq!(rows[0].3.as_deref(), Some(CLASS_UNKNOWN));
+        assert!(!retry_admissible(CLASS_UNKNOWN));
+    }
+
+    /// R17: staging content missing at drain time is `staging-lost` —
+    /// dead without requeue (there is nothing to upload), class persisted.
+    #[test]
+    fn p0d_r17_staging_lost_dead_letters_without_requeue() {
+        let c = wb_core("r17lost");
+        c.create("/f", 0o644).unwrap();
+        write_via_rpc(&c, "/f", b"lost body", Some(0));
+        // the staging file vanishes before the drain (data-loss scenario)
+        let (staging, _) = c
+            .metadata()
+            .wb_latest_staging(c.lookup("/f").unwrap().id)
+            .unwrap()
+            .unwrap();
+        std::fs::remove_file(&staging).unwrap();
+        assert!(c.wb().unwrap().drain_once().unwrap());
+        assert_eq!(c.wb().unwrap().queue_counts(), (0, 0, 1));
+        let rows = c.metadata().wb_task_rows().unwrap();
+        assert_eq!(rows[0].1, "dead");
+        assert_eq!(rows[0].3.as_deref(), Some(CLASS_STAGING_LOST));
+        assert!(!retry_admissible(CLASS_STAGING_LOST));
+    }
+
+    /// R17: a CAS conflict dead-letters with the `conflict` class (the
+    /// winner always stands); the already-committed guard is untouched and
+    /// still rescues a crash between CAS and finish.
+    #[test]
+    fn p0d_r17_conflict_dead_letters_with_class() {
+        let c = wb_core("r17conf");
+        c.create("/f", 0o644).unwrap();
+        let _ = write_via_rpc(&c, "/f", b"client A staged", Some(0));
+        {
+            let eng = c.wb().unwrap();
+            let node = c.lookup("/f").unwrap();
+            eng.write_deferred(
+                &node,
+                0,
+                &mut std::io::Cursor::new(b"client B staged".to_vec()),
+                15,
+            )
+            .unwrap();
+        }
+        assert!(c.wb().unwrap().drain_once().unwrap());
+        assert!(c.wb().unwrap().drain_once().unwrap());
+        assert_eq!(c.wb().unwrap().queue_counts(), (0, 0, 1));
+        let rows = c.metadata().wb_task_rows().unwrap();
+        assert_eq!(rows[0].1, "dead");
+        assert_eq!(rows[0].3.as_deref(), Some(CLASS_CONFLICT));
+        assert!(!retry_admissible(CLASS_CONFLICT));
+        let after = c.lookup("/f").unwrap();
+        assert_eq!(
+            c.objects()
+                .get(after.object_key.as_deref().unwrap(), None)
+                .unwrap()
+                .data,
+            b"client A staged",
+            "the winner is never corrupted"
+        );
+    }
+
+    /// R17 (recover arm): a task whose staging file vanished by restart
+    /// time dead-letters with `staging-lost` — visible, never silent, and
+    /// never re-enqueued.
+    #[test]
+    fn p0d_r17_recover_marks_lost_staging_with_class() {
+        let c = wb_core("r17rec");
+        c.create("/f", 0o644).unwrap();
+        write_via_rpc(&c, "/f", b"vanishing body", Some(0));
+        let (staging, _) = c
+            .metadata()
+            .wb_latest_staging(c.lookup("/f").unwrap().id)
+            .unwrap()
+            .unwrap();
+        std::fs::remove_file(&staging).unwrap();
+        c.wb().unwrap().recover().unwrap();
+        let rows = c.metadata().wb_task_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "dead");
+        assert_eq!(rows[0].3.as_deref(), Some(CLASS_STAGING_LOST));
+    }
+
+    /// R16 child: opens the PERSISTENT engine (file-backed SQLite +
+    /// staging dir), writes one deferred task to a successful enqueue,
+    /// signals readiness, and parks holding the engine until SIGKILLed.
+    /// No-op without the env var (plain suite sweep).
+    #[test]
+    fn p0d_r16_child_helper() {
+        let Some(dir) = std::env::var_os("LIGHTFS_P0D_CHILD_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        // The long batch seal window pins the task in non-terminal state
+        // (claimed, waiting for the seal) so the parent has a deterministic
+        // crash window instead of racing a millisecond per-file drain.
+        let mut cfg = p0d_cfg(&dir.join("meta.db"), &dir.join("staging"));
+        cfg.writeback.batch_pack_bytes = 8388608;
+        cfg.writeback.batch_max_wait_ms = 600_000;
+        let eng = crate::engine::open_embedded_mem(&cfg).expect("child engine");
+        let c = &eng.core;
+        c.create("/f", 0o644).unwrap();
+        write_via_rpc(c, "/f", P0D_R16_BODY, Some(0));
+        assert_eq!(c.wb().unwrap().queue_counts(), (1, 0, 0));
+        std::fs::write(dir.join("child.ready"), b"enqueued").unwrap();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// R16: a REAL process crash after a successful enqueue. The child
+    /// commits the task and is SIGKILLed; the parent reopens the same
+    /// database + staging dir and must find the staged bytes byte-exact,
+    /// the capacity ledger equal to the real files, and the task draining
+    /// to a full commit. This proves G1 (process crash recovery). It does
+    /// NOT prove G2 (host power loss): process death preserves the OS page
+    /// cache, so dir-fsync/synchronous=FULL margins are not exercised here
+    /// — no power-loss claim is made.
+    #[test]
+    fn p0d_r16_process_crash_recovery_preserves_task_and_bytes() {
+        let dir = p0c2_dir("r16crash");
+        let ready = dir.join("child.ready");
+        let exe = std::env::current_exe().unwrap();
+        let child = std::process::Command::new(&exe)
+            .args(["p0d_r16_child_helper", "--nocapture"])
+            .env("LIGHTFS_P0D_CHILD_DIR", &dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        struct Guard(std::process::Child);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut guard = Guard(child);
+        let mut waited = 0u32;
+        while !ready.exists() && waited < 10_000 {
+            std::thread::sleep(Duration::from_millis(20));
+            waited += 20;
+        }
+        assert!(ready.exists(), "child never reached the enqueue");
+        // Deterministic crash point: poll the database READ-ONLY (WAL
+        // allows concurrent readers; the child keeps running) until the
+        // task is durably enqueued, then SIGKILL. The child's long batch
+        // seal window pins the task in non-terminal state so the crash
+        // cannot race a millisecond drain.
+        let db = rusqlite::Connection::open_with_flags(
+            dir.join("meta.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut tasks = 0i64;
+        let poll_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tasks == 0 {
+            assert!(
+                std::time::Instant::now() < poll_deadline,
+                "the enqueue never became visible"
+            );
+            tasks = db
+                .query_row(
+                    "SELECT count(*) FROM wb_tasks WHERE state IN ('queued','draining')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // SIGKILL: the engine dies holding its locks; the kernel releases.
+        let _ = guard.0.kill();
+        let _ = guard.0.wait();
+        drop(db);
+        // 1) BEFORE any engine lives in this process again: the staged
+        // bytes are byte-exact on disk — no worker can have touched them,
+        // the child is dead, so this is the crash instant's truth.
+        let staging_dir = dir.join("staging");
+        let mut staged = Vec::new();
+        for e in std::fs::read_dir(&staging_dir).unwrap().flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with("wb-") && name.ends_with(".data") {
+                staged.push(e.path());
+            }
+        }
+        assert_eq!(staged.len(), 1, "exactly one staged file after the crash");
+        assert_eq!(
+            std::fs::read(&staged[0]).unwrap(),
+            P0D_R16_BODY,
+            "staged bytes must be byte-exact after SIGKILL"
+        );
+        // 2) reopen the engine (bounded retry: the killed holder's lock
+        // release can stay invisible for a few tens of microseconds — see
+        // S4.3.4b.2): recover() enrolls the task; the single drain worker
+        // settles it to a full commit. Poll the SETTLED state.
+        let cfg = p0d_cfg(&dir.join("meta.db"), &staging_dir);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let eng = loop {
+            match crate::engine::open_embedded_mem(&cfg) {
+                Ok(eng) => break eng,
+                Err(e) => {
+                    if std::time::Instant::now() >= deadline {
+                        panic!("engine not reacquired after holder death: {e}");
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        };
+        let c = &eng.core;
+        let settle = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if c.wb().unwrap().queue_counts() == (0, 0, 0) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < settle,
+                "the recovered task must drain on its own: {:?}",
+                c.wb().unwrap().queue_counts()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // 3) the acked write became a full commit with the exact bytes
+        let after = c.lookup("/f").unwrap();
+        assert_eq!(after.version, 1);
+        assert_eq!(
+            c.objects()
+                .get(after.object_key.as_deref().unwrap(), None)
+                .unwrap()
+                .data,
+            P0D_R16_BODY,
+            "the bytes that survived the crash are the bytes that commit"
+        );
+        // 4) the ledger converged with reality
+        assert_eq!(
+            c.wb().unwrap().reconcile_capacity_and_report().unwrap(),
+            (0, 0),
+            "staged bytes fully drained; no phantom reservation"
+        );
+        // stop the drain worker so the engine's locks release before the
+        // directory removal (workers keep the engine Arc alive otherwise)
+        eng.core.wb().unwrap().stop();
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R16 payload (byte-exact assertion target).
+    const P0D_R16_BODY: &[u8] = b"process-crash body 0123456789";
+
+    /// R16 config: file-backed SQLite + its own staging dir, manual drain.
+    fn p0d_cfg(db: &Path, staging: &Path) -> crate::config::Config {
+        let mut cfg = crate::config::Config::load_or_defaults(None).unwrap();
+        cfg.metadata.path = db.to_string_lossy().to_string();
+        cfg.commit.mode = "writeback".into();
+        cfg.writeback.staging_dir = staging.to_string_lossy().to_string();
+        // 1 worker: open_embedded refuses 0 (an embedded engine must
+        // drain). The parent polls the SETTLED state instead of racing
+        // intermediate queue shapes.
+        cfg.writeback.drain_workers = 1;
+        cfg.writeback.batch_pack_bytes = 0;
+        cfg.writeback.staging_budget_bytes = 0;
+        cfg
     }
 }
