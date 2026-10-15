@@ -204,12 +204,26 @@ impl WriteBackEngine {
         // P0-a recovery sweep 2: dead tasks that had already uploaded bytes
         // leave orphan candidates. Enrollment re-checks "no live reference"
         // in the registration transaction and confirms the object still
-        // exists before recording the durable deletion intent.
+        // exists before recording the durable deletion intent. HEAD is a
+        // three-state signal (S4.2.1): exists → enroll the intent (never a
+        // synchronous delete); confirmed absent → nothing to delete, no
+        // intent either; any OTHER error → fail closed, keep the record
+        // for the next recover() — "cannot tell" is never read as "absent".
         for key in self.meta.dead_task_orphans()? {
-            if self.objects.head(&key).is_ok()
-                && self.meta.gc_enqueue_orphan_object(&key, self.now())?
-            {
-                eprintln!("lightfs wb: orphan object {key} enrolled for deletion");
+            match self.objects.head(&key) {
+                Ok(_) => {
+                    if self.meta.gc_enqueue_orphan_object(&key, self.now())? {
+                        eprintln!("lightfs wb: orphan object {key} enrolled for deletion");
+                    }
+                }
+                Err(Error::ObjectMissing(_)) => {
+                    eprintln!("lightfs wb: orphan object {key} already absent; no deletion intent");
+                }
+                Err(e) => {
+                    eprintln!(
+                        "lightfs wb: orphan object {key}: head unavailable ({e}); record kept for next recover"
+                    );
+                }
             }
         }
         Ok(())
@@ -762,10 +776,22 @@ impl WriteBackEngine {
         if key.starts_with(crate::pack::PACK_KEY_PREFIX) {
             return; // shared pack: lifecycle owned by pack gc
         }
-        if !(self.retention_supersede && self.meta.record_superseded(key, self.now()).is_ok())
-            && self.objects.delete(key).is_ok()
-        {
-            self.metrics.s3_delete.fetch_add(1, Ordering::Relaxed);
+        // Retention: record for point-in-time restore — reclamation happens
+        // only through the P0-b-gated gc pipeline. Retention disabled (or
+        // the record failed): park a durable deletion intent instead of
+        // deleting inline; a committed object may sit in historical
+        // metadata backups, so its bytes never leave synchronously here.
+        if self.retention_supersede && self.meta.record_superseded(key, self.now()).is_ok() {
+            return;
+        }
+        match self.meta.gc_enqueue_orphan_object(key, self.now()) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!("lightfs wb: retire of {key} skipped: a live reference appeared")
+            }
+            Err(e) => eprintln!(
+                "lightfs wb: retire of {key} could not record a deletion intent: {e} (left for fsck)"
+            ),
         }
     }
 
@@ -1801,6 +1827,138 @@ mod tests {
         let (done, failed) = c.gc_execute_deletions(10).unwrap();
         assert_eq!((done, failed), (1, 0));
         assert!(objects.head(orphan).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- S4.2.1: recover()/HEAD semantics ----------------------------------
+
+    fn recover_engine() -> (
+        StdArc<SqliteMetadataStore>,
+        StdArc<MemObjectStore>,
+        WriteBackEngine,
+        std::path::PathBuf,
+    ) {
+        let meta = StdArc::new(SqliteMetadataStore::open_in_memory().unwrap());
+        let objects = StdArc::new(MemObjectStore::new());
+        let dir = std::env::temp_dir().join(format!(
+            "lightfs-wb-p0a1-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let opts = WbOptions {
+            staging_dir: dir.join("staging").to_string_lossy().to_string(),
+            drain_workers: 0,
+            batch_pack_bytes: 0,
+            batch_max_wait_ms: 0,
+            queue_max_tasks: 0,
+        };
+        let eng = WriteBackEngine::new(
+            meta.clone(),
+            objects.clone(),
+            StdArc::new(Metrics::default()),
+            &opts,
+            false,
+        )
+        .unwrap();
+        (meta, objects, eng, dir)
+    }
+
+    fn seed_dead_uploaded_task(meta: &SqliteMetadataStore, staging: &str, orphan: &str) {
+        let n = meta
+            .create_node(1, "f", crate::metadata::NodeKind::File, 0o644, None)
+            .unwrap();
+        let (task_id, _) = meta.wb_enqueue(n.id, staging, 1, 0, 1).unwrap();
+        meta.wb_set_uploaded_key(task_id, orphan, 1).unwrap();
+        meta.wb_set_state(task_id, "dead", 1).unwrap();
+    }
+
+    /// HEAD confirms the object is absent: no deletion intent may be
+    /// enrolled for an object that no longer exists (baseline semantics —
+    /// the pre-S4.2.1 code also skipped this case, silently).
+    #[test]
+    fn p0a1_recover_head_absent_enrolls_nothing() {
+        let (meta, _objects, eng, dir) = recover_engine();
+        let staged = dir.join("s1.data").to_string_lossy().to_string();
+        std::fs::write(&staged, b"x").unwrap();
+        seed_dead_uploaded_task(&meta, &staged, "objects/1/absent.data");
+        eng.recover().unwrap();
+        let claimed = meta.gc_claim_deletions(10, 1).unwrap();
+        assert!(
+            claimed.is_empty(),
+            "no executable intent for an absent object: {claimed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// HEAD unavailable (network/permission/timeout): fail closed — no
+    /// intent, record kept, and the next determinate recover() converges.
+    #[test]
+    fn p0a1_recover_head_error_fails_closed_keeps_record() {
+        let (meta, objects, eng, dir) = recover_engine();
+        let orphan = "objects/1/unreachable.data";
+        let staged = dir.join("s2.data").to_string_lossy().to_string();
+        std::fs::write(&staged, b"x").unwrap();
+        seed_dead_uploaded_task(&meta, &staged, orphan);
+        objects.put(orphan, b"z").unwrap();
+        objects.inject_head_failure(orphan);
+
+        eng.recover().unwrap();
+        assert!(
+            meta.gc_claim_deletions(10, 1).unwrap().is_empty(),
+            "cannot-tell must not become a deletion intent"
+        );
+        assert!(
+            meta.dead_task_orphans()
+                .unwrap()
+                .contains(&orphan.to_string()),
+            "the record is kept for the next recover, not silently dropped"
+        );
+
+        // Once HEAD is determinate again, the deferred record converges —
+        // into an INTENT; nothing is deleted here.
+        eng.recover().unwrap();
+        let claimed = meta.gc_claim_deletions(10, 1).unwrap();
+        assert_eq!(claimed.len(), 1, "deferred, not dropped");
+        assert!(objects.head(orphan).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Repeated recover() runs: lifecycle state is never reset and a
+    /// completed intent is not resurrected (the object is confirmed gone).
+    #[test]
+    fn p0a1_recover_repeated_runs_are_idempotent() {
+        let (meta, objects, eng, dir) = recover_engine();
+        meta.register_pack("packs/stale2.data", 10).unwrap();
+        meta.mark_pack_uploaded("packs/stale2.data", 1).unwrap();
+        let orphan = "objects/1/twice.data";
+        let staged = dir.join("s3.data").to_string_lossy().to_string();
+        std::fs::write(&staged, b"x").unwrap();
+        seed_dead_uploaded_task(&meta, &staged, orphan);
+        objects.put(orphan, b"z").unwrap();
+
+        eng.recover().unwrap();
+        let (st1, unref1) = meta.pack_state("packs/stale2.data").unwrap().unwrap();
+        assert_eq!(st1, "unreferenced");
+        assert!(unref1.is_some());
+        let claimed = meta.gc_claim_deletions(10, 1).unwrap();
+        assert_eq!(claimed.len(), 1);
+        // Executor order: remote delete first, then the durable finalize.
+        objects.delete(orphan).unwrap();
+        meta.gc_complete_deletion(claimed[0].id, 1).unwrap();
+
+        eng.recover().unwrap();
+        let (st2, unref2) = meta.pack_state("packs/stale2.data").unwrap().unwrap();
+        assert_eq!(
+            (st2.as_str(), unref2),
+            ("unreferenced", unref1),
+            "no lifecycle reset on re-recover"
+        );
+        let claimed2 = meta.gc_claim_deletions(10, 1).unwrap();
+        assert!(claimed2.is_empty(), "a completed intent is not resurrected");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

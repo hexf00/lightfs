@@ -77,72 +77,84 @@ CREATE TABLE IF NOT EXISTS gc_deletions (
 );
 "#;
 
-/// S3.1 branch: add the pack columns to a nodes table created by an older
-/// build of THIS branch lineage. Pure additive ALTERs (idempotent); the
-/// AUTOINCREMENT identity contract check above still runs first and still
-/// rejects genuinely legacy databases.
-fn add_missing_pack_columns(conn: &Connection) -> rusqlite::Result<()> {
-    let mut present: Vec<String> = Vec::new();
-    let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('nodes')")?;
-    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-    for name in rows {
-        present.push(name?);
-    }
-    drop(stmt);
-    for (col, ddl) in [
-        ("pack_key", "ALTER TABLE nodes ADD COLUMN pack_key TEXT"),
-        ("pack_off", "ALTER TABLE nodes ADD COLUMN pack_off INTEGER"),
-        ("pack_len", "ALTER TABLE nodes ADD COLUMN pack_len INTEGER"),
-        (
+/// S4.2.1 single-schema contract: every table and column this build
+/// requires, checked against an EXISTING database file before anything is
+/// written to it. There is deliberately no ALTER/migration/backfill — a
+/// database missing any piece predates this schema and is rejected at open
+/// (re-initialize the store instead); a fresh database simply gets all of
+/// it from `SCHEMA`.
+const REQUIRED_TABLE_COLUMNS: [(&str, &[&str]); 5] = [
+    (
+        "nodes",
+        &[
+            "id",
+            "parent_id",
+            "name",
+            "kind",
+            "size",
+            "mtime",
+            "mode",
+            "object_key",
+            "version",
+            "etag",
+            "target",
+            "pack_key",
+            "pack_off",
+            "pack_len",
             "content_hash",
-            "ALTER TABLE nodes ADD COLUMN content_hash TEXT",
-        ),
-    ] {
-        if !present.iter().any(|c| c == col) {
-            conn.execute_batch(ddl)?;
-        }
-    }
-    Ok(())
+        ],
+    ),
+    ("superseded_objects", &["object_key", "superseded_at"]),
+    (
+        "packs",
+        &["key", "bytes", "uploaded_at", "state", "unref_since"],
+    ),
+    (
+        "wb_tasks",
+        &[
+            "id",
+            "node_id",
+            "staging",
+            "size",
+            "expected",
+            "state",
+            "attempts",
+            "updated_at",
+            "pack_key",
+            "uploaded_key",
+        ],
+    ),
+    (
+        "gc_deletions",
+        &[
+            "id",
+            "key",
+            "kind",
+            "state",
+            "attempts",
+            "last_error",
+            "updated_at",
+        ],
+    ),
+];
+
+/// Column names of `table`; empty when the table does not exist.
+fn table_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    rows.collect()
 }
 
-/// S4.2 P0-a: add the pack-lifecycle columns to databases created by an
-/// older build of THIS branch lineage. Pure additive ALTERs (idempotent).
-/// Backfill: an already-uploaded pack without lifecycle state becomes
-/// `active` (conservative — the gc re-query converges it); a never-uploaded
-/// one stays `building`. Existing task rows carry no pack binding.
-fn add_pack_lifecycle_columns(conn: &Connection) -> rusqlite::Result<()> {
-    let pack_cols: Vec<String> = {
-        let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('packs')")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        rows.collect::<rusqlite::Result<_>>()?
-    };
-    let added_state = !pack_cols.iter().any(|c| c == "state");
-    if added_state {
-        conn.execute_batch("ALTER TABLE packs ADD COLUMN state TEXT NOT NULL DEFAULT 'building'")?;
+/// True when at least one of this build's tables exists — i.e. the file is
+/// a LightFS database from some build of this lineage and must satisfy the
+/// full current schema, whatever its age.
+fn any_known_table(conn: &Connection) -> rusqlite::Result<bool> {
+    for (table, _) in REQUIRED_TABLE_COLUMNS {
+        if !table_columns(conn, table)?.is_empty() {
+            return Ok(true);
+        }
     }
-    if !pack_cols.iter().any(|c| c == "unref_since") {
-        conn.execute_batch("ALTER TABLE packs ADD COLUMN unref_since INTEGER")?;
-    }
-    if added_state {
-        // Every pre-lifecycle row predates the new column: classify by what
-        // the old schema knew — uploaded packs are conservatively `active`
-        // (the gc re-query converges them), never-uploaded stay `building`.
-        conn.execute_batch(
-            "UPDATE packs SET state = CASE WHEN uploaded_at IS NULL THEN 'building' ELSE 'active' END",
-        )?;
-    }
-    let task_cols: Vec<String> = {
-        let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('wb_tasks')")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        rows.collect::<rusqlite::Result<_>>()?
-    };
-    if !task_cols.iter().any(|c| c == "pack_key") {
-        conn.execute_batch("ALTER TABLE wb_tasks ADD COLUMN pack_key TEXT")?;
-    }
-    if !task_cols.iter().any(|c| c == "uploaded_key") {
-        conn.execute_batch("ALTER TABLE wb_tasks ADD COLUMN uploaded_key TEXT")?;
-    }
-    Ok(())
+    Ok(false)
 }
 
 /// S4.2 P0-a — the pack reference lifecycle, applied INSIDE the caller's
@@ -316,30 +328,28 @@ const NODE_COLS: &str = "id, parent_id, name, kind, size, mtime, mode, object_ke
 impl SqliteMetadataStore {
     /// Open (creating if needed) the store and ensure schema + root.
     ///
-    /// A database whose `nodes` table predates AUTOINCREMENT cannot satisfy
-    /// the stable-identity guarantee and is rejected BEFORE anything is
-    /// written (even the journal-mode pragma) — the legacy database is
-    /// left untouched: no schema change, no rows, no pragma side effects.
-    /// There is deliberately no migration: the store must be re-initialized
+    /// A database written by an older build of this lineage — a `nodes`
+    /// table predating AUTOINCREMENT id allocation, or any table/column
+    /// missing from the current single schema — is rejected BEFORE anything
+    /// is written (even the journal-mode pragma): no schema change, no
+    /// rows, no pragma side effects, no partial upgrade. There is
+    /// deliberately no migration: the store must be re-initialized
     /// (stop the service, unmount all clients, discard the metadata
-    /// database and the object namespace). The check keys on the id
-    /// column's actual definition (see
-    /// [`Self::nodes_table_matches_contract`]), not on the stored SQL
-    /// text.
+    /// database and the object namespace). The check keys on what the
+    /// ENGINE recorded (see [`Self::database_matches_current_schema`]),
+    /// not on the stored SQL text.
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
-        let nodes_exists: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'nodes'",
-            [],
-            |r| r.get(0),
-        )?;
-        if nodes_exists > 0 && !Self::nodes_table_matches_contract(&conn)? {
+        if any_known_table(&conn)? && !Self::database_matches_current_schema(&conn)? {
             return Err(Error::Storage(
-                "nodes table predates AUTOINCREMENT id allocation: stable identity \
-                 is not satisfiable on this database. Re-initialize the store \
-                 (stop the service, unmount all clients, discard the metadata \
-                 database and the test object namespace, then start fresh); \
-                 automatic migration is intentionally not supported"
+                "database schema predates the current schema (AUTOINCREMENT id \
+                 allocation and/or the S4 pack-lifecycle tables: packs.state, \
+                 wb_tasks.pack_key/uploaded_key, gc_deletions). Stable identity \
+                 and the lifecycle invariants are not satisfiable on this \
+                 database. Re-initialize the store (stop the service, unmount \
+                 all clients, discard the metadata database and the test \
+                 object namespace, then start fresh); automatic migration is \
+                 intentionally not supported"
                     .into(),
             ));
         }
@@ -347,8 +357,6 @@ impl SqliteMetadataStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
-        add_missing_pack_columns(&conn)?;
-        add_pack_lifecycle_columns(&conn)?;
         // Root: id 1, no parent. Ignore conflict on reopen.
         conn.execute(
             "INSERT OR IGNORE INTO nodes (id, parent_id, name, kind, size, mtime, mode) VALUES (1, NULL, '', 'dir', 0, ?1, ?2)",
@@ -359,11 +367,13 @@ impl SqliteMetadataStore {
         })
     }
 
-    /// Definition-level contract check for an existing `nodes` table — it
-    /// reads what the ENGINE recorded, never the CREATE statement's text:
+    /// Definition-level contract for an EXISTING database — it reads what
+    /// the ENGINE recorded, never the CREATE statement's text:
     ///
-    /// - every required column is present (`pragma_table_info`);
-    /// - `sqlite_sequence` holds a row for this table, the engine's own
+    /// - every required table exists with every required column
+    ///   (`pragma_table_info`; the single-schema list, no per-column
+    ///   migration beyond what `SCHEMA` creates);
+    /// - `sqlite_sequence` holds a row for `nodes`, the engine's own
     ///   bookkeeping for AUTOINCREMENT tables (the row appears on first
     ///   insert; `open` always seeds root id 1, so every database this code
     ///   initialized has one). A legacy table that merely mentions the word
@@ -371,28 +381,12 @@ impl SqliteMetadataStore {
     ///   not pass. The marker is engine-managed: a hand-forged
     ///   sqlite_sequence row is out-of-model tampering, the same class as
     ///   external tools writing the table directly.
-    fn nodes_table_matches_contract(conn: &Connection) -> Result<bool> {
-        const REQUIRED: [&str; 11] = [
-            "id",
-            "parent_id",
-            "name",
-            "kind",
-            "size",
-            "mtime",
-            "mode",
-            "object_key",
-            "version",
-            "etag",
-            "target",
-        ];
-        let mut present: Vec<String> = Vec::new();
-        let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('nodes')")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        for name in rows {
-            present.push(name?);
-        }
-        if REQUIRED.iter().any(|col| !present.iter().any(|c| c == col)) {
-            return Ok(false);
+    fn database_matches_current_schema(conn: &Connection) -> Result<bool> {
+        for (table, required) in REQUIRED_TABLE_COLUMNS {
+            let present = table_columns(conn, table)?;
+            if required.iter().any(|col| !present.iter().any(|c| c == col)) {
+                return Ok(false);
+            }
         }
         // The sqlite_sequence table itself exists only once some
         // AUTOINCREMENT table exists; a legacy-only database has neither
@@ -1685,6 +1679,282 @@ mod tests {
     }
 
     // --- R4.2c: stable identity starts at CREATE time -----------------------
+
+    // --- S4.2.1: single schema, fail fast on anything older ----------------
+
+    #[test]
+    fn p0a1_fresh_db_has_full_lifecycle_schema() {
+        const EXPECTED: [(&str, &[&str]); 5] = [
+            (
+                "nodes",
+                &[
+                    "id",
+                    "parent_id",
+                    "name",
+                    "kind",
+                    "size",
+                    "mtime",
+                    "mode",
+                    "object_key",
+                    "version",
+                    "etag",
+                    "target",
+                    "pack_key",
+                    "pack_off",
+                    "pack_len",
+                    "content_hash",
+                ],
+            ),
+            ("superseded_objects", &["object_key", "superseded_at"]),
+            (
+                "packs",
+                &["key", "bytes", "uploaded_at", "state", "unref_since"],
+            ),
+            (
+                "wb_tasks",
+                &[
+                    "id",
+                    "node_id",
+                    "staging",
+                    "size",
+                    "expected",
+                    "state",
+                    "attempts",
+                    "updated_at",
+                    "pack_key",
+                    "uploaded_key",
+                ],
+            ),
+            (
+                "gc_deletions",
+                &[
+                    "id",
+                    "key",
+                    "kind",
+                    "state",
+                    "attempts",
+                    "last_error",
+                    "updated_at",
+                ],
+            ),
+        ];
+        let s = SqliteMetadataStore::open_in_memory().unwrap();
+        let conn = s.conn.lock().unwrap();
+        for (table, cols) in EXPECTED {
+            let present: Vec<String> = {
+                let mut stmt = conn
+                    .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                    .unwrap();
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+                rows.map(|r| r.unwrap()).collect()
+            };
+            for col in cols {
+                assert!(
+                    present.iter().any(|c| c == col),
+                    "{table}.{col} missing from fresh schema"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn p0a1_reopen_preserves_lifecycle_and_deletion_state() {
+        let dir = std::env::temp_dir().join(format!("lightfs-p0a1-reopen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.db");
+        let pk = "packs/p0a1-reopen.data";
+        {
+            let s = SqliteMetadataStore::open(path.to_str().unwrap()).unwrap();
+            s.register_pack(pk, 128).unwrap();
+            s.mark_pack_uploaded(pk, 5).unwrap();
+            {
+                let conn = s.conn.lock().unwrap();
+                conn.execute(
+                    "INSERT INTO wb_tasks (node_id, staging, size, expected, state, attempts, \
+                     updated_at, pack_key, uploaded_key) \
+                     VALUES (9, '/tmp/unused', 1, 1, 'dead', 1, 1, 'pk', 'objects/9/1')",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO gc_deletions (key, kind, state, updated_at) \
+                     VALUES ('objects/gone', 'object', 'pending', 1)",
+                    [],
+                )
+                .unwrap();
+            }
+        }
+        // Reopen: nothing is re-initialized, reset or re-derived.
+        let s = SqliteMetadataStore::open(path.to_str().unwrap()).unwrap();
+        {
+            let conn = s.conn.lock().unwrap();
+            let state: String = conn
+                .query_row("SELECT state FROM packs WHERE key = ?1", params![pk], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                state, "committing",
+                "lifecycle state survives reopen untouched"
+            );
+            let bound: Option<String> = conn
+                .query_row("SELECT pack_key FROM wb_tasks WHERE node_id = 9", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(bound.as_deref(), Some("pk"));
+            let uploaded: Option<String> = conn
+                .query_row(
+                    "SELECT uploaded_key FROM wb_tasks WHERE node_id = 9",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(uploaded.as_deref(), Some("objects/9/1"));
+            let intents: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM gc_deletions WHERE key = 'objects/gone'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(intents, 1, "deletion intents survive reopen");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A database from an older build of this lineage (pre-lifecycle packs,
+    /// pre-binding wb_tasks, no gc_deletions) must be rejected at open and
+    /// left EXACTLY as it was: no ALTER, no backfill, no created table.
+    #[test]
+    fn p0a1_pre_s4_schema_rejected_without_partial_upgrade() {
+        let dir = std::env::temp_dir().join(format!("lightfs-p0a1-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE nodes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    parent_id INTEGER, name TEXT NOT NULL, kind TEXT NOT NULL,
+                    size INTEGER NOT NULL DEFAULT 0, mtime INTEGER NOT NULL, mode INTEGER,
+                    object_key TEXT, version TEXT, etag TEXT, target TEXT,
+                    pack_key TEXT, pack_off INTEGER, pack_len INTEGER, content_hash TEXT,
+                    UNIQUE(parent_id, name)
+                );
+                CREATE TABLE superseded_objects (
+                    object_key TEXT PRIMARY KEY, superseded_at INTEGER NOT NULL
+                );
+                CREATE TABLE packs (key TEXT PRIMARY KEY, bytes INTEGER NOT NULL, uploaded_at INTEGER);
+                CREATE TABLE wb_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, node_id INTEGER NOT NULL,
+                    staging TEXT NOT NULL, size INTEGER NOT NULL, expected INTEGER NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'queued', attempts INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL
+                );
+                INSERT INTO nodes (id, parent_id, name, kind, size, mtime, mode)
+                    VALUES (1, NULL, '', 'dir', 0, 0, 493);
+                INSERT INTO packs (key, bytes, uploaded_at) VALUES ('packs/old.data', 10, 1);",
+            )
+            .unwrap();
+        }
+        let err = match SqliteMetadataStore::open(path.to_str().unwrap()) {
+            Ok(_) => panic!("a pre-S4-schema database must be rejected at open"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err}").contains("Re-initialize"),
+            "the rejection must say how to proceed: {err}"
+        );
+        // Nothing was partially upgraded.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let pack_cols: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT name FROM pragma_table_info('packs')")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert!(
+            !pack_cols.iter().any(|c| c == "state"),
+            "no ALTER may sneak into a rejected database"
+        );
+        let packs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM packs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(packs, 1, "existing rows untouched");
+        let gc_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'gc_deletions'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            gc_tables, 0,
+            "no table may be created into a rejected database"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same contract when everything else is current but ONE required
+    /// table is missing: reject instead of quietly completing the schema.
+    #[test]
+    fn p0a1_db_missing_required_table_rejected() {
+        let dir = std::env::temp_dir().join(format!("lightfs-p0a1-part-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("part.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE nodes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    parent_id INTEGER, name TEXT NOT NULL, kind TEXT NOT NULL,
+                    size INTEGER NOT NULL DEFAULT 0, mtime INTEGER NOT NULL, mode INTEGER,
+                    object_key TEXT, version TEXT, etag TEXT, target TEXT,
+                    pack_key TEXT, pack_off INTEGER, pack_len INTEGER, content_hash TEXT,
+                    UNIQUE(parent_id, name)
+                );
+                CREATE TABLE superseded_objects (
+                    object_key TEXT PRIMARY KEY, superseded_at INTEGER NOT NULL
+                );
+                CREATE TABLE packs (
+                    key TEXT PRIMARY KEY, bytes INTEGER NOT NULL, uploaded_at INTEGER,
+                    state TEXT NOT NULL DEFAULT 'building', unref_since INTEGER
+                );
+                CREATE TABLE wb_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, node_id INTEGER NOT NULL,
+                    staging TEXT NOT NULL, size INTEGER NOT NULL, expected INTEGER NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'queued', attempts INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL, pack_key TEXT, uploaded_key TEXT
+                );
+                INSERT INTO nodes (id, parent_id, name, kind, size, mtime, mode)
+                    VALUES (1, NULL, '', 'dir', 0, 0, 493);",
+            )
+            .unwrap();
+        }
+        let err = match SqliteMetadataStore::open(path.to_str().unwrap()) {
+            Ok(_) => panic!("a database missing gc_deletions must be rejected at open"),
+            Err(e) => e,
+        };
+        assert!(format!("{err}").contains("Re-initialize"));
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let gc_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'gc_deletions'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            gc_tables, 0,
+            "the missing table must not be created into a rejected database"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn fresh_databases_get_autoincrement_identity() {

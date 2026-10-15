@@ -273,9 +273,12 @@ impl Core {
     }
 
     /// Retire a committed object: record it for retention (point-in-time
-    /// restore) or, when retention is disabled, delete it immediately.
-    /// Best effort — a leftover is a stale/retained object for fsck, never
-    /// a correctness issue.
+    /// restore) or, when retention is disabled, park a durable deletion
+    /// intent. Best effort — a leftover is a stale/retained object for
+    /// fsck, never a correctness issue. No inline remote delete here: a
+    /// committed object may be referenced by historical metadata backups,
+    /// so its bytes only ever leave through the P0-b-gated deletion
+    /// pipeline (the gc dependency gate), never synchronously.
     fn retire_object(&self, key: &str) {
         // A pack object is shared by construction; no per-file path may
         // retire (let alone delete) it. Its lifecycle is reference-driven:
@@ -283,12 +286,21 @@ impl Core {
         if key.starts_with(crate::pack::PACK_KEY_PREFIX) {
             return;
         }
-        // Metadata write failed: fall through to the plain delete so the
-        // data plane still does not accumulate.
-        if !(self.retention_supersede && self.meta.record_superseded(key, self.now()).is_ok())
-            && self.objects.delete(key).is_ok()
-        {
-            self.metrics.s3_delete.fetch_add(1, Ordering::Relaxed);
+        if self.retention_supersede && self.meta.record_superseded(key, self.now()).is_ok() {
+            return;
+        }
+        // Retention disabled, or the supersede record failed: enroll the
+        // object as a deletion intent. The caller's metadata transaction
+        // already committed, so the registration's live-reference guard
+        // holds; executing the intent stays behind the gc gate.
+        match self.meta.gc_enqueue_orphan_object(key, self.now()) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!("lightfs: retire of {key} skipped: a live reference appeared")
+            }
+            Err(e) => eprintln!(
+                "lightfs: retire of {key} could not record a deletion intent: {e} (left for fsck)"
+            ),
         }
     }
 
@@ -305,7 +317,14 @@ impl Core {
     /// past their retention window and superseded per-file objects. Each
     /// registration re-checks its guards inside its own transaction and
     /// returns false when the predicate no longer holds.
-    pub fn gc_enroll_candidates(&self, cutoff: i64) -> Result<(usize, usize)> {
+    ///
+    /// `#[cfg(test)]` on purpose: enrollment as a bulk sweep exists only for
+    /// the deletion-task tests. Production objects reach the intent ledger
+    /// through their own paths (retire/unlink/recover); the production
+    /// entry point for reclamation is `lightfs gc`, which refuses to run
+    /// until P0-b's backup-manifest protection exists.
+    #[cfg(test)]
+    pub(crate) fn gc_enroll_candidates(&self, cutoff: i64) -> Result<(usize, usize)> {
         let mut packs = 0usize;
         let mut objects = 0usize;
         for (key, _) in self.meta.gc_pack_candidates(cutoff, 1000)? {
@@ -328,7 +347,14 @@ impl Core {
     /// already gone, e.g. a crash after the remote delete but before the
     /// local finalize, counts as success) then the transactional finalize.
     /// Failures persist as retryable rows; the intent is never lost.
-    pub fn gc_execute_deletions(&self, limit: usize) -> Result<(u64, u64)> {
+    ///
+    /// `#[cfg(test)]` on purpose: this is the single function that turns
+    /// deletion intents into real remote deletes, and until P0-b lands NO
+    /// production caller may exist at all (the future sanctioned caller is
+    /// the gated `lightfs gc`). Compiling it out of non-test builds makes
+    /// "no bypass" a property of the binary, not of call-site discipline.
+    #[cfg(test)]
+    pub(crate) fn gc_execute_deletions(&self, limit: usize) -> Result<(u64, u64)> {
         let mut done = 0u64;
         let mut failed = 0u64;
         for d in self.meta.gc_claim_deletions(limit, self.now())? {
@@ -1259,10 +1285,14 @@ impl Core {
         }
     }
 
-    /// Remove a file. With retention the object is RECORDED (bytes stay for
-    /// point-in-time restore) before the metadata row goes; without
-    /// retention it is deleted first, and a failed delete keeps the metadata
-    /// row so fsck retries later.
+    /// Remove a file. The metadata transaction is the atomic truth: the
+    /// node row goes (and a pack-backed file's reference-gone event fires
+    /// inside the same transaction). Only AFTER it commits is the old
+    /// object's reclamation booked — a superseded record under retention,
+    /// a durable deletion intent otherwise — and both are best effort:
+    /// a failure leaks an unreferenced object for fsck, it can never
+    /// dangle a live row against deleted bytes, and no bytes are ever
+    /// deleted inline (the gc dependency gate owns real deletion).
     pub fn unlink(&self, path: &str) -> Result<()> {
         let node = self.lookup(path)?;
         // POSIX: unlink removes files AND symlinks (never following the
@@ -1274,18 +1304,6 @@ impl Core {
                 actual: node.kind.as_str().to_string(),
             });
         }
-        if let Some(key) = &node.object_key {
-            if node.is_pack_backed() {
-                // Shared pack: never a per-file delete/retire. The pack
-                // simply loses one reference; pack gc reclaims it when the
-                // last one is gone (retention window applies).
-            } else if self.retention_supersede {
-                self.meta.record_superseded(key, self.now())?;
-            } else {
-                self.objects.delete(key)?;
-                self.metrics.s3_delete.fetch_add(1, Ordering::Relaxed);
-            }
-        }
         // Write-back: queued staged writes for this node never reach the
         // store (the delete-before-commit cancel). A draining task rides
         // to its CAS, which fails NotFound and is discarded.
@@ -1293,7 +1311,27 @@ impl Core {
             wb.cancel(node.id);
         }
         self.metrics.metadata_tx.fetch_add(1, Ordering::Relaxed);
-        self.meta.delete_node(node.id)
+        self.meta.delete_node(node.id)?;
+        if let Some(key) = &node.object_key {
+            if !node.is_pack_backed() {
+                if self.retention_supersede {
+                    if let Err(e) = self.meta.record_superseded(key, self.now()) {
+                        eprintln!("lightfs: unlinked object {key} left unrecorded: {e} (fsck)");
+                    }
+                } else {
+                    match self.meta.gc_enqueue_orphan_object(key, self.now()) {
+                        Ok(true) => {}
+                        Ok(false) => eprintln!(
+                            "lightfs: unlinked object {key} not enrolled: a live reference exists"
+                        ),
+                        Err(e) => eprintln!(
+                            "lightfs: unlinked object {key} could not record a deletion intent: {e} (fsck)"
+                        ),
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn rmdir(&self, path: &str) -> Result<()> {
@@ -1873,23 +1911,128 @@ mod tests {
         assert!(matches!(c.unlink("/d"), Err(Error::NotFound(_))));
     }
 
-    /// With retention disabled the old immediate-delete semantics hold.
+    // --- S4.2.1: no unprotected destructive delete -------------------------
+
+    /// Retention-off unlink must not delete bytes inline: the object stays
+    /// in the store and a durable deletion intent is parked for the gated
+    /// pipeline. (Old behavior: `objects.delete(key)?` ran BEFORE the
+    /// metadata delete — a failed unlink could dangle a live row on
+    /// already-deleted bytes.)
     #[test]
-    fn unlink_deletes_immediately_when_retention_disabled() {
+    fn p0a1_unlink_retention_off_leaves_object_to_gated_intent() {
+        let objs = Arc::new(MemObjectStore::new());
+        let c = Core::with_retention(
+            Arc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            objs.clone(),
+            0,
+        );
+        c.create("/f", 0o644).unwrap();
+        let h = c.open_write("/f", None).unwrap();
+        c.write(&h, 0, b"x").unwrap();
+        c.commit_write(&h).unwrap();
+        let key = c.lookup("/f").unwrap().object_key.clone().unwrap();
+
+        c.unlink("/f").unwrap();
+        assert!(c.lookup("/f").is_err());
+        assert!(
+            objs.head(&key).is_ok(),
+            "unlink must not physically delete: only the gated executor may"
+        );
+        let claimed = c.metadata().gc_claim_deletions(10, 1).unwrap();
+        assert!(
+            claimed.iter().any(|d| d.key == key && d.kind == "object"),
+            "the unlinked object must carry a durable deletion intent: {claimed:?}"
+        );
+    }
+
+    /// Even with the object store unable to serve a delete, unlink keeps
+    /// its metadata contract: the node goes, nothing is deleted inline,
+    /// the intent is recorded (old behavior: unlink propagated the store
+    /// error and left the node row behind).
+    #[test]
+    fn p0a1_unlink_succeeds_without_inline_object_delete() {
+        let objs = Arc::new(MemObjectStore::new());
+        let c = Core::with_retention(
+            Arc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            objs.clone(),
+            0,
+        );
+        c.create("/f", 0o644).unwrap();
+        let h = c.open_write("/f", None).unwrap();
+        c.write(&h, 0, b"x").unwrap();
+        c.commit_write(&h).unwrap();
+        let key = c.lookup("/f").unwrap().object_key.clone().unwrap();
+
+        objs.inject_delete_failure(&key);
+        c.unlink("/f")
+            .expect("unlink must not depend on an inline remote delete");
+        assert!(
+            c.lookup("/f").is_err(),
+            "the metadata delete is the unlink contract"
+        );
+        assert!(objs.head(&key).is_ok());
+    }
+
+    /// Overwrite with retention off: the replaced version object is parked
+    /// as a deletion intent, never deleted inline by the commit path.
+    #[test]
+    fn p0a1_retire_overwrite_enqueues_intent_instead_of_inline_delete() {
+        let objs = Arc::new(MemObjectStore::new());
+        let c = Core::with_retention(
+            Arc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            objs.clone(),
+            0,
+        );
+        c.create("/f", 0o644).unwrap();
+        let h = c.open_write("/f", None).unwrap();
+        c.write(&h, 0, b"one").unwrap();
+        c.commit_write(&h).unwrap();
+        let old_key = c.lookup("/f").unwrap().object_key.clone().unwrap();
+        let h = c.open_write("/f", None).unwrap();
+        c.write(&h, 0, b"two").unwrap();
+        c.commit_write(&h).unwrap();
+
+        assert!(
+            objs.head(&old_key).is_ok(),
+            "the replaced version must not be deleted inline on overwrite"
+        );
+        assert!(c.metadata().all_superseded().unwrap().is_empty());
+        let claimed = c.metadata().gc_claim_deletions(10, 1).unwrap();
+        assert!(
+            claimed
+                .iter()
+                .any(|d| d.key == old_key && d.kind == "object"),
+            "the replaced version must carry a durable deletion intent: {claimed:?}"
+        );
+    }
+
+    /// Retention-disabled unlink parks a deletion intent instead of the
+    /// old inline delete: the object survives until the gated gc executor
+    /// runs, and the superseded ledger stays untouched. This replaces the
+    /// pre-S4.2.1 `unlink_deletes_immediately_when_retention_disabled`,
+    /// which encoded exactly the unprotected destructive path the audit
+    /// retired (a committed object could leave through an ungated delete).
+    #[test]
+    fn unlink_with_retention_disabled_parks_intent_not_inline_delete() {
         let c = Core::with_retention(
             Arc::new(SqliteMetadataStore::open_in_memory().unwrap()),
             Arc::new(MemObjectStore::new()),
             0,
         );
         c.create("/f", 0o644).unwrap();
-        // commit content so there is an object to delete immediately
+        // commit content so there is an object to reclaim later
         let h = c.open_write("/f", None).unwrap();
         c.write(&h, 0, b"x").unwrap();
         c.commit_write(&h).unwrap();
         let key = c.lookup("/f").unwrap().object_key.clone().unwrap();
         c.unlink("/f").unwrap();
-        assert!(c.objects.head(&key).is_err());
+        assert!(
+            c.objects.head(&key).is_ok(),
+            "no inline delete: the gated executor owns reclamation"
+        );
         assert!(c.metadata().all_superseded().unwrap().is_empty());
+        let claimed = c.metadata().gc_claim_deletions(10, 1).unwrap();
+        assert!(claimed.iter().any(|d| d.key == key && d.kind == "object"));
     }
 
     /// The point of retention: overwrite a file, GC nothing — the metadata

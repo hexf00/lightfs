@@ -21,6 +21,9 @@ pub struct MemObjectStore {
     /// Test-only failure injection: deletes of a key present here error
     /// once (gc retry-path coverage without a network).
     delete_failures: Mutex<std::collections::HashSet<String>>,
+    /// Test-only failure injection: heads of a key present here error once
+    /// (recover() fail-closed coverage without a network).
+    head_failures: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Default for MemObjectStore {
@@ -35,6 +38,7 @@ impl MemObjectStore {
             objects: Mutex::new(BTreeMap::new()),
             counter: std::sync::atomic::AtomicU64::new(1),
             delete_failures: Mutex::new(std::collections::HashSet::new()),
+            head_failures: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -42,6 +46,13 @@ impl MemObjectStore {
     /// deletion-task retry paths can be driven deterministically.
     pub fn inject_delete_failure(&self, key: &str) {
         self.delete_failures.lock().unwrap().insert(key.to_string());
+    }
+
+    /// Test-only: make the next `head(key)` return a storage error (not
+    /// ObjectMissing) so recover()'s fail-closed branch can be driven
+    /// deterministically.
+    pub fn inject_head_failure(&self, key: &str) {
+        self.head_failures.lock().unwrap().insert(key.to_string());
     }
 
     fn info(&self, key: &str, e: &Entry) -> ObjectInfo {
@@ -122,6 +133,11 @@ impl ObjectStore for MemObjectStore {
     }
 
     fn head(&self, key: &str) -> Result<ObjectInfo> {
+        if self.head_failures.lock().unwrap().remove(key) {
+            return Err(Error::Storage(format!(
+                "injected head failure for testing: {key}"
+            )));
+        }
         let objs = self.objects.lock().unwrap();
         let e = objs
             .get(key)
