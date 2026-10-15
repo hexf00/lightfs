@@ -1457,6 +1457,16 @@ impl MetadataStore for SqliteMetadataStore {
     }
 
     #[cfg(test)]
+    fn pack_rows_debug(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT key, state FROM packs ORDER BY key")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    #[cfg(test)]
     fn wb_task_rows(&self) -> Result<Vec<crate::metadata::WbTaskRowDebug>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt =

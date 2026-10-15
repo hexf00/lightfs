@@ -94,6 +94,8 @@ fn build_core(
             queue_max_tasks: cfg.writeback.queue_max_tasks,
             staging_budget_bytes: cfg.writeback.staging_budget_bytes,
             ledger_lock_path: Some(format!("{}.engine-lock", db_identity.display())),
+            #[cfg(test)]
+            probe_fault: false,
         })
     } else {
         None

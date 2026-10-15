@@ -82,6 +82,11 @@ pub struct WbOptions {
     /// configs that share the DB but not the staging dir. `None` for
     /// in-memory test ledgers (nothing on disk to exclude).
     pub ledger_lock_path: Option<String>,
+    /// Test-only: force the startup dir-sync capability probe to fail so
+    /// the refusal path is exercisable on every platform (a global fault
+    /// flag would race parallel engine constructions).
+    #[cfg(test)]
+    pub(crate) probe_fault: bool,
 }
 
 pub struct WriteBackEngine {
@@ -177,7 +182,13 @@ pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     }
 }
 
-/// S4.4 P0-d dead-letter error classes, persisted on `wb_tasks.error_class`.
+/// The P0-d.2 startup capability probe: one real directory fsync on the
+/// staging dir we are about to own.
+fn probe_dir_sync(staging: &Path) -> Result<()> {
+    sync_directory(staging)
+}
+
+// S4.4 P0-d dead-letter error classes, persisted on `wb_tasks.error_class`.
 /// The retry-admission contract lives in [`retry_admissible`]; the drain
 /// workers only AUTO-requeue what classifies as transient.
 pub const CLASS_CONFLICT: &str = "conflict";
@@ -294,6 +305,31 @@ impl WriteBackEngine {
             ),
             None => None,
         };
+        // P0-d.2 capability gate: the write-back ack depends on the
+        // staging DIRECTORY sync (R15 order: file-sync -> dir-sync ->
+        // enqueue). A platform or filesystem where that cannot be done
+        // must be refused HERE, loudly — never discovered as a per-write
+        // failure, and never papered over with a silent success. The probe
+        // is one real directory fsync on the staging dir we are about to
+        // own.
+        #[cfg(test)]
+        let forced = opts.probe_fault;
+        #[cfg(not(test))]
+        let forced = false;
+        let probe = if forced {
+            Err(Error::Io("injected directory-sync probe failure".into()))
+        } else {
+            probe_dir_sync(Path::new(&opts.staging_dir))
+        };
+        if let Err(e) = probe {
+            return Err(Error::Config(format!(
+                "write-back staging directory {} does not support durable \
+                 directory sync: {e} — refusing write-back mode: writes must \
+                 not be acknowledged when the staging namespace cannot be \
+                 made durable",
+                opts.staging_dir
+            )));
+        }
         Ok(Self {
             meta,
             objects,
@@ -448,10 +484,6 @@ impl WriteBackEngine {
 
     fn all_task_stagings(&self) -> Result<Vec<String>> {
         self.meta.wb_all_stagings()
-    }
-
-    fn set_state(&self, id: i64, state: &str) -> Result<()> {
-        self.meta.wb_set_state(id, state, self.now())
     }
 
     /// R15 seam: record a durability step; when the probe names this step
@@ -933,7 +965,8 @@ impl WriteBackEngine {
                         Ok(f) => match f.metadata() {
                             Ok(m) if m.len() as i64 == task.size => Some(task.size),
                             Ok(m) => {
-                                self.set_state(task.id, "dead")?;
+                                self.meta
+                                    .wb_mark_dead(task.id, CLASS_STAGING_LOST, self.now())?;
                                 eprintln!(
                                     "lightfs wb: task {id} dead: staged {got} != declared {want}",
                                     id = task.id,
@@ -943,7 +976,8 @@ impl WriteBackEngine {
                                 None
                             }
                             Err(e) => {
-                                self.set_state(task.id, "dead")?;
+                                self.meta
+                                    .wb_mark_dead(task.id, CLASS_STAGING_LOST, self.now())?;
                                 eprintln!(
                                     "lightfs wb: task {id} dead: staging stat failed: {e}",
                                     id = task.id
@@ -952,7 +986,8 @@ impl WriteBackEngine {
                             }
                         },
                         Err(e) => {
-                            self.set_state(task.id, "dead")?;
+                            self.meta
+                                .wb_mark_dead(task.id, CLASS_STAGING_LOST, self.now())?;
                             eprintln!(
                                 "lightfs wb: task {id} dead: staging unreadable: {e}",
                                 id = task.id
@@ -1435,6 +1470,7 @@ mod tests {
                 staging_budget_bytes: 0,
 
                 ledger_lock_path: None,
+                probe_fault: false,
             }),
         )
         .unwrap()
@@ -1603,6 +1639,7 @@ mod tests {
                 staging_budget_bytes: 0,
 
                 ledger_lock_path: None,
+                probe_fault: false,
             }),
         )
         .unwrap()
@@ -1819,6 +1856,7 @@ mod tests {
                 staging_budget_bytes: 0,
 
                 ledger_lock_path: None,
+                probe_fault: false,
             }),
         )
         .unwrap();
@@ -2034,6 +2072,7 @@ mod tests {
             staging_budget_bytes: 0,
 
             ledger_lock_path: None,
+            probe_fault: false,
         };
         let body = b"survives a crash";
         let store: StdArc<dyn crate::object_store::ObjectStore> =
@@ -2192,6 +2231,7 @@ mod tests {
                 staging_budget_bytes: 0,
 
                 ledger_lock_path: None,
+                probe_fault: false,
             }),
         )
         .unwrap();
@@ -2274,6 +2314,7 @@ mod tests {
                 staging_budget_bytes: 0,
 
                 ledger_lock_path: None,
+                probe_fault: false,
             }),
         )
         .unwrap();
@@ -2376,6 +2417,7 @@ mod tests {
             staging_budget_bytes: 0,
 
             ledger_lock_path: None,
+            probe_fault: false,
         };
         let eng = WriteBackEngine::new(
             meta.clone(),
@@ -2442,6 +2484,7 @@ mod tests {
             staging_budget_bytes: 0,
 
             ledger_lock_path: None,
+            probe_fault: false,
         };
         let eng = WriteBackEngine::new(
             meta.clone(),
@@ -2574,6 +2617,7 @@ mod tests {
                 queue_max_tasks: 0,
                 staging_budget_bytes: budget,
                 ledger_lock_path: None,
+                probe_fault: false,
             }),
         )
         .unwrap();
@@ -2691,6 +2735,7 @@ mod tests {
                     staging_budget_bytes: 0,
 
                     ledger_lock_path: None,
+                    probe_fault: false,
                 }),
             )
             .unwrap();
@@ -2722,6 +2767,7 @@ mod tests {
                 staging_budget_bytes: 0,
 
                 ledger_lock_path: None,
+                probe_fault: false,
             }),
         )
         .unwrap();
@@ -2751,6 +2797,7 @@ mod tests {
                 staging_budget_bytes: 100,
 
                 ledger_lock_path: None,
+                probe_fault: false,
             }),
         )
         .unwrap();
@@ -2788,6 +2835,7 @@ mod tests {
                 staging_budget_bytes: 0,
 
                 ledger_lock_path: None,
+                probe_fault: false,
             }),
         )
         .unwrap();
@@ -2938,6 +2986,7 @@ mod tests {
                 staging_budget_bytes: 0,
 
                 ledger_lock_path: None,
+                probe_fault: false,
             }),
         )
         .unwrap();
@@ -2993,6 +3042,7 @@ mod tests {
                 staging_budget_bytes: 0,
 
                 ledger_lock_path: None,
+                probe_fault: false,
             }),
         )
         .unwrap();
@@ -3022,6 +3072,7 @@ mod tests {
             queue_max_tasks: 0,
             staging_budget_bytes: 1000,
             ledger_lock_path: ledger,
+            probe_fault: false,
         }
     }
 
@@ -3802,6 +3853,7 @@ mod tests {
                 staging_budget_bytes: 0,
 
                 ledger_lock_path: None,
+                probe_fault: false,
             }),
         )
         .unwrap()
@@ -4154,5 +4206,217 @@ mod tests {
         cfg.writeback.batch_pack_bytes = 0;
         cfg.writeback.staging_budget_bytes = 0;
         cfg
+    }
+
+    /// P0-d.2 acceptance batch tests: the batch path must obey the SAME
+    /// dead-letter contract as the per-file drain (staging-lost class
+    /// persisted, bytes accounted, no requeue), and the pack lifecycle
+    /// must stay untouched by a dead member (it never entered a pack).
+    /// Existing R17 tests ran with batch_pack_bytes = 0 — these do not.
+    /// A Core with batch-pack drain enabled, manual seal via drain call.
+    fn p0d4_batch_core(tag: &str) -> Core {
+        let dir = std::env::temp_dir().join(format!(
+            "lightfs-p0d4-{tag}-{}-{}",
+            std::process::id(),
+            tmp_unique()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Core::with_options(
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            StdArc::new(MemObjectStore::new()),
+            crate::core::DEFAULT_SUPERSEDED_SECS,
+            None,
+            Some(WbOptions {
+                staging_dir: dir.join("staging").to_string_lossy().to_string(),
+                drain_workers: 0,
+                batch_pack_bytes: 8388608,
+                batch_max_wait_ms: 0, // seal immediately on manual drain
+                queue_max_tasks: 0,
+                staging_budget_bytes: 0,
+
+                ledger_lock_path: None,
+                probe_fault: false,
+            }),
+        )
+        .unwrap()
+    }
+
+    /// Batch arm of staging-lost: the staged file vanishes before the
+    /// seal. Dead WITH the persisted class (same contract as drain_task),
+    /// no requeue, dead bytes stay accounted until a reconcile rebuilds
+    /// from disk truth, and no pack row may appear for a member that
+    /// never entered one.
+    #[test]
+    fn p0d4_batch_staging_missing_dead_letters_with_class() {
+        let c = p0d4_batch_core("lost");
+        c.create("/f", 0o644).unwrap();
+        write_via_rpc(&c, "/f", b"batch lost body", Some(0));
+        let (staging, _) = c
+            .metadata()
+            .wb_latest_staging(c.lookup("/f").unwrap().id)
+            .unwrap()
+            .unwrap();
+        std::fs::remove_file(&staging).unwrap();
+        c.wb().unwrap().drain_once().unwrap();
+        assert_eq!(
+            c.wb().unwrap().queue_counts(),
+            (0, 0, 1),
+            "dead, never requeued"
+        );
+        let rows = c.metadata().wb_task_rows().unwrap();
+        assert_eq!(rows[0].1, "dead");
+        assert_eq!(
+            rows[0].3.as_deref(),
+            Some(CLASS_STAGING_LOST),
+            "batch validation must persist the same class as the per-file drain"
+        );
+        assert!(!retry_admissible(CLASS_STAGING_LOST));
+        // the ledger still accounts the dead bytes right now...
+        let (staged, reserved) = c.metadata().wb_capacity_snapshot().unwrap();
+        assert_eq!(staged, 15, "dead bytes stay accounted");
+        assert_eq!(reserved, 0);
+        // ...and a reconcile rebuilds from disk truth (file gone)
+        assert_eq!(
+            c.wb().unwrap().reconcile_capacity_and_report().unwrap(),
+            (0, 0)
+        );
+        // no pack lifecycle was touched: no pack row exists
+        assert_eq!(c.metadata().pack_rows_debug().unwrap().len(), 0);
+    }
+
+    /// Batch arm of a length mismatch: content that no longer matches the
+    /// task declaration must not enter a pack — dead with staging-lost,
+    /// the truncated bytes stay accounted (they occupy real disk).
+    #[test]
+    fn p0d4_batch_len_mismatch_dead_letters_with_class() {
+        let c = p0d4_batch_core("len");
+        c.create("/f", 0o644).unwrap();
+        write_via_rpc(&c, "/f", b"batch len body!!", Some(0));
+        let (staging, _) = c
+            .metadata()
+            .wb_latest_staging(c.lookup("/f").unwrap().id)
+            .unwrap()
+            .unwrap();
+        // corrupt the declared size: append AFTER the task recorded 16 bytes
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&staging)
+                .unwrap();
+            std::io::Write::write_all(&mut f, b"EXTRA").unwrap();
+        }
+        c.wb().unwrap().drain_once().unwrap();
+        assert_eq!(c.wb().unwrap().queue_counts(), (0, 0, 1));
+        let rows = c.metadata().wb_task_rows().unwrap();
+        assert_eq!(rows[0].1, "dead");
+        assert_eq!(rows[0].3.as_deref(), Some(CLASS_STAGING_LOST));
+        // bytes stay accounted (21 on disk now, ledger keeps the declared 16
+        // until reconcile rebuilds from the real file)
+        let (staged, _) = c.metadata().wb_capacity_snapshot().unwrap();
+        assert_eq!(staged, 16, "declared bytes stay accounted after dead");
+        assert_eq!(
+            c.wb().unwrap().reconcile_capacity_and_report().unwrap(),
+            (21, 0),
+            "reconcile sees the REAL file (declared + corruption)"
+        );
+        assert_eq!(c.metadata().pack_rows_debug().unwrap().len(), 0);
+    }
+
+    /// Contract parity control: with batch drain enabled, a HEALTHY task
+    /// still seals into exactly one pack and drains to a full commit —
+    /// proving the dead-letter branches above did not break the happy
+    /// path or the pack lifecycle.
+    #[test]
+    fn p0d4_batch_healthy_task_seals_one_pack_and_drains() {
+        let c = p0d4_batch_core("ok");
+        c.create("/f", 0o644).unwrap();
+        write_via_rpc(&c, "/f", b"batch healthy body", Some(0));
+        c.create("/g", 0o644).unwrap();
+        write_via_rpc(&c, "/g", b"second member", Some(0));
+        assert!(c.wb().unwrap().drain_once().unwrap(), "seal happened");
+        assert_eq!(c.wb().unwrap().queue_counts(), (0, 0, 0));
+        // pack members read through the core (extent-aware); a raw GET of
+        // a pack key returns the whole pack by design
+        assert_eq!(c.read("/f", 0, 100).unwrap(), b"batch healthy body");
+        assert_eq!(c.read("/g", 0, 100).unwrap(), b"second member");
+        assert_eq!(
+            c.wb().unwrap().reconcile_capacity_and_report().unwrap(),
+            (0, 0),
+            "both members drained out of the ledger"
+        );
+        let packs = c.metadata().pack_rows_debug().unwrap();
+        assert_eq!(packs.len(), 1, "two members, ONE pack object");
+        assert_eq!(packs[0].1, "active", "the batch finalized to active");
+    }
+
+    /// P0-d.2 capability gate: a staging directory whose namespace cannot
+    /// be made durable must refuse write-back AT STARTUP with a clear
+    /// error — never a per-write surprise, never a silent success. The
+    /// fault switch stands in for a filesystem without directory-sync
+    /// support (not forceable portably on a real FS).
+    #[test]
+    fn p0d4_startup_refuses_staging_without_durable_dir_sync() {
+        let r = WriteBackEngine::new(
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            StdArc::new(MemObjectStore::new()),
+            StdArc::new(Metrics::default()),
+            &WbOptions {
+                staging_dir: std::env::temp_dir()
+                    .join(format!("lightfs-p0d4-probe-{}", tmp_unique()))
+                    .to_string_lossy()
+                    .to_string(),
+                drain_workers: 0,
+                batch_pack_bytes: 0,
+                batch_max_wait_ms: 0,
+                queue_max_tasks: 0,
+                staging_budget_bytes: 0,
+
+                ledger_lock_path: None,
+                probe_fault: true,
+            },
+            false,
+        );
+        let e = p0c2_expect_refused(r);
+        assert!(
+            format!("{e}").contains("does not support durable directory sync"),
+            "{e}"
+        );
+        // and a healthy staging dir still starts (fault cleared)
+        let eng = WriteBackEngine::new(
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            StdArc::new(MemObjectStore::new()),
+            StdArc::new(Metrics::default()),
+            &p0c2_opts(&p0c2_dir("probe-ok"), None),
+            false,
+        )
+        .expect("healthy staging dir passes the capability probe");
+        eng.stop();
+    }
+
+    /// Windows runtime arm of the directory-sync contract: opens a REAL
+    /// directory the way production does and requires FlushFileBuffers to
+    /// succeed. Executes on windows runtimes (CI / real hardware); this
+    /// macOS host cannot execute it — recorded as compile-checked +
+    /// contract-verified, runtime execution pending a windows runner.
+    #[test]
+    #[cfg(windows)]
+    fn p0d4_windows_sync_directory_flushes_a_real_directory() {
+        let dir = std::env::temp_dir().join(format!("lightfs-p0d4-windir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // must SUCCEED on NTFS: GENERIC_WRITE + FILE_FLAG_BACKUP_SEMANTICS
+        sync_directory(&dir).expect("FlushFileBuffers on a directory handle");
+        // and the old broken shape (read-only handle) must FAIL loudly,
+        // proving the permission requirement is real, not theoretical
+        use std::os::windows::fs::OpenOptionsExt;
+        let ro = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x0200_0000)
+            .open(&dir)
+            .unwrap();
+        assert!(
+            ro.sync_all().is_err(),
+            "a GENERIC_READ-only directory handle must not flush"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

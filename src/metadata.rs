@@ -350,6 +350,11 @@ pub trait MetadataStore: Send + Sync {
     fn wb_task_rows(&self) -> Result<Vec<WbTaskRowDebug>> {
         Ok(Vec::new())
     }
+    /// Test-only readback of pack rows: (key, state).
+    #[cfg(test)]
+    fn pack_rows_debug(&self) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
     fn wb_set_state(&self, id: i64, state: &str, now: i64) -> Result<()> {
         let _ = (id, state, now);
         Err(Error::Storage("write-back unsupported".into()))
