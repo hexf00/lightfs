@@ -72,3 +72,9 @@ lock_timeout_secs = 600
 ## same metadata DB fails loudly at startup; a killed holder releases the
 ## locks by itself. `lightfs gc` / `lightfs fsck` do NOT take these locks
 ## (they never stage anything) and stay usable while the server runs.
+## Both locks — and the SQLite connection itself, and the backup
+## maintenance gc.lock — key on the CANONICAL identity of the resource
+## (staging directory / database file / backup root), not the spelling you
+## pass: a symlink, a relative path or `dir/../dir` all resolve to the
+## same lock, and ambiguous identities fail at startup instead of
+## silently locking a lookalike path.

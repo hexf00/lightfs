@@ -15,13 +15,17 @@ use crate::object_store::mem::MemObjectStore;
 use rusqlite::params;
 
 fn temp_dir(tag: &str) -> PathBuf {
+    // Sequence suffix: macOS clock resolution is microseconds, and parallel
+    // tests starting together can mint identical "nanos" names (S4.3.4b.2).
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let d = std::env::temp_dir().join(format!(
-        "lightfs-p0b-{tag}-{}-{}",
+        "lightfs-p0b-{tag}-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -533,6 +537,70 @@ fn p0b_lock_is_cross_process_and_released_on_exit_and_death() {
 /// backup/gc/prune all take the SAME lock: while one holds it, the others
 /// block and then error (never silently skip). In-process half; the
 /// cross-process half is p0b_lock_is_cross_process_and_released_on_exit_and_death.
+/// S4.3.4b.2: the maintenance lock keys on the ROOT's canonical identity.
+/// A symlink spelling and a dot-path spelling of the same root collide with
+/// the absolute real path — concurrent maintenance through different
+/// spellings cannot each hold "their own" gc.lock. Symlink arm: unix only
+/// (executed on macOS and Linux; gated out on windows where symlink
+/// creation needs privileges — the portable dot-path test below still runs
+/// there).
+#[test]
+#[cfg(unix)]
+fn p0c3_maintenance_lock_symlink_alias_is_the_same_lock() {
+    let dir = temp_dir("lockalias");
+    let (root, link) = (dir.join("root"), dir.join("root-link"));
+    std::fs::create_dir_all(&root).unwrap();
+    std::os::unix::fs::symlink(&root, &link).unwrap();
+    // Held via the symlink spelling...
+    let held = MaintenanceLock::acquire(&link, 0).unwrap();
+    // ...the real path and the alias itself both collide with the SAME lock.
+    let e = MaintenanceLock::acquire(&root, 0).unwrap_err();
+    assert!(format!("{e}").contains("busy"), "{e}");
+    let e = MaintenanceLock::acquire(&link, 0).unwrap_err();
+    assert!(format!("{e}").contains("busy"), "{e}");
+    drop(held);
+    p0c3_reacquire_after_release(&root);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Portable alias arm (runs on every platform incl. windows): a dot-path
+/// spelling of the same root resolves to the same gc.lock.
+#[test]
+fn p0c3_maintenance_lock_dot_path_alias_is_the_same_lock() {
+    let dir = temp_dir("lockalias2");
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let dot = dir.join("..").join(dir.file_name().unwrap()).join("root");
+    let held = MaintenanceLock::acquire(&dot, 0).unwrap();
+    let e = MaintenanceLock::acquire(&root, 0).unwrap_err();
+    assert!(format!("{e}").contains("busy"), "{e}");
+    drop(held);
+    p0c3_reacquire_after_release(&root);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Re-acquire after a deliberate release. A short bounded wait — not
+/// `timeout 0` — because Darwin can keep a closed flock visible to the
+/// next flock for a few tens of microseconds under thread contention
+/// (observed as a spurious EAGAIN ~45µs after `close(2)` returned on the
+/// same thread); the alias-collision property itself is already proven by
+/// the busy attempts made while the lock is held, and a lock that genuinely
+/// leaked (never released) still fails this after the 2s bound.
+fn p0c3_reacquire_after_release(root: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match MaintenanceLock::acquire(root, 0) {
+            Ok(_) => return,
+            Err(e) => {
+                if std::time::Instant::now() >= deadline {
+                    panic!("lock not reacquired after release: {e}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+}
+
 #[test]
 fn p0b_backup_gc_prune_share_one_exclusive_lock() {
     let dir = temp_dir("shelock");

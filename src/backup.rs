@@ -73,17 +73,22 @@ pub struct MaintenanceLock {
 impl MaintenanceLock {
     /// Block until the lock is acquired or `timeout` elapses. The lock file
     /// itself is a stable path inside the root — locking is provided by the
-    /// OS, not by create-new marker semantics.
+    /// OS, not by create-new marker semantics. The lock keys on the ROOT's
+    /// canonical identity (S4.3.4b.2): `gc`, `backup` and `backup prune`
+    /// spellings of the same root — relative, absolute or through a
+    /// symlink — resolve to one `gc.lock`.
     pub fn acquire(root: &Path, timeout_secs: u64) -> Result<Self> {
         std::fs::create_dir_all(root).map_err(|e| {
             Error::Config(format!("cannot create backup root {}: {e}", root.display()))
         })?;
+        let identity = crate::fslock::canonical_identity(root, "backup root")?;
+        let lock_path = identity.join(LOCK_NAME);
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .read(true)
-            .open(root.join(LOCK_NAME))
+            .open(&lock_path)
             .map_err(|e| Error::Config(format!("cannot open maintenance lock: {e}")))?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
         loop {
@@ -94,7 +99,7 @@ impl MaintenanceLock {
                 return Err(Error::Config(format!(
                     "maintenance lock {} busy: another backup/gc/prune holds it \
                      (waited {timeout_secs}s); refusing to proceed",
-                    root.join(LOCK_NAME).display()
+                    lock_path.display()
                 )));
             }
             std::thread::sleep(std::time::Duration::from_millis(20));

@@ -107,6 +107,26 @@ pub(crate) fn try_lock_raw(file: &File) -> bool {
     }
 }
 
+/// Resolve a resource (staging directory, database file, backup root) to
+/// its canonical filesystem identity: absolute, symlink-free, spelling-
+/// independent. Every lock that guards the resource is derived from THIS
+/// path, so two spellings of the same resource — relative vs absolute, or
+/// through a symlink — compute the same lock and cannot both be taken.
+///
+/// `fs::canonicalize` fails when the path does not exist; callers therefore
+/// create the resource first (staging dir, db file, backup root all are),
+/// and any failure is a hard error — never a fall back to raw string
+/// identities.
+pub(crate) fn canonical_identity(path: &Path, what: &str) -> Result<std::path::PathBuf> {
+    std::fs::canonicalize(path).map_err(|e| {
+        Error::Config(format!(
+            "cannot resolve the identity of {what} {}: {e} — refusing to \
+             derive a lock from an ambiguous path",
+            path.display()
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,7 +147,21 @@ mod tests {
         );
         assert!(format!("{err}").contains("pid "), "{err}");
         drop(l1);
-        FileLock::try_acquire(&path).unwrap();
+        // Bounded retry, not a single shot: Darwin can keep a closed flock
+        // visible to the next flock for a few tens of microseconds under
+        // thread contention; a genuinely leaked lock still fails the bound.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match FileLock::try_acquire(&path) {
+                Ok(_) => break,
+                Err(e) => {
+                    if std::time::Instant::now() >= deadline {
+                        panic!("lock not reacquired after release: {e}");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

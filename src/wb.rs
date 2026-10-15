@@ -157,14 +157,20 @@ impl WriteBackEngine {
         // (die with the process) and held for THIS struct's lifetime, so a
         // second engine fails loudly while the first is alive and can start
         // cleanly once it is gone. Acquired BEFORE any recover/reconcile.
-        let staging_path = Path::new(&opts.staging_dir).join("engine.lock");
-        let staging_lock = crate::fslock::FileLock::try_acquire(&staging_path).map_err(|e| {
-            Error::Config(format!(
-                "write-back staging directory {} is already owned by a live engine \
-                 (only one engine may own a staging directory and its capacity ledger): {e}",
-                opts.staging_dir
-            ))
-        })?;
+        let staging_identity = crate::fslock::canonical_identity(
+            Path::new(&opts.staging_dir),
+            "write-back staging directory",
+        )?;
+        let staging_lock =
+            crate::fslock::FileLock::try_acquire(&staging_identity.join("engine.lock")).map_err(
+                |e| {
+                    Error::Config(format!(
+                        "write-back staging directory {} is already owned by a live engine \
+                         (only one engine may own a staging directory and its capacity ledger): {e}",
+                        opts.staging_dir
+                    ))
+                },
+            )?;
         let ledger_lock = match &opts.ledger_lock_path {
             Some(p) => Some(
                 crate::fslock::FileLock::try_acquire(Path::new(p)).map_err(|e| {
@@ -1172,15 +1178,28 @@ mod tests {
     use crate::object_store::mem::MemObjectStore;
     use std::collections::HashSet;
     use std::sync::Arc as StdArc;
+    use std::sync::atomic::AtomicU64;
+
+    /// macOS SystemTime has microsecond real resolution (`as_nanos()` is
+    /// microseconds x 1000), so parallel tests starting together can build
+    /// identical "nanos" names and collide on the same temp dir — observed
+    /// as flaky lock-busy errors on gc.lock/engine.lock. A per-process
+    /// sequence makes every temp dir unique regardless of clock ticks.
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn tmp_unique() -> u128 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        (nanos << 8) | TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u128
+    }
 
     fn wb_core(tag: &str) -> Core {
         let dir = std::env::temp_dir().join(format!(
             "lightfs-wb-{tag}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            tmp_unique()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         Core::with_options(
@@ -1340,10 +1359,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "lightfs-wbb-{tag}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            tmp_unique()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         Core::with_options(
@@ -1549,10 +1565,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "lightfs-wbf-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            tmp_unique()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let store = StdArc::new(FlakyThenOk {
@@ -1774,10 +1787,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "lightfs-wbrec-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            tmp_unique()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("meta.db");
@@ -1928,10 +1938,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "lightfs-wborder-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            tmp_unique()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let store = StdArc::new(SlowFirstPut {
@@ -2017,10 +2024,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "lightfs-wbsame-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            tmp_unique()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let c = Core::with_options(
@@ -2127,10 +2131,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "lightfs-wb-recover-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            tmp_unique()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let opts = WbOptions {
@@ -2196,10 +2197,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "lightfs-wb-p0a1-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            tmp_unique()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let opts = WbOptions {
@@ -2796,7 +2794,7 @@ mod tests {
 
     /// `.unwrap_err()` needs the Ok type to be Debug (the engine is not);
     /// match the refusal out instead.
-    fn p0c2_expect_refused(r: Result<WriteBackEngine>) -> Error {
+    fn p0c2_expect_refused<T>(r: Result<T>) -> Error {
         match r {
             Ok(_) => panic!("second engine must be refused while the first is live"),
             Err(e) => e,
@@ -2807,10 +2805,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "lightfs-p0c2-{tag}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            tmp_unique()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("staging")).unwrap();
@@ -3016,14 +3011,26 @@ mod tests {
         // SIGKILL the holder: the kernel drops the lock immediately.
         let _ = guard.0.kill();
         let _ = guard.0.wait();
-        let eng = WriteBackEngine::new(
-            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
-            StdArc::new(MemObjectStore::new()),
-            StdArc::new(Metrics::default()),
-            &p0c2_opts(&staging, None),
-            false,
-        )
-        .unwrap();
+        // Bounded retry (2s): kernel lock release can stay invisible for a
+        // few tens of microseconds; a lock that never released still fails.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let eng = loop {
+            match WriteBackEngine::new(
+                StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+                StdArc::new(MemObjectStore::new()),
+                StdArc::new(Metrics::default()),
+                &p0c2_opts(&staging, None),
+                false,
+            ) {
+                Ok(eng) => break eng,
+                Err(e) => {
+                    if std::time::Instant::now() >= deadline {
+                        panic!("staging lock not reacquired after holder death: {e}");
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        };
         assert_eq!(
             eng.reconcile_capacity_and_report().unwrap(),
             (0, 0),
@@ -3055,5 +3062,261 @@ mod tests {
         loop {
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    // ---- S4.3.4b.2: lock identity canonicalization (path aliases) ---------
+
+    /// A: the staging lock keys on the directory's CANONICAL identity.
+    /// Engine 1 holds it via the real absolute path; engine 2 through a
+    /// symlink to the same directory is refused; after engine 1 exits the
+    /// symlink spelling starts cleanly. Symlinks: unix (executed on macOS
+    /// and Linux; gated out on windows where creation needs privileges).
+    #[test]
+    #[cfg(unix)]
+    fn p0c3_staging_symlink_alias_refused() {
+        let dir = p0c2_dir("alias");
+        let real = dir.join("staging-real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.join("staging-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let eng = WriteBackEngine::new(
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            StdArc::new(MemObjectStore::new()),
+            StdArc::new(Metrics::default()),
+            &p0c2_opts(&real, None),
+            false,
+        )
+        .unwrap();
+        let e = p0c2_expect_refused(WriteBackEngine::new(
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            StdArc::new(MemObjectStore::new()),
+            StdArc::new(Metrics::default()),
+            &p0c2_opts(&link, None),
+            false,
+        ));
+        assert!(format!("{e}").contains("staging directory"), "{e}");
+        drop(eng);
+        // Bounded retry (2s) — see p0c2: kernel lock release after a close
+        // can stay invisible for a few tens of microseconds.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let eng2 = loop {
+            match WriteBackEngine::new(
+                StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+                StdArc::new(MemObjectStore::new()),
+                StdArc::new(Metrics::default()),
+                &p0c2_opts(&link, None),
+                false,
+            ) {
+                Ok(eng) => break eng,
+                Err(e) => {
+                    if std::time::Instant::now() >= deadline {
+                        panic!("staging lock not reacquired after drop: {e}");
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        };
+        assert_eq!(
+            eng2.reconcile_capacity_and_report().unwrap(),
+            (0, 0),
+            "the alias spelling owns the directory once the holder exits"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A, relative-vs-absolute: a CHILD PROCESS takes the lock via the
+    /// RELATIVE spelling (it chdir's first); the parent is refused through
+    /// both the absolute real path and the symlink — one canonical lock.
+    /// After the child is SIGKILLed, the parent starts via the symlink.
+    #[test]
+    #[cfg(unix)]
+    fn p0c3_relative_spelling_holds_the_same_lock_cross_process() {
+        let dir = p0c2_dir("relalias");
+        let real = dir.join("staging-real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.join("staging-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let ready = dir.join("child.ready");
+        let exe = std::env::current_exe().unwrap();
+        let child = std::process::Command::new(&exe)
+            .args(["p0c3_lock_child_helper_relative", "--nocapture"])
+            .env("LIGHTFS_P0C3_CHILD_DIR", &dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        struct Guard(std::process::Child);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut guard = Guard(child);
+        let mut waited = 0u32;
+        while !ready.exists() && waited < 10_000 {
+            std::thread::sleep(Duration::from_millis(20));
+            waited += 20;
+        }
+        assert!(
+            ready.exists(),
+            "child never acquired the lock (relative spelling)"
+        );
+        let e = p0c2_expect_refused(WriteBackEngine::new(
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            StdArc::new(MemObjectStore::new()),
+            StdArc::new(Metrics::default()),
+            &p0c2_opts(&link, None),
+            false,
+        ));
+        assert!(format!("{e}").contains("staging directory"), "{e}");
+        let _ = guard.0.kill();
+        let _ = guard.0.wait();
+        // Bounded retry (2s) — see p0c2: kernel lock release after the
+        // holder's death can stay invisible for a few tens of microseconds.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let eng = loop {
+            match WriteBackEngine::new(
+                StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+                StdArc::new(MemObjectStore::new()),
+                StdArc::new(Metrics::default()),
+                &p0c2_opts(&link, None),
+                false,
+            ) {
+                Ok(eng) => break eng,
+                Err(e) => {
+                    if std::time::Instant::now() >= deadline {
+                        panic!("staging lock not reacquired after holder death: {e}");
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        };
+        assert_eq!(
+            eng.reconcile_capacity_and_report().unwrap(),
+            (0, 0),
+            "clean start after the relative-spelling holder died"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Helper for `p0c3_relative_spelling_holds_the_same_lock_cross_process`:
+    /// chdir's into the given dir and locks the staging dir by its RELATIVE
+    /// name. No-op without the env var.
+    #[test]
+    fn p0c3_lock_child_helper_relative() {
+        let Some(dir) = std::env::var_os("LIGHTFS_P0C3_CHILD_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        std::env::set_current_dir(&dir).expect("child chdir");
+        let _engine = WriteBackEngine::new(
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            StdArc::new(MemObjectStore::new()),
+            StdArc::new(Metrics::default()),
+            &p0c2_opts(Path::new("staging-real"), None),
+            false,
+        )
+        .expect("child takes the lock via the relative spelling");
+        std::fs::write(dir.join("child.ready"), b"lock held").unwrap();
+        loop {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// B: the ledger lock AND the SQLite connection key on the DATABASE
+    /// FILE's canonical identity. A dot-path alias and (unix) a symlink
+    /// both resolve to the real file: `db_path()` reports the canonical
+    /// path, the -wal sidecar lands beside the real file and never beside
+    /// the alias, and a second engine through the alias with a different
+    /// staging dir is refused by the LEDGER lock. Alias spellings start
+    /// cleanly once the real-path engine exits.
+    #[test]
+    fn p0c3_db_alias_one_identity_one_ledger() {
+        let dir = p0c2_dir("dbalias");
+        let db = dir.join("m.db");
+        let dot = dir.join("..").join(dir.file_name().unwrap()).join("m.db");
+        // 1) the connection itself opens the canonical identity
+        let meta = SqliteMetadataStore::open(&dot.to_string_lossy()).unwrap();
+        let canonical = meta.db_path().unwrap().to_path_buf();
+        assert_eq!(
+            canonical,
+            std::fs::canonicalize(&db).unwrap(),
+            "a dot-path spelling resolves to the real file identity"
+        );
+        meta.create_node(1, "f", crate::metadata::NodeKind::File, 0o644, None)
+            .unwrap();
+        assert!(
+            canonical.with_file_name("m.db-wal").exists(),
+            "the -wal sidecar is anchored at the canonical name"
+        );
+        drop(meta);
+        // 2) unix: a symlink entry resolves to the same identity and NEVER
+        //    produces its own sidecar stream beside the same file.
+        #[cfg(unix)]
+        {
+            let link = dir.join("m-link.db");
+            std::os::unix::fs::symlink(&db, &link).unwrap();
+            let meta2 = SqliteMetadataStore::open(&link.to_string_lossy()).unwrap();
+            assert_eq!(
+                meta2.db_path().unwrap(),
+                std::fs::canonicalize(&db).unwrap()
+            );
+            meta2
+                .create_node(1, "g", crate::metadata::NodeKind::File, 0o644, None)
+                .unwrap();
+            assert!(
+                canonical.with_file_name("m.db-wal").exists(),
+                "writes through the alias land in the canonical WAL stream"
+            );
+            assert!(
+                !dir.join("m-link.db-wal").exists(),
+                "no second WAL stream may appear under the alias name"
+            );
+            drop(meta2);
+        }
+        // 3) the engine's ledger lock derives from the same identity:
+        //    engine 1 via the real path, second engine via the alias with a
+        //    DIFFERENT staging dir — refused by the ledger axis.
+        let cfg_for = |path: &Path, staging: &Path| {
+            let mut cfg = crate::config::Config::load_or_defaults(None).unwrap();
+            cfg.metadata.path = path.to_string_lossy().to_string();
+            cfg.commit.mode = "writeback".into();
+            cfg.writeback.staging_dir = staging.to_string_lossy().to_string();
+            cfg
+        };
+        let eng = crate::engine::open_embedded_mem(&cfg_for(&db, &dir.join("s1"))).unwrap();
+        let alias = {
+            #[cfg(unix)]
+            {
+                dir.join("m-link.db")
+            }
+            #[cfg(not(unix))]
+            {
+                dot
+            }
+        };
+        let e = p0c2_expect_refused(crate::engine::open_embedded_mem(&cfg_for(
+            &alias,
+            &dir.join("s2"),
+        )));
+        assert!(format!("{e}").contains("capacity ledger"), "{e}");
+        // Graceful engine exit: stop the drain worker (it holds an Arc of
+        // the engine, so a bare drop would keep the locks in-process for up
+        // to its 200ms park), then drop and wait for the kernel locks to
+        // actually re-acquire.
+        eng.core.wb().unwrap().stop();
+        drop(eng);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let _eng2 = loop {
+            match crate::engine::open_embedded_mem(&cfg_for(&alias, &dir.join("s2"))) {
+                Ok(e) => break e,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                Err(e) => panic!("alias engine never started after the first exited: {e}"),
+            }
+        };
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap().join(dir.file_name().unwrap()));
     }
 }

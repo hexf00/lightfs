@@ -20,6 +20,9 @@ use crate::metadata::{GcDeletion, MetadataStore, Node, NodeKind};
 
 pub struct SqliteMetadataStore {
     conn: Mutex<Connection>,
+    /// The canonical filesystem identity this connection actually uses
+    /// (S4.3.4b.2); `None` for `:memory:`.
+    db_path: Option<std::path::PathBuf>,
 }
 
 const SCHEMA: &str = r#"
@@ -345,7 +348,32 @@ impl SqliteMetadataStore {
     /// ENGINE recorded (see [`Self::database_matches_current_schema`]),
     /// not on the stored SQL text.
     pub fn open(path: &str) -> Result<Self> {
-        let conn = Connection::open(path)?;
+        // S4.3.4b.2: open the CANONICAL identity of the database file, so
+        // the connection, the -wal/-shm sidecars and the ledger lock
+        // derived from this path all key on one resource — opening through
+        // a symlink or a different spelling can no longer produce a second
+        // WAL stream beside the same file. `:memory:` has no filesystem
+        // identity and keeps today's behavior.
+        let db_identity = if path == ":memory:" {
+            None
+        } else {
+            let p = std::path::Path::new(path);
+            // The file must exist for its identity to be resolvable; SQLite
+            // would create it anyway (same empty-file start state).
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(p)
+                .map_err(|e| {
+                    Error::Storage(format!("cannot create metadata database {path}: {e}"))
+                })?;
+            Some(crate::fslock::canonical_identity(p, "metadata database")?)
+        };
+        let conn = match &db_identity {
+            None => Connection::open(path)?,
+            Some(canonical) => Connection::open(canonical)?,
+        };
         if any_known_table(&conn)? && !Self::database_matches_current_schema(&conn)? {
             return Err(Error::Storage(
                 "database schema predates the current schema (AUTOINCREMENT id \
@@ -370,7 +398,14 @@ impl SqliteMetadataStore {
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
+            db_path: db_identity,
         })
+    }
+
+    /// The canonical database file path this connection uses (the lock
+    /// identity and the -wal/-shm sidecar anchor); `None` for `:memory:`.
+    pub fn db_path(&self) -> Option<&std::path::Path> {
+        self.db_path.as_deref()
     }
 
     /// Definition-level contract for an EXISTING database — it reads what

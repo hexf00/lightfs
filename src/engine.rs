@@ -78,6 +78,14 @@ fn build_core(
         None
     };
     let wb = if enable_wb && cfg.commit.mode == "writeback" {
+        // The ledger lock keys on the DATABASE FILE's canonical identity
+        // (S4.3.4b.2): the store was opened above, so the file exists and
+        // its symlink-free absolute path is resolvable. Two configs sharing
+        // one DB — through any spelling — derive the same lock.
+        let db_identity = crate::fslock::canonical_identity(
+            std::path::Path::new(&cfg.metadata.path),
+            "metadata database",
+        )?;
         Some(crate::wb::WbOptions {
             staging_dir: cfg.writeback.staging_dir.clone(),
             drain_workers: cfg.writeback.drain_workers,
@@ -85,10 +93,7 @@ fn build_core(
             batch_max_wait_ms: cfg.writeback.batch_max_wait_ms,
             queue_max_tasks: cfg.writeback.queue_max_tasks,
             staging_budget_bytes: cfg.writeback.staging_budget_bytes,
-            // P0-c supplement: ledger lock anchored next to the SQLite file,
-            // so two configs sharing one DB but not the staging dir also
-            // refuse the second engine.
-            ledger_lock_path: Some(format!("{}.engine-lock", cfg.metadata.path)),
+            ledger_lock_path: Some(format!("{}.engine-lock", db_identity.display())),
         })
     } else {
         None
