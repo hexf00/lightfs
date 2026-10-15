@@ -49,3 +49,20 @@ superseded_secs = 604800
 # How long gc waits for the inter-process maintenance lock (gc.lock) before
 # giving up. A crashed holder releases it automatically (OS-level flock).
 lock_timeout_secs = 600
+
+# Write-back (EXPLICIT opt-in; "strict" commit mode stays the default and
+# is untouched by any of this). Deferred writes stage server-side and drain
+# in the background.
+#[commit]
+#mode = "writeback"
+#[writeback]
+#staging_dir = "./staging"
+#drain_workers = 1
+#batch_pack_bytes = 8388608
+## P0-c staging capacity ceiling for staged_bytes + reserved_bytes.
+## 0 = unbounded (historical behavior). When set, a write that cannot
+## reserve its bytes fails with "capacity-exhausted"; staged data is never
+## evicted (dead tasks and orphan files keep occupying their bytes until
+## physically removed, and a restart re-derives the ledger from the real
+## staging files).
+#staging_budget_bytes = 0

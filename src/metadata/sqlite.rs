@@ -75,6 +75,11 @@ CREATE TABLE IF NOT EXISTS gc_deletions (
     last_error TEXT,
     updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS wb_capacity (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    staged_bytes INTEGER NOT NULL DEFAULT 0,
+    reserved_bytes INTEGER NOT NULL DEFAULT 0
+);
 "#;
 
 /// S4.2.1 single-schema contract: every table and column this build
@@ -83,7 +88,7 @@ CREATE TABLE IF NOT EXISTS gc_deletions (
 /// database missing any piece predates this schema and is rejected at open
 /// (re-initialize the store instead); a fresh database simply gets all of
 /// it from `SCHEMA`.
-const REQUIRED_TABLE_COLUMNS: [(&str, &[&str]); 5] = [
+const REQUIRED_TABLE_COLUMNS: [(&str, &[&str]); 6] = [
     (
         "nodes",
         &[
@@ -136,6 +141,7 @@ const REQUIRED_TABLE_COLUMNS: [(&str, &[&str]); 5] = [
             "updated_at",
         ],
     ),
+    ("wb_capacity", &["id", "staged_bytes", "reserved_bytes"]),
 ];
 
 /// Column names of `table`; empty when the table does not exist.
@@ -1191,7 +1197,7 @@ impl MetadataStore for SqliteMetadataStore {
         size: i64,
         expected: i64,
         now: i64,
-    ) -> Result<(i64, Option<String>)> {
+    ) -> Result<(i64, Option<(String, i64)>)> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let version: Option<String> = tx
@@ -1208,16 +1214,16 @@ impl MetadataStore for SqliteMetadataStore {
         // Coalesce only a strictly newer expected version (same writer
         // lineage). An equal expected means another writer aiming at the
         // same base: it queues separately and the CAS at drain decides.
-        let existing: Option<(i64, i64, String)> = tx
+        let existing: Option<(i64, i64, String, i64)> = tx
             .query_row(
-                "SELECT id, expected, staging FROM wb_tasks \
+                "SELECT id, expected, staging, size FROM wb_tasks \
                  WHERE node_id = ?1 AND state = 'queued' ORDER BY id LIMIT 1",
                 params![node_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
         let mut replaced = None;
-        if let Some((id, task_expected, old_staging)) = existing {
+        if let Some((id, task_expected, old_staging, old_size)) = existing {
             if expected > task_expected {
                 // Coalesce CONTENT only. The task's `expected` stays at the
                 // committed anchor the first flush observed: the drain's
@@ -1230,7 +1236,7 @@ impl MetadataStore for SqliteMetadataStore {
                      updated_at = ?4 WHERE id = ?1",
                     params![id, staging, size, now],
                 )?;
-                replaced = Some(old_staging);
+                replaced = Some((old_staging, old_size));
             }
         }
         if replaced.is_none() {
@@ -1241,6 +1247,21 @@ impl MetadataStore for SqliteMetadataStore {
             )
             .map_err(|e| map_constraint(e, || Error::Storage("wb insert".into())))?;
         }
+        // P0-c: the write's reservation becomes staged accounting in THIS
+        // transaction — the durability boundary (sync_all) has already
+        // passed before enqueue, so disk occupancy and the ledger move
+        // together (invariant 3). The replaced file's bytes stay counted
+        // until its physical delete succeeds (invariant 4).
+        tx.execute(
+            "INSERT INTO wb_capacity (id, staged_bytes, reserved_bytes) VALUES (1, 0, 0) \
+             ON CONFLICT(id) DO NOTHING",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE wb_capacity SET staged_bytes = staged_bytes + ?1, \
+             reserved_bytes = MAX(reserved_bytes - ?1, 0) WHERE id = 1",
+            params![size],
+        )?;
         let pending: i64 = tx.query_row(
             "SELECT COUNT(*) FROM wb_tasks WHERE node_id = ?1 AND state IN ('queued','draining')",
             params![node_id],
@@ -1450,13 +1471,16 @@ impl MetadataStore for SqliteMetadataStore {
         }
     }
 
-    fn wb_cancel_queued(&self, node_id: i64) -> Result<Vec<String>> {
+    fn wb_cancel_queued(&self, node_id: i64) -> Result<Vec<(String, i64)>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let mut stmt =
-            tx.prepare("SELECT staging FROM wb_tasks WHERE node_id = ?1 AND state = 'queued'")?;
-        let paths: Vec<String> = stmt
-            .query_map(params![node_id], |r| r.get::<_, String>(0))?
+        let mut stmt = tx.prepare(
+            "SELECT staging, size FROM wb_tasks WHERE node_id = ?1 AND state = 'queued'",
+        )?;
+        let paths: Vec<(String, i64)> = stmt
+            .query_map(params![node_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?
             .collect::<rusqlite::Result<_>>()?;
         drop(stmt);
         tx.execute(
@@ -1484,6 +1508,101 @@ impl MetadataStore for SqliteMetadataStore {
             }
         }
         Ok((q, d, dead))
+    }
+
+    // ---- P0-c staging capacity accounting (S4 §3.D) ----
+    // Every mutation is a single immediate transaction on the one-row
+    // ledger, so concurrent writers serialize and the admission predicate
+    // cannot be raced (invariant 2).
+
+    fn wb_capacity_reserve(&self, bytes: i64, budget: i64) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO wb_capacity (id, staged_bytes, reserved_bytes) VALUES (1, 0, 0) \
+             ON CONFLICT(id) DO NOTHING",
+            [],
+        )?;
+        let (staged, reserved): (i64, i64) = tx.query_row(
+            "SELECT staged_bytes, reserved_bytes FROM wb_capacity WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if budget > 0 && staged + reserved + bytes > budget {
+            return Err(Error::Capacity(format!(
+                "staging budget {budget}B exhausted: staged {staged}B + reserved {reserved}B + requested {bytes}B"
+            )));
+        }
+        tx.execute(
+            "UPDATE wb_capacity SET reserved_bytes = reserved_bytes + ?1 WHERE id = 1",
+            params![bytes],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn wb_release_reserved(&self, bytes: i64) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO wb_capacity (id, staged_bytes, reserved_bytes) VALUES (1, 0, 0) \
+             ON CONFLICT(id) DO NOTHING",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE wb_capacity SET reserved_bytes = MAX(reserved_bytes - ?1, 0) WHERE id = 1",
+            params![bytes],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn wb_release_staged(&self, bytes: i64) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO wb_capacity (id, staged_bytes, reserved_bytes) VALUES (1, 0, 0) \
+             ON CONFLICT(id) DO NOTHING",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE wb_capacity SET staged_bytes = MAX(staged_bytes - ?1, 0) WHERE id = 1",
+            params![bytes],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn wb_capacity_snapshot(&self) -> Result<(i64, i64)> {
+        let conn = self.conn.lock().unwrap();
+        match conn.query_row(
+            "SELECT staged_bytes, reserved_bytes FROM wb_capacity WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ) {
+            Ok(v) => Ok(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok((0, 0)),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn wb_reconcile_capacity(&self, on_disk: &[(String, i64)]) -> Result<(i64, i64)> {
+        let total: i64 = on_disk.iter().map(|(_, sz)| sz).sum();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO wb_capacity (id, staged_bytes, reserved_bytes) VALUES (1, 0, 0) \
+             ON CONFLICT(id) DO NOTHING",
+            [],
+        )?;
+        // Leftover reservations die with the process that made them: the
+        // rebuild reflects ONLY real files (invariant 8).
+        tx.execute(
+            "UPDATE wb_capacity SET staged_bytes = ?1, reserved_bytes = 0 WHERE id = 1",
+            params![total],
+        )?;
+        tx.commit()?;
+        Ok((total, 0))
     }
 }
 

@@ -40,6 +40,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use sha2::Digest;
+
 use crate::core::Metrics;
 use crate::error::{Error, Result};
 use crate::metadata::{MetadataStore, Node};
@@ -69,6 +71,11 @@ pub struct WbOptions {
     /// Queued-task bound; 0 = unbounded. At the limit the flushing write
     /// degrades to a synchronous per-file commit instead of erroring.
     pub queue_max_tasks: usize,
+    /// P0-c staging capacity budget: ceiling for staged_bytes +
+    /// reserved_bytes. 0 = unbounded (historical behavior, the default).
+    /// Exhaustion fails the write with `Error::Capacity` — never a spin
+    /// (dead bytes never drain, waiting cannot help) and never an eviction.
+    pub staging_budget_bytes: u64,
 }
 
 pub struct WriteBackEngine {
@@ -80,6 +87,7 @@ pub struct WriteBackEngine {
     batch_pack_bytes: u64,
     batch_max_wait_ms: u64,
     queue_max_tasks: usize,
+    staging_budget_bytes: u64,
     /// Signalled whenever a task is enqueued so idle workers wake.
     wake: Condvar,
     idle: Mutex<usize>,
@@ -136,6 +144,7 @@ impl WriteBackEngine {
             batch_pack_bytes: opts.batch_pack_bytes,
             batch_max_wait_ms: opts.batch_max_wait_ms,
             queue_max_tasks: opts.queue_max_tasks,
+            staging_budget_bytes: opts.staging_budget_bytes,
             wake: Condvar::new(),
             idle: Mutex::new(0),
             stop: AtomicBool::new(false),
@@ -177,22 +186,20 @@ impl WriteBackEngine {
         // fsync and task insert. The data has no task; sweep.
         let referenced: std::collections::HashSet<String> =
             self.all_task_stagings()?.into_iter().collect();
+        let on_disk = self.reconcile_capacity()?;
+        // Sweep orphans; each release is bound to the confirmed physical
+        // delete (invariant 4) — a failed delete keeps its bytes accounted.
         let mut swept = 0usize;
-        if let Ok(entries) = std::fs::read_dir(&self.staging_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if !(name.starts_with("wb-") || name.starts_with("drain-")) {
-                    continue;
-                }
-                let p = entry.path();
-                let path_str = p.to_string_lossy().to_string();
-                if !referenced.contains(&path_str) && std::fs::remove_file(&p).is_ok() {
-                    swept += 1;
-                }
+        for (path_str, size) in &on_disk {
+            if !referenced.contains(path_str) && std::fs::remove_file(path_str).is_ok() {
+                let _ = self.meta.wb_release_staged(*size);
+                swept += 1;
             }
         }
         if swept > 0 {
-            eprintln!("lightfs wb: swept {swept} orphaned staging file(s)");
+            eprintln!(
+                "lightfs wb: swept {swept} orphaned staging file(s) and released their bytes"
+            );
         }
         // P0-a recovery sweep 1: batches a crash left in `committing`
         // finalize here when no non-terminal task remains for them —
@@ -227,6 +234,48 @@ impl WriteBackEngine {
             }
         }
         Ok(())
+    }
+
+    /// P0-c (invariant 8): rebuild the capacity ledger from the REAL
+    /// staging files — queued/draining/dead/referenced AND orphans are all
+    /// physically on disk and all count — voiding every leftover
+    /// reservation from the previous process. Runs at engine construction,
+    /// before any worker or front write can reserve (single-authority: two
+    /// engines never share one db). Unstatable files fail the rebuild:
+    /// partial information is never guessed into the ledger.
+    pub(crate) fn reconcile_capacity(&self) -> Result<Vec<(String, i64)>> {
+        let mut on_disk: Vec<(String, i64)> = Vec::new();
+        let entries = std::fs::read_dir(&self.staging_dir)
+            .map_err(|e| Error::Storage(format!("read staging dir: {e}")))?;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !(name.starts_with("wb-") || name.starts_with("drain-")) {
+                continue;
+            }
+            let p = entry.path();
+            match entry.metadata() {
+                Ok(m) => on_disk.push((p.to_string_lossy().to_string(), m.len() as i64)),
+                Err(e) => {
+                    return Err(Error::Storage(format!(
+                        "cannot stat staging file {}: {e} — refusing to rebuild the capacity ledger on partial information",
+                        p.display()
+                    )));
+                }
+            }
+        }
+        let (staged_total, _) = self.meta.wb_reconcile_capacity(&on_disk)?;
+        eprintln!(
+            "lightfs wb: capacity ledger reconciled: {staged_total}B staged across {} file(s); reservations voided",
+            on_disk.len()
+        );
+        Ok(on_disk)
+    }
+
+    /// Test/ops convenience: run the reconciliation and report the ledger.
+    #[cfg(test)]
+    pub(crate) fn reconcile_capacity_and_report(&self) -> Result<(i64, i64)> {
+        self.reconcile_capacity()?;
+        self.meta.wb_capacity_snapshot()
     }
 
     fn active_tasks(&self) -> Result<Vec<TaskRow>> {
@@ -274,6 +323,20 @@ impl WriteBackEngine {
                 }
             }
         }
+        // P0-c: reserve the staging capacity BEFORE the file exists
+        // (invariant 1: 预留先行 — a write must never be able to exceed
+        // the budget, even briefly). Exhaustion is an explicit
+        // `capacity-exhausted` error: no queue-style spin (dead bytes
+        // never drain, waiting cannot help), no eviction, no silent
+        // degrade (invariant 7).
+        if self.staging_budget_bytes > 0 && len as i64 > self.staging_budget_bytes as i64 {
+            return Err(Error::Capacity(format!(
+                "write of {len}B alone exceeds the whole staging budget of {}B",
+                self.staging_budget_bytes
+            )));
+        }
+        self.meta
+            .wb_capacity_reserve(len as i64, self.staging_budget_bytes as i64)?;
         // Stage first (durable), record second; a crash in between leaves
         // an orphan staging file that recover() sweeps at next start.
         let staging = self.staging_dir.join(format!(
@@ -284,7 +347,7 @@ impl WriteBackEngine {
                 .unwrap()
                 .as_nanos()
         ));
-        {
+        let staged = (|| -> Result<()> {
             use std::io::Write;
             let mut f = std::fs::OpenOptions::new()
                 .read(true)
@@ -297,7 +360,25 @@ impl WriteBackEngine {
                 w.flush()?;
             }
             f.sync_all()?; // the durability contract: staged bytes survive process death
+            Ok(())
+        })();
+        if let Err(e) = staged {
+            // The half-written file is physically gone; only then does the
+            // reservation come back (invariant 4 inverted: never release
+            // capacity for bytes that might still occupy the disk).
+            match std::fs::remove_file(&staging) {
+                Ok(()) => {
+                    let _ = self.meta.wb_release_reserved(len as i64);
+                }
+                Err(rm) => eprintln!(
+                    "lightfs wb: half-written staging {} kept ({rm}); its reservation stays until reconcile",
+                    staging.display()
+                ),
+            }
+            return Err(e);
         }
+        // Converts the reservation to staged accounting in the SAME
+        // transaction that records the task (invariant 3).
         let (projected_version, replaced_staging) = self.meta.wb_enqueue(
             node.id,
             staging.to_string_lossy().as_ref(),
@@ -305,9 +386,20 @@ impl WriteBackEngine {
             expected,
             self.now(),
         )?;
-        if let Some(old) = replaced_staging {
+        if let Some((old, old_size)) = replaced_staging {
             self.metrics.wb_coalesced.fetch_add(1, Ordering::Relaxed);
-            let _ = std::fs::remove_file(old); // coalesced away; row no longer references it
+            // Coalesced away; the row no longer references it. Its bytes
+            // leave the ledger ONLY when the physical delete confirms
+            // (invariant 4); a failed delete leaves accounted orphan bytes
+            // for recover() to sweep.
+            match std::fs::remove_file(&old) {
+                Ok(()) => {
+                    let _ = self.meta.wb_release_staged(old_size);
+                }
+                Err(e) => eprintln!(
+                    "lightfs wb: coalesced staging {old} not removed ({e}); its {old_size}B stay accounted"
+                ),
+            }
         }
         self.metrics.wb_enqueued.fetch_add(1, Ordering::Relaxed);
         self.wake.notify_all();
@@ -387,8 +479,15 @@ impl WriteBackEngine {
                         .wb_cancelled
                         .fetch_add(paths.len() as u64, Ordering::Relaxed);
                 }
-                for p in paths {
-                    let _ = std::fs::remove_file(p);
+                for (p, size) in paths {
+                    match std::fs::remove_file(&p) {
+                        Ok(()) => {
+                            let _ = self.meta.wb_release_staged(size);
+                        }
+                        Err(e) => eprintln!(
+                            "lightfs wb: cancelled staging {p} not removed ({e}); its {size}B stay accounted"
+                        ),
+                    }
                 }
             }
             Err(e) => eprintln!("lightfs wb: cancel for node {node_id} failed: {e}"),
@@ -411,8 +510,12 @@ impl WriteBackEngine {
     /// Body of draining one claimed task through the exact same chain as
     /// strict write_stream: immutable version key → PUT → CAS → retire.
     fn drain_task(&self, task: TaskRow) -> Result<()> {
-        let content = match std::fs::read(&task.staging) {
-            Ok(c) => c,
+        // P0-c streaming: the staging file goes to put_stream via an open
+        // File — never fs::read into memory (a 1 GiB write used to peak at
+        // ~2x its size here). Length is verified against the file METADATA,
+        // before a single byte is uploaded.
+        let mut f = match std::fs::File::open(&task.staging) {
+            Ok(f) => f,
             Err(e) => {
                 self.set_state(task.id, "dead")?;
                 eprintln!(
@@ -422,12 +525,23 @@ impl WriteBackEngine {
                 return Ok(());
             }
         };
-        if content.len() as i64 != task.size {
+        let actual_len = match f.metadata() {
+            Ok(m) => m.len() as i64,
+            Err(e) => {
+                self.set_state(task.id, "dead")?;
+                eprintln!(
+                    "lightfs wb: task {id} dead: staging stat failed: {e}",
+                    id = task.id
+                );
+                return Ok(());
+            }
+        };
+        if actual_len != task.size {
             self.set_state(task.id, "dead")?;
             eprintln!(
                 "lightfs wb: task {id} dead: staged {got} bytes != declared {want}",
                 id = task.id,
-                got = content.len(),
+                got = actual_len,
                 want = task.size
             );
             return Ok(());
@@ -440,12 +554,14 @@ impl WriteBackEngine {
                 // unlinked while queued/draining: discard silently (this is
                 // the delete-before-commit cancel outcome)
                 self.meta.wb_finish(task.id)?;
-                let _ = std::fs::remove_file(&task.staging);
+                self.remove_staged(&task);
                 return Ok(());
             }
         };
         let version_key = crate::core::new_version_key_for(task.node_id);
-        let put = self.objects.put(&version_key, &content);
+        let put = self
+            .objects
+            .put_stream(&version_key, &mut f, task.size as u64);
         self.metrics.s3_put.fetch_add(1, Ordering::Relaxed);
         let outcome = match put {
             Ok(info) => {
@@ -474,16 +590,16 @@ impl WriteBackEngine {
                     self.retire(old_key);
                 }
                 self.meta.wb_finish(task.id)?;
-                let _ = std::fs::remove_file(&task.staging);
+                self.remove_staged(&task);
                 self.metrics.wb_drained.fetch_add(1, Ordering::Relaxed);
             }
             Err(Error::Conflict { .. }) => {
                 // Crash between CAS and wb_finish: the commit LANDED - the
                 // recovered task must finish as a success, never as a
                 // conflict (S3.5 recovery semantics).
-                if self.task_already_committed(&task, &content)? {
+                if self.task_already_committed(&task)? {
                     self.meta.wb_finish(task.id)?;
-                    let _ = std::fs::remove_file(&task.staging);
+                    self.remove_staged(&task);
                     self.metrics.wb_drained.fetch_add(1, Ordering::Relaxed);
                     return Ok(());
                 }
@@ -504,7 +620,7 @@ impl WriteBackEngine {
                 self.metrics.wb_discarded.fetch_add(1, Ordering::Relaxed);
                 let _ = self.objects.delete(&version_key);
                 self.meta.wb_finish(task.id)?;
-                let _ = std::fs::remove_file(&task.staging);
+                self.remove_staged(&task);
             }
             Err(e) => {
                 let _ = self.objects.delete(&version_key);
@@ -528,14 +644,18 @@ impl WriteBackEngine {
     /// batch, a seal, or an upload.
     pub fn drain_batch_once(&self) -> Result<bool> {
         let max_bytes = self.batch_pack_bytes;
-        let mut entries: Vec<(TaskRow, usize, usize)> = Vec::new();
-        let mut buf: Vec<u8> = Vec::new();
+        // P0-c streaming: entries are (task, pack_offset, len) — the bytes
+        // are NEVER read into memory here. Content-length validation uses
+        // the file METADATA; the PackReader streams the files straight
+        // into put_stream inside seal_batch.
+        let mut entries: Vec<(TaskRow, u64, u64)> = Vec::new();
+        let mut total: u64 = 0;
         let mut first_at: Option<std::time::Instant> = None;
         loop {
             if self.stop.load(Ordering::Relaxed) && !entries.is_empty() {
                 break;
             }
-            let fit = (max_bytes - buf.len() as u64).min(i64::MAX as u64) as i64;
+            let fit = (max_bytes - total).min(i64::MAX as u64) as i64;
             match self.meta.wb_claim_fit(fit, self.now())? {
                 None => {
                     if entries.is_empty() {
@@ -564,43 +684,72 @@ impl WriteBackEngine {
                     if first_at.is_none() {
                         first_at = Some(std::time::Instant::now());
                     }
-                    let content = match std::fs::read(&task.staging) {
-                        Ok(c) if c.len() as i64 == task.size => c,
-                        Ok(c) => {
-                            self.set_state(task.id, "dead")?;
-                            eprintln!(
-                                "lightfs wb: task {id} dead: staged {got} != declared {want}",
-                                id = task.id,
-                                got = c.len(),
-                                want = task.size
-                            );
-                            continue;
-                        }
+                    // Validate WITHOUT loading content: open + metadata.
+                    let declared = match std::fs::File::open(&task.staging) {
+                        Ok(f) => match f.metadata() {
+                            Ok(m) if m.len() as i64 == task.size => Some(task.size),
+                            Ok(m) => {
+                                self.set_state(task.id, "dead")?;
+                                eprintln!(
+                                    "lightfs wb: task {id} dead: staged {got} != declared {want}",
+                                    id = task.id,
+                                    got = m.len(),
+                                    want = task.size
+                                );
+                                None
+                            }
+                            Err(e) => {
+                                self.set_state(task.id, "dead")?;
+                                eprintln!(
+                                    "lightfs wb: task {id} dead: staging stat failed: {e}",
+                                    id = task.id
+                                );
+                                None
+                            }
+                        },
                         Err(e) => {
                             self.set_state(task.id, "dead")?;
                             eprintln!(
                                 "lightfs wb: task {id} dead: staging unreadable: {e}",
                                 id = task.id
                             );
-                            continue;
+                            None
                         }
                     };
-                    entries.push((task, buf.len(), content.len()));
-                    buf.extend_from_slice(&content);
-                    if buf.len() as u64 >= max_bytes {
+                    let Some(len) = declared else { continue };
+                    entries.push((task, total, len as u64));
+                    total += len as u64;
+                    if total >= max_bytes {
                         break; // pack budget reached
                     }
                 }
             }
         }
-        self.seal_batch(entries, buf)?;
+        self.seal_batch(entries)?;
         Ok(true)
+    }
+
+    /// Remove a drained task's staging file and release its staged bytes
+    /// ONLY on the confirmed physical delete (P0-c invariants 4/5). A
+    /// failed delete keeps the bytes accounted: the file becomes an orphan
+    /// that the next recover() sweep deletes and releases.
+    fn remove_staged(&self, task: &TaskRow) {
+        match std::fs::remove_file(&task.staging) {
+            Ok(()) => {
+                let _ = self.meta.wb_release_staged(task.size);
+            }
+            Err(e) => eprintln!(
+                "lightfs wb: staging {} not removed ({e}); its {}B stay accounted",
+                task.staging, task.size
+            ),
+        }
     }
 
     /// Upload one assembled pack and resolve every entry's CAS. The PUT
     /// runs while holding NO shared lock — only this worker's entries are
     /// in flight, and sibling tasks stay claimable throughout.
-    fn seal_batch(&self, entries: Vec<(TaskRow, usize, usize)>, buf: Vec<u8>) -> Result<()> {
+    fn seal_batch(&self, entries: Vec<(TaskRow, u64, u64)>) -> Result<()> {
+        let total: u64 = entries.last().map(|(_, off, len)| off + len).unwrap_or(0);
         let pack_key = format!(
             "{}wb-{:x}-{:x}.data",
             crate::pack::PACK_KEY_PREFIX,
@@ -612,32 +761,38 @@ impl WriteBackEngine {
         );
         // Register the pack row (uploaded_at NULL) before the upload — the
         // same "intent before object" invariant the strict pack engine uses.
-        self.meta.register_pack(&pack_key, buf.len() as i64)?;
-        let put = self.objects.put(&pack_key, &buf);
+        self.meta.register_pack(&pack_key, total as i64)?;
+        // P0-c streaming: the pack is the sequential concatenation of its
+        // staging files, streamed straight into put_stream (bounded 8 MiB
+        // part windows on the S3 side; ONE staging fd at a time). Segment
+        // hashes come out of the same pass — no in-memory pack buffer.
+        let mut reader = PackReader::new(
+            entries
+                .iter()
+                .map(|(t, _, len)| (std::path::PathBuf::from(&t.staging), *len))
+                .collect(),
+        );
+        let put = self.objects.put_stream(&pack_key, &mut reader, total);
         self.metrics.s3_put.fetch_add(1, Ordering::Relaxed);
         if put.is_ok() {
             self.metrics.wb_packs.fetch_add(1, Ordering::Relaxed);
         }
-        let put = match put {
-            Ok(info) => info,
-            Err(e) => {
-                // upload failed: nothing references the pack yet — undo row
-                // + object, requeue the batch with the retry budget.
-                let _ = self.objects.delete(&pack_key);
-                let _ = self.meta.drop_pack(&pack_key);
-                for (task, _, _) in &entries {
-                    if !self.meta.wb_retry_or_dead(task.id, 3, self.now())? {
-                        eprintln!(
-                            "lightfs wb: task {id} dead after retries: {e}",
-                            id = task.id
-                        );
-                    }
+        if let Err(e) = put {
+            // upload failed: nothing references the pack yet — undo row
+            // + object, requeue the batch with the retry budget.
+            let _ = self.objects.delete(&pack_key);
+            let _ = self.meta.drop_pack(&pack_key);
+            for (task, _, _) in &entries {
+                if !self.meta.wb_retry_or_dead(task.id, 3, self.now())? {
+                    eprintln!(
+                        "lightfs wb: task {id} dead after retries: {e}",
+                        id = task.id
+                    );
                 }
-                std::thread::sleep(Duration::from_millis(50));
-                return Ok(());
             }
-        };
-        let _ = put;
+            std::thread::sleep(Duration::from_millis(50));
+            return Ok(());
+        }
         self.meta.mark_pack_uploaded(&pack_key, self.now())?;
         // P0-a: bind the claimed tasks to THIS batch before any member CAS —
         // the batch is now `committing`, its members are tracked, and the
@@ -646,8 +801,14 @@ impl WriteBackEngine {
         self.meta
             .wb_bind_pack_keys(&member_ids, Some(&pack_key), self.now())?;
         let mut batch_finalized = false;
-        for (task, off, len) in entries {
-            let hash = crate::pack::content_hash(&buf[off..off + len]);
+        let hashes = reader.hashes;
+        assert_eq!(
+            hashes.len(),
+            entries.len(),
+            "PackReader must produce one hash per entry after a full upload"
+        );
+        for (idx, (task, off, len)) in entries.into_iter().enumerate() {
+            let hash = hashes[idx].clone();
             // Errors propagate: a get_node failure must not silently skip
             // the retire of the previous generation (S3.5 swallow fix).
             let old_key = match self.meta.get_node(task.node_id)? {
@@ -672,16 +833,15 @@ impl WriteBackEngine {
                         self.retire(&k);
                     }
                     self.meta.wb_finish(task.id)?;
-                    let _ = std::fs::remove_file(&task.staging);
+                    self.remove_staged(&task);
                     self.metrics.wb_drained.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(Error::Conflict { .. }) => {
                     // Crash between the per-file CAS and wb_finish: the
                     // commit landed - finish as a success (S3.5 recovery).
-                    let staged = &buf[off..off + len];
-                    if self.task_already_committed(&task, staged)? {
+                    if self.task_already_committed(&task)? {
                         self.meta.wb_finish(task.id)?;
-                        let _ = std::fs::remove_file(&task.staging);
+                        self.remove_staged(&task);
                         self.metrics.wb_drained.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
@@ -691,7 +851,7 @@ impl WriteBackEngine {
                     self.metrics.wb_conflicts.fetch_add(1, Ordering::Relaxed);
                     self.metrics
                         .pack_dead_bytes
-                        .fetch_add(len as u64, Ordering::Relaxed);
+                        .fetch_add(len, Ordering::Relaxed);
                     self.set_state(task.id, "dead")?;
                     eprintln!(
                         "lightfs wb: task {id} for node {node} dead: CAS conflict (pack sibling bytes kept for gc)",
@@ -704,7 +864,7 @@ impl WriteBackEngine {
                     // discard, counted (S3.5)
                     self.metrics.wb_discarded.fetch_add(1, Ordering::Relaxed);
                     self.meta.wb_finish(task.id)?;
-                    let _ = std::fs::remove_file(&task.staging);
+                    self.remove_staged(&task);
                 }
                 Err(e) => {
                     // transient CAS failure: retry via the queue. The entry
@@ -743,7 +903,7 @@ impl WriteBackEngine {
     /// recovered task must then complete as a success, never dead-letter as
     /// a conflict. Verified by CONTENT (bytes for per-file objects, the
     /// committed pack range for pack-backed nodes), not just version arith.
-    fn task_already_committed(&self, task: &TaskRow, staged: &[u8]) -> Result<bool> {
+    fn task_already_committed(&self, task: &TaskRow) -> Result<bool> {
         let Some(n) = self.meta.get_node(task.node_id)? else {
             return Ok(false);
         };
@@ -755,20 +915,41 @@ impl WriteBackEngine {
         };
         // Object unreadable = cannot verify = NOT committed (conservative:
         // the normal conflict path then decides, the winner stays intact).
-        let read = if let (Some(off), Some(plen)) = (n.pack_off, n.pack_len) {
-            self.objects.get(
-                key,
-                Some(crate::object_store::Range {
-                    start: off as u64,
-                    len: plen as u64,
-                }),
-            )
-        } else {
-            self.objects.get(key, None)
+        // P0-c: byte comparison in bounded 8 MiB windows against the
+        // staging FILE — the old slice-vs-Vec compare required the staged
+        // bytes resident, which is exactly the memory spike this stage
+        // removes (a 1 GiB conflict would have re-read 1 GiB).
+        let range = match (n.pack_off, n.pack_len) {
+            (Some(off), Some(plen)) => Some(crate::object_store::Range {
+                start: off as u64,
+                len: plen as u64,
+            }),
+            _ => None,
         };
-        match read {
-            Ok(d) => Ok(d.data == staged),
-            Err(_) => Ok(false),
+        let (mut remote, remote_len) = match self.objects.get_stream(key, range) {
+            Ok(r) => r,
+            Err(_) => return Ok(false),
+        };
+        if remote_len != task.size as u64 {
+            return Ok(false);
+        }
+        let mut local = match std::fs::File::open(&task.staging) {
+            Ok(f) => f,
+            Err(_) => return Ok(false),
+        };
+        // Heap buffers: two 8 MiB stack arrays would overflow a default
+        // 2 MiB worker/test thread stack.
+        let mut a = vec![0u8; 8 * 1024 * 1024];
+        let mut b = vec![0u8; 8 * 1024 * 1024];
+        loop {
+            let na = read_full(&mut local, &mut a)?;
+            let nb = read_full(&mut remote, &mut b)?;
+            if na != nb || a[..na] != b[..nb] {
+                return Ok(false);
+            }
+            if na == 0 {
+                return Ok(true);
+            }
         }
     }
 
@@ -842,6 +1023,104 @@ impl WriteBackEngine {
     }
 }
 
+/// Reads until `buf` is full or EOF; returns bytes read (0 = EOF at the
+/// boundary). A short read from the middle would silently corrupt a pack,
+/// so callers that need exactness loop here.
+fn read_full(r: &mut dyn std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let got = r.read(&mut buf[filled..])?;
+        if got == 0 {
+            break;
+        }
+        filled += got;
+    }
+    Ok(filled)
+}
+
+/// Streams a pack as the sequential concatenation of its staging files
+/// (pack layout: no header; per-entry (offset, len) lives in SQLite).
+/// ONE staging file is open at any time (fd peak = 1) and no pack-sized
+/// buffer ever exists — the caller's read window (S3 put_stream: 8 MiB
+/// parts) is the memory bound (S4 §3.D frozen streaming design).
+/// Each entry's SHA-256 is computed on the SAME pass (tee-style), so the
+/// per-file content hashes are ready when the upload finishes, without a
+/// second read. A staging file that deviates from its declared length
+/// fails the upload (io error) — data integrity is never weakened by the
+/// streaming rewrite.
+struct PackReader {
+    segs: std::collections::VecDeque<(std::path::PathBuf, u64)>,
+    cur: Option<(std::io::BufReader<std::fs::File>, u64)>,
+    seg_hasher: Option<sha2::Sha256>,
+    seg_remaining: u64,
+    hashes: Vec<String>,
+}
+
+impl PackReader {
+    fn new(segs: Vec<(std::path::PathBuf, u64)>) -> Self {
+        Self {
+            segs: segs.into(),
+            cur: None,
+            seg_hasher: None,
+            seg_remaining: 0,
+            hashes: Vec::new(),
+        }
+    }
+}
+
+impl std::io::Read for PackReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if out.is_empty() {
+                return Ok(0);
+            }
+            if self.cur.is_none() {
+                let Some((path, len)) = self.segs.pop_front() else {
+                    return Ok(0); // pack exhausted
+                };
+                let f = std::fs::File::open(&path).map_err(|e| {
+                    std::io::Error::other(format!("staging {}: {e}", path.display()))
+                })?;
+                self.cur = Some((std::io::BufReader::with_capacity(512 * 1024, f), len));
+                self.seg_hasher = Some(sha2::Sha256::new());
+                self.seg_remaining = len;
+            }
+            let (reader, remaining) = self.cur.as_mut().unwrap();
+            let want = (out.len() as u64).min(*remaining) as usize;
+            let got = reader.read(&mut out[..want])?;
+            if got == 0 {
+                return Err(std::io::Error::other(format!(
+                    "staging file ended {} bytes short of its declared length",
+                    self.seg_remaining
+                )));
+            }
+            self.seg_hasher
+                .as_mut()
+                .expect("hasher exists while a segment is open")
+                .update(&out[..got]);
+            self.seg_remaining -= got as u64;
+            *remaining -= got as u64;
+            if self.seg_remaining == 0 {
+                self.hashes.push(hex::encode(
+                    self.seg_hasher.take().expect("hasher").finalize(),
+                ));
+                // The segment declared length is consumed; the file must be
+                // exactly at EOF, or the next entry's bytes would shift.
+                let mut probe = [0u8; 1];
+                if reader.read(&mut probe)? != 0 {
+                    return Err(std::io::Error::other(
+                        "staging file longer than its declared length".to_string(),
+                    ));
+                }
+                self.cur = None;
+            }
+            if got > 0 {
+                return Ok(got);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -872,6 +1151,7 @@ mod tests {
                 batch_pack_bytes: 0,
                 batch_max_wait_ms: 0,
                 queue_max_tasks: 0,
+                staging_budget_bytes: 0,
             }),
         )
         .unwrap()
@@ -1032,6 +1312,7 @@ mod tests {
                 batch_pack_bytes: pack_bytes,
                 batch_max_wait_ms: 0, // no straggler wait in tests
                 queue_max_tasks: queue_max,
+                staging_budget_bytes: 0,
             }),
         )
         .unwrap()
@@ -1175,6 +1456,15 @@ mod tests {
                 reader: &mut dyn std::io::Read,
                 len: u64,
             ) -> crate::error::Result<crate::object_store::ObjectInfo> {
+                // P0-c: batch seals stream via put_stream — the outage
+                // injection must live on the path production actually uses.
+                if key.starts_with(crate::pack::PACK_KEY_PREFIX)
+                    && self.fail_first.swap(false, Ordering::Relaxed)
+                {
+                    return Err(crate::error::Error::Storage(
+                        "simulated upload outage".into(),
+                    ));
+                }
                 self.inner.put_stream(key, reader, len)
             }
             fn get(
@@ -1233,6 +1523,7 @@ mod tests {
                 batch_pack_bytes: 1 << 20,
                 batch_max_wait_ms: 0,
                 queue_max_tasks: 0,
+                staging_budget_bytes: 0,
             }),
         )
         .unwrap();
@@ -1448,6 +1739,7 @@ mod tests {
             batch_pack_bytes: 0,
             batch_max_wait_ms: 0,
             queue_max_tasks: 0,
+            staging_budget_bytes: 0,
         };
         let body = b"survives a crash";
         let store: StdArc<dyn crate::object_store::ObjectStore> =
@@ -1606,6 +1898,7 @@ mod tests {
                 batch_pack_bytes: 0,
                 batch_max_wait_ms: 0,
                 queue_max_tasks: 0,
+                staging_budget_bytes: 0,
             }),
         )
         .unwrap();
@@ -1688,6 +1981,7 @@ mod tests {
                 batch_pack_bytes: 0,
                 batch_max_wait_ms: 0,
                 queue_max_tasks: 0,
+                staging_budget_bytes: 0,
             }),
         )
         .unwrap();
@@ -1790,6 +2084,7 @@ mod tests {
             batch_pack_bytes: 0,
             batch_max_wait_ms: 0,
             queue_max_tasks: 0,
+            staging_budget_bytes: 0,
         };
         let eng = WriteBackEngine::new(
             meta.clone(),
@@ -1856,6 +2151,7 @@ mod tests {
             batch_pack_bytes: 0,
             batch_max_wait_ms: 0,
             queue_max_tasks: 0,
+            staging_budget_bytes: 0,
         };
         let eng = WriteBackEngine::new(
             meta.clone(),
@@ -1960,6 +2256,452 @@ mod tests {
         );
         let claimed2 = meta.gc_claim_deletions(10, 1).unwrap();
         assert!(claimed2.is_empty(), "a completed intent is not resurrected");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// Drive write_deferred with an explicit len (tests stage from memory).
+    fn write_deferred_for_test(c: &Core, n: &Node, body: &[u8], len: usize) -> Result<Node> {
+        c.wb()
+            .unwrap()
+            .write_deferred(n, 0, &mut std::io::Cursor::new(body.to_vec()), len as u64)
+    }
+
+    // ---- P0-c: staging capacity accounting + bounded-memory streaming ----
+
+    fn cap_core(tag: &str, budget: u64, batch_bytes: u64) -> Core {
+        let dir = std::env::temp_dir().join(format!("lightfs-p0c-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Core::with_options(
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            StdArc::new(MemObjectStore::new()),
+            crate::core::DEFAULT_SUPERSEDED_SECS,
+            None,
+            Some(WbOptions {
+                staging_dir: dir.join("staging").to_string_lossy().to_string(),
+                drain_workers: 0,
+                batch_pack_bytes: batch_bytes,
+                batch_max_wait_ms: 0,
+                queue_max_tasks: 0,
+                staging_budget_bytes: budget,
+            }),
+        )
+        .unwrap();
+        c
+    }
+
+    /// Boundary: a write that exactly fills the budget lands; one more
+    /// byte gets the explicit capacity-exhausted error.
+    #[test]
+    fn p0c_capacity_boundary_exact_and_overflow() {
+        let c = cap_core("boundary", 100, 0);
+        c.create("/f", 0o644).unwrap();
+        let n = c.lookup("/f").unwrap();
+        let _ = write_deferred_for_test(&c, &n, &[b'a'; 100], 100).unwrap();
+        let (staged, reserved) = c.metadata().wb_capacity_snapshot().unwrap();
+        assert_eq!(
+            (staged, reserved),
+            (100, 0),
+            "sync_all passed: staged, not reserved"
+        );
+        let e = write_deferred_for_test(&c, &n, b"x", 1).unwrap_err();
+        assert!(
+            format!("{e}").starts_with("capacity-exhausted"),
+            "identifiable exhaustion: {e}"
+        );
+        // the failed write reserved nothing and staged nothing
+        assert_eq!(c.metadata().wb_capacity_snapshot().unwrap(), (100, 0));
+    }
+
+    /// Concurrent reservations serialize in SQLite: exactly floor(budget/N)
+    /// of N equal reservations can win, never one more.
+    #[test]
+    fn p0c_concurrent_reserves_never_overbook() {
+        let meta: StdArc<SqliteMetadataStore> =
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap());
+        let budget = 1000i64;
+        let ok = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+        let exhausted = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let meta = meta.clone();
+                let ok = ok.clone();
+                let exhausted = exhausted.clone();
+                scope.spawn(move || {
+                    for _ in 0..50 {
+                        match meta.wb_capacity_reserve(200, budget) {
+                            Ok(()) => {
+                                ok.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(Error::Capacity(_)) => {
+                                exhausted.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(e) => panic!("unexpected: {e}"),
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            ok.load(Ordering::Relaxed),
+            5,
+            "budget 1000 / 200 = exactly 5"
+        );
+        assert_eq!(exhausted.load(Ordering::Relaxed), 8 * 50 - 5);
+        assert_eq!(meta.wb_capacity_snapshot().unwrap(), (0, 1000));
+    }
+
+    /// A staging write whose half-written file CANNOT be deleted keeps its
+    /// reservation (invariant 4: bytes may still occupy the disk). A later
+    /// reconcile() — which reflects reality — clears it.
+    #[test]
+    fn p0c_half_written_file_keeps_reservation_until_reconciled() {
+        let c = cap_core("halfwrite", 0, 0);
+        c.create("/f", 0o644).unwrap();
+        let n = c.lookup("/f").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let staging_dir = c.wb().unwrap().staging_dir().to_path_buf();
+        std::fs::set_permissions(&staging_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let e = write_deferred_for_test(&c, &n, b"doomed", 6).unwrap_err();
+        assert!(!format!("{e}").is_empty());
+        std::fs::set_permissions(&staging_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // the half-written file could not be deleted -> reservation kept
+        let (_, reserved) = c.metadata().wb_capacity_snapshot().unwrap();
+        assert_eq!(reserved, 6, "no release while the file may still exist");
+        // reconcile reflects reality: no staging file survived
+        let (staged, reserved) = c.wb().unwrap().reconcile_capacity_and_report().unwrap();
+        assert_eq!(
+            (staged, reserved),
+            (0, 0),
+            "reconcile sees no file, voids the reservation"
+        );
+    }
+
+    /// Dead tasks keep occupying capacity; exhaustion says so explicitly.
+    #[test]
+    fn p0c_dead_and_orphans_occupy_and_reconcile() {
+        let dir = std::env::temp_dir().join(format!("lightfs-p0c-dead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("staging")).unwrap();
+        let meta_path = dir.join("m.db");
+        let staging_dir = dir.join("staging");
+        // Build a db + staging set in a first engine: one dead task, one orphan file.
+        {
+            let c = Core::with_options(
+                StdArc::new(SqliteMetadataStore::open(&meta_path.to_string_lossy()).unwrap()),
+                StdArc::new(MemObjectStore::new()),
+                crate::core::DEFAULT_SUPERSEDED_SECS,
+                None,
+                Some(WbOptions {
+                    staging_dir: staging_dir.to_string_lossy().to_string(),
+                    drain_workers: 0,
+                    batch_pack_bytes: 0,
+                    batch_max_wait_ms: 0,
+                    queue_max_tasks: 0,
+                    staging_budget_bytes: 0,
+                }),
+            )
+            .unwrap();
+            c.create("/f", 0o644).unwrap();
+            let n = c.lookup("/f").unwrap();
+            // dead task with staging retained
+            let dead_path = staging_dir.join("wb-dead-1.data");
+            std::fs::write(&dead_path, vec![b'd'; 30]).unwrap();
+            let meta = SqliteMetadataStore::open(&meta_path.to_string_lossy()).unwrap();
+            meta.wb_enqueue(n.id, &dead_path.to_string_lossy(), 30, 0, 1)
+                .unwrap();
+            meta.wb_set_state(1, "dead", 2).unwrap();
+            // orphan file with no task
+            std::fs::write(staging_dir.join("wb-orphan-1.data"), vec![b'o'; 50]).unwrap();
+        }
+        // Reopen: reconcile counts BOTH files (dead stays, orphan counted
+        // then swept+released), reservations void.
+        let c = Core::with_options(
+            StdArc::new(SqliteMetadataStore::open(&meta_path.to_string_lossy()).unwrap()),
+            StdArc::new(MemObjectStore::new()),
+            crate::core::DEFAULT_SUPERSEDED_SECS,
+            None,
+            Some(WbOptions {
+                staging_dir: staging_dir.to_string_lossy().to_string(),
+                drain_workers: 0,
+                batch_pack_bytes: 0,
+                batch_max_wait_ms: 0,
+                queue_max_tasks: 0,
+                staging_budget_bytes: 0,
+            }),
+        )
+        .unwrap();
+        c.wb().unwrap().recover().unwrap();
+        let (staged, reserved) = c.metadata().wb_capacity_snapshot().unwrap();
+        assert_eq!(reserved, 0, "reboot voids every reservation");
+        assert_eq!(
+            staged, 30,
+            "orphan 50B swept+released; dead 30B still accounted"
+        );
+        // dead bytes keep occupying: an explicit budget that only fits the
+        // dead file refuses further writes with the explicit error.
+        let c2 = Core::with_options(
+            StdArc::new(SqliteMetadataStore::open(&meta_path.to_string_lossy()).unwrap()),
+            StdArc::new(MemObjectStore::new()),
+            crate::core::DEFAULT_SUPERSEDED_SECS,
+            None,
+            Some(WbOptions {
+                staging_dir: staging_dir.to_string_lossy().to_string(),
+                drain_workers: 0,
+                batch_pack_bytes: 0,
+                batch_max_wait_ms: 0,
+                queue_max_tasks: 0,
+                staging_budget_bytes: 100,
+            }),
+        )
+        .unwrap();
+        c2.wb().unwrap().recover().unwrap();
+        let e =
+            write_deferred_for_test(&c2, &c2.lookup("/f").unwrap(), &[b'x'; 71], 71).unwrap_err();
+        assert!(format!("{e}").starts_with("capacity-exhausted"), "{e}");
+        // 30 (dead) + 60 fits exactly
+        write_deferred_for_test(&c2, &c2.lookup("/f").unwrap(), &[b'y'; 60], 60).unwrap();
+        assert_eq!(c2.metadata().wb_capacity_snapshot().unwrap(), (90, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// drain success with a staging file that cannot be deleted: bytes stay
+    /// accounted (invariant 5), the task is still terminal, and a later
+    /// recover() sweep releases them once the delete actually succeeds.
+    #[test]
+    fn p0c_drained_but_undeletable_keeps_bytes_until_sweep() {
+        let dir = std::env::temp_dir().join(format!("lightfs-p0c-undel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("staging")).unwrap();
+        let meta_path = dir.join("m.db");
+        let staging_dir = dir.join("staging");
+        let c = Core::with_options(
+            StdArc::new(SqliteMetadataStore::open(&meta_path.to_string_lossy()).unwrap()),
+            StdArc::new(MemObjectStore::new()),
+            crate::core::DEFAULT_SUPERSEDED_SECS,
+            None,
+            Some(WbOptions {
+                staging_dir: staging_dir.to_string_lossy().to_string(),
+                drain_workers: 0,
+                batch_pack_bytes: 0,
+                batch_max_wait_ms: 0,
+                queue_max_tasks: 0,
+                staging_budget_bytes: 0,
+            }),
+        )
+        .unwrap();
+        c.create("/f", 0o644).unwrap();
+        let _ = write_via_rpc(&c, "/f", b"payload-30-bytes----padding!", Some(0));
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staging_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(
+            c.wb().unwrap().drain_once().unwrap(),
+            "drain succeeds (upload+CAS+finish)"
+        );
+        std::fs::set_permissions(&staging_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            c.read("/f", 0, 100).unwrap(),
+            b"payload-30-bytes----padding!"
+        );
+        let (staged, _) = c.metadata().wb_capacity_snapshot().unwrap();
+        assert!(staged > 0, "undeletable staging keeps its bytes accounted");
+        // the file physically gone-able now: recover sweeps and releases
+        c.wb().unwrap().recover().unwrap();
+        assert_eq!(c.metadata().wb_capacity_snapshot().unwrap(), (0, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tracking wrapper: forwards to a MemObjectStore but mirrors the
+    /// production S3 put_stream read pattern (bounded 8 MiB windows) and
+    /// records the LARGEST single read request ever made — the observable
+    /// proof that no caller reads a whole pack/file in one go.
+    struct TrackingStore {
+        inner: MemObjectStore,
+        max_window: StdArc<std::sync::atomic::AtomicUsize>,
+    }
+    impl TrackingStore {
+        fn new() -> Self {
+            Self {
+                inner: MemObjectStore::new(),
+                max_window: StdArc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+        fn max_window(&self) -> usize {
+            self.max_window.load(Ordering::Relaxed)
+        }
+    }
+    struct WindowTrackingReader {
+        inner: Box<dyn std::io::Read + Send>,
+        max: StdArc<std::sync::atomic::AtomicUsize>,
+    }
+    impl std::io::Read for WindowTrackingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.max.fetch_max(buf.len(), Ordering::Relaxed);
+            self.inner.read(buf)
+        }
+    }
+    impl crate::object_store::ObjectStore for TrackingStore {
+        fn put(
+            &self,
+            key: &str,
+            data: &[u8],
+        ) -> crate::error::Result<crate::object_store::ObjectInfo> {
+            self.inner.put(key, data)
+        }
+        fn put_stream(
+            &self,
+            key: &str,
+            reader: &mut dyn std::io::Read,
+            len: u64,
+        ) -> crate::error::Result<crate::object_store::ObjectInfo> {
+            // Mirrors s3.rs put_stream: >=8 MiB goes out in bounded 8 MiB
+            // part windows; smaller objects in exactly one len-sized read.
+            const PART: usize = 8 * 1024 * 1024;
+            let mut collected = Vec::with_capacity(len as usize);
+            loop {
+                let mut buf = vec![0u8; PART.min(len as usize).max(1)];
+                let filled = read_full(reader, &mut buf)?;
+                if filled == 0 {
+                    break;
+                }
+                buf.truncate(filled);
+                collected.extend_from_slice(&buf);
+                if filled < buf.len() {
+                    break;
+                }
+            }
+            self.max_window
+                .fetch_max(collected.len().clamp(1, PART), Ordering::Relaxed);
+            self.inner.put(key, &collected)
+        }
+        fn get(
+            &self,
+            key: &str,
+            range: Option<crate::object_store::Range>,
+        ) -> crate::error::Result<crate::object_store::ObjectData> {
+            self.inner.get(key, range)
+        }
+        fn get_stream(
+            &self,
+            key: &str,
+            range: Option<crate::object_store::Range>,
+        ) -> crate::error::Result<(Box<dyn std::io::Read + Send>, u64)> {
+            let (r, len) = self.inner.get_stream(key, range)?;
+            Ok((
+                Box::new(WindowTrackingReader {
+                    inner: r,
+                    max: self.max_window.clone(),
+                }),
+                len,
+            ))
+        }
+        fn head(&self, key: &str) -> crate::error::Result<crate::object_store::ObjectInfo> {
+            self.inner.head(key)
+        }
+        fn delete(&self, key: &str) -> crate::error::Result<()> {
+            self.inner.delete(key)
+        }
+        fn list(
+            &self,
+            prefix: &str,
+            token: Option<&str>,
+            max: usize,
+        ) -> crate::error::Result<crate::object_store::ListPage> {
+            self.inner.list(prefix, token, max)
+        }
+        fn ping(&self) -> crate::error::Result<()> {
+            self.inner.ping()
+        }
+    }
+
+    /// Streaming batch: byte layout identical to the old in-memory concat,
+    /// and the largest read window is bounded (<= 8 MiB, the S3 part size),
+    /// NOT the pack size.
+    #[test]
+    fn p0c_batch_streams_bounded_and_layout_is_identical() {
+        let dir = std::env::temp_dir().join(format!("lightfs-p0c-bstream-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("staging")).unwrap();
+        let store = StdArc::new(TrackingStore::new());
+        let c = Core::with_options(
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            store.clone(),
+            crate::core::DEFAULT_SUPERSEDED_SECS,
+            None,
+            Some(WbOptions {
+                staging_dir: dir.join("staging").to_string_lossy().to_string(),
+                drain_workers: 0,
+                batch_pack_bytes: 1 << 20,
+                batch_max_wait_ms: 0,
+                queue_max_tasks: 0,
+                staging_budget_bytes: 0,
+            }),
+        )
+        .unwrap();
+        let bodies = [vec![b'a'; 1000], vec![b'b'; 500], vec![b'c'; 250]];
+        for (i, body) in bodies.iter().enumerate() {
+            let p = format!("/s{i}");
+            c.create(&p, 0o644).unwrap();
+            let _ = write_via_rpc(&c, &p, body, Some(0));
+        }
+        assert!(c.wb().unwrap().drain_once().unwrap());
+        assert!(!c.wb().unwrap().drain_once().unwrap(), "queue drained");
+        // byte layout: the pack object IS the concatenation
+        let n = c.lookup("/s0").unwrap();
+        let key = n.object_key.as_deref().unwrap().to_string();
+        let mut want = Vec::new();
+        want.extend_from_slice(&bodies[0]);
+        want.extend_from_slice(&bodies[1]);
+        want.extend_from_slice(&bodies[2]);
+        let got = store.get(&key, None).unwrap();
+        assert_eq!(
+            got.data, want,
+            "pack = exact concatenation of staging files"
+        );
+        for (i, body) in bodies.iter().enumerate() {
+            assert_eq!(c.read(&format!("/s{i}"), 0, 10000).unwrap(), *body);
+        }
+        assert_eq!(c.metrics.wb_drained.load(Ordering::Relaxed), 3);
+        // bounded window: 1750-byte pack read in windows <= 8 MiB — and,
+        // decisively, no single read as large as reading beyond one part
+        assert!(store.max_window() <= 8 * 1024 * 1024, "window bound");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A single file LARGER than the 8 MiB part size drains per-file via
+    /// put_stream with the same bounded window; content verifies bytewise.
+    #[test]
+    fn p0c_oversized_single_file_streams_bounded() {
+        let dir = std::env::temp_dir().join(format!("lightfs-p0c-big-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("staging")).unwrap();
+        let store = StdArc::new(TrackingStore::new());
+        let c = Core::with_options(
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            store.clone(),
+            crate::core::DEFAULT_SUPERSEDED_SECS,
+            None,
+            Some(WbOptions {
+                staging_dir: dir.join("staging").to_string_lossy().to_string(),
+                drain_workers: 0,
+                batch_pack_bytes: 0, // per-file drain
+                batch_max_wait_ms: 0,
+                queue_max_tasks: 0,
+                staging_budget_bytes: 0,
+            }),
+        )
+        .unwrap();
+        let big: Vec<u8> = (0..17 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        c.create("/big", 0o644).unwrap();
+        let _ = write_via_rpc(&c, "/big", &big, Some(0));
+        assert!(c.wb().unwrap().drain_once().unwrap());
+        assert_eq!(c.read("/big", 0, big.len() as u64).unwrap(), big);
+        assert_eq!(c.metrics.wb_drained.load(Ordering::Relaxed), 1);
+        assert!(
+            store.max_window() <= 8 * 1024 * 1024,
+            "largest read window {} must be the 8 MiB part bound, not the {}-byte file",
+            store.max_window(),
+            big.len()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

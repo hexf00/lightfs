@@ -50,6 +50,12 @@ pub enum Error {
     Exdev(String),
     /// Configuration problem.
     Config(String),
+    /// Write-back staging capacity exhausted. Deliberately its own variant:
+    /// callers (and operators) must be able to tell "no staging budget
+    /// left" apart from every other failure — capacity exhaustion is NEVER
+    /// silently degraded, retried, or worked around by evicting staged
+    /// data (S4 P0-c invariant 7).
+    Capacity(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -88,6 +94,7 @@ impl fmt::Display for Error {
             Error::Io(m) => write!(f, "io: {m}"),
             Error::Exdev(m) => write!(f, "cross-device link: {m}"),
             Error::Config(m) => write!(f, "config: {m}"),
+            Error::Capacity(m) => write!(f, "capacity-exhausted: {m}"),
         }
     }
 }
@@ -126,6 +133,7 @@ impl Error {
             Error::Io(_) => "IO",
             Error::Exdev(_) => "EXDEV",
             Error::Config(_) => "CONFIG",
+            Error::Capacity(_) => "CAPACITY",
         }
     }
 }

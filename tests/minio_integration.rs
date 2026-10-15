@@ -144,8 +144,8 @@ fn concurrent_commit_race_minio() {
         Ok(c) => c,
         Err(_) => return,
     };
-    // Dedicated bucket: the "only the winner's object remains" assertion is
-    // prefix-scoped per node id, and fresh DBs reuse small ids across runs.
+    // Dedicated bucket: the per-node object-count assertion is prefix-scoped
+    // by node id, and fresh DBs reuse small ids across runs.
     // Retention is DISABLED here: this test pins CAS-race cleanup, not the
     // retention feature (which intentionally keeps superseded history).
     cfg.s3.bucket = "lightfs-race".into();
@@ -174,6 +174,9 @@ fn concurrent_commit_race_minio() {
     let eng = lightfs::engine::open_embedded(&cfg).expect("engine opens");
     eng.core.create("/race", 0o644).unwrap();
     let v = eng.core.lookup("/race").unwrap().version;
+    // The previous round's winner key: once superseded it must show up as a
+    // pending gc_deletions intent (retirement contract), not vanish inline.
+    let mut prev_object_key: Option<String> = None;
 
     for round in 0..3 {
         let core = eng.core.clone();
@@ -212,7 +215,13 @@ fn concurrent_commit_race_minio() {
             .unwrap();
         assert_eq!(head.etag, node.etag);
         assert_eq!(head.size as i64, node.size);
-        // the loser version keys were cleaned: exactly one object for the node
+        // Deletion contract (S4.2.1): losers never committed, so they still
+        // delete their own version keys inline — that is the CAS-race
+        // cleanup this test pins. The winner retires the previous version
+        // as a gc_deletions intent: committed objects are never deleted
+        // inline, gc is the only drain. After round N the node therefore
+        // owns exactly N+1 physical objects — the live winner plus N
+        // retired predecessors — and a loser leak would push the count up.
         let mut count = 0;
         let mut token = None;
         loop {
@@ -228,9 +237,22 @@ fn concurrent_commit_race_minio() {
             }
         }
         assert_eq!(
-            count, 1,
-            "only the winner's object may remain (round {round})"
+            count,
+            round as usize + 1,
+            "winner lives, losers cleaned, predecessors retired (round {round})"
         );
+        if let Some(prev) = prev_object_key.take() {
+            let pending: String = rusqlite::Connection::open(&cfg.metadata.path)
+                .unwrap()
+                .query_row(
+                    "SELECT key FROM gc_deletions WHERE key = ?1 AND state = 'pending'",
+                    [&prev],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|e| panic!("predecessor {prev} not a pending intent: {e}"));
+            assert_eq!(pending, prev);
+        }
+        prev_object_key = node.object_key.clone();
     }
     eng.core.unlink("/race").unwrap();
     let _ = std::fs::remove_file(&cfg.metadata.path);

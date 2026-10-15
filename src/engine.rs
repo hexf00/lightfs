@@ -79,6 +79,7 @@ fn build_core(
             batch_pack_bytes: cfg.writeback.batch_pack_bytes,
             batch_max_wait_ms: cfg.writeback.batch_max_wait_ms,
             queue_max_tasks: cfg.writeback.queue_max_tasks,
+            staging_budget_bytes: cfg.writeback.staging_budget_bytes,
         })
     } else {
         None

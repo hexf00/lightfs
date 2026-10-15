@@ -100,6 +100,14 @@ pub struct WritebackSection {
     /// limit, the flushing write degrades to a synchronous per-file commit
     /// (front stage blocks, correctness unchanged) instead of erroring.
     pub queue_max_tasks: usize,
+    /// P0-c staging capacity budget in bytes: the ceiling for
+    /// `staged_bytes + reserved_bytes` (see docs S4 §3.D). 0 = unbounded —
+    /// the historical write-back behavior, and the default, so Strict and
+    /// default-configured write-back deployments are unchanged. When set,
+    /// a write that cannot reserve its bytes fails with an explicit
+    /// `capacity-exhausted` error; staged data is never evicted to make
+    /// room (dead tasks and orphans keep occupying their bytes).
+    pub staging_budget_bytes: u64,
 }
 
 impl Default for WritebackSection {
@@ -108,6 +116,7 @@ impl Default for WritebackSection {
             staging_dir: String::from("./staging"),
             drain_workers: 1,
             batch_pack_bytes: 0,
+            staging_budget_bytes: 0,
             batch_max_wait_ms: 200,
             queue_max_tasks: 0,
         }

@@ -298,7 +298,11 @@ pub trait MetadataStore: Send + Sync {
     /// QUEUED task when `expected` is strictly newer than the task's
     /// (same-writer lineage); otherwise queues a new task. Returns the
     /// projected version (committed + pending tasks AFTER this call) and,
-    /// when a coalesce replaced one, the staging file the row abandoned.
+    /// when a coalesce replaced one, the (staging path, size) the row
+    /// abandoned — the caller releases those `staged_bytes` ONLY after the
+    /// physical delete of the old file succeeds (P0-c invariant 4).
+    /// Also converts this write's reservation to staged accounting in the
+    /// SAME transaction (P0-c invariant 3).
     fn wb_enqueue(
         &self,
         node_id: i64,
@@ -306,7 +310,7 @@ pub trait MetadataStore: Send + Sync {
         size: i64,
         expected: i64,
         now: i64,
-    ) -> Result<(i64, Option<String>)> {
+    ) -> Result<(i64, Option<(String, i64)>)> {
         let _ = (node_id, staging, size, expected, now);
         Err(Error::Storage("write-back unsupported".into()))
     }
@@ -358,14 +362,60 @@ pub trait MetadataStore: Send + Sync {
         let _ = node_id;
         Ok(None)
     }
-    /// Cancel queued tasks for a node; returns their staging paths.
-    fn wb_cancel_queued(&self, node_id: i64) -> Result<Vec<String>> {
+    /// Cancel queued tasks for a node; returns their (staging path, size)
+    /// so the caller releases staged bytes only after the physical delete
+    /// succeeds (P0-c invariant 4).
+    fn wb_cancel_queued(&self, node_id: i64) -> Result<Vec<(String, i64)>> {
         let _ = node_id;
         Ok(Vec::new())
     }
     /// (queued, draining, dead) counts.
     fn wb_counts(&self) -> Result<(u64, u64, u64)> {
         Ok((0, 0, 0))
+    }
+
+    // ---- P0-c staging capacity accounting (staged_bytes / reserved_bytes)
+    // Both counters persist in SQLite and every change happens in the SAME
+    // transaction as the task-state change it belongs to (S4 §3.D). The
+    // defaults are inert no-ops for stores without the accounting table.
+
+    /// Atomically reserve `bytes` of staging capacity for a write that is
+    /// about to create its staging file. The admission predicate
+    /// `staged + reserved + bytes <= budget` is evaluated INSIDE the same
+    /// immediate transaction that bumps `reserved_bytes`, so concurrent
+    /// writers cannot overbook (P0-c invariant 2). `budget <= 0` means
+    /// unbounded (accounting only). Exhaustion is `Error::Capacity`.
+    fn wb_capacity_reserve(&self, bytes: i64, budget: i64) -> Result<()> {
+        let _ = (bytes, budget);
+        Ok(())
+    }
+    /// Return an unused reservation (the staging file could not be
+    /// written): reserved_bytes decreases, nothing was ever staged.
+    fn wb_release_reserved(&self, bytes: i64) -> Result<()> {
+        let _ = bytes;
+        Ok(())
+    }
+    /// Release `bytes` of STAGED accounting — callers MUST have physically
+    /// deleted the backing file first (P0-c invariants 4/5/6: a file that
+    /// still exists keeps occupying capacity, dead tasks included).
+    fn wb_release_staged(&self, bytes: i64) -> Result<()> {
+        let _ = bytes;
+        Ok(())
+    }
+    /// Startup reconciliation (P0-c invariant 8): rebuild the ledger from
+    /// the REAL staging files (`(path, size)` pairs enumerated by the
+    /// caller), voiding every leftover reservation. The rebuild runs in
+    /// one immediate transaction at engine construction, before any
+    /// worker or front-stage write can reserve — single-authority by
+    /// architecture, so two processes cannot race two rebuilds.
+    /// Returns the new (staged, reserved) ledger.
+    fn wb_reconcile_capacity(&self, on_disk: &[(String, i64)]) -> Result<(i64, i64)> {
+        let _ = on_disk;
+        Ok((0, 0))
+    }
+    /// Current (staged_bytes, reserved_bytes) ledger — tests and metrics.
+    fn wb_capacity_snapshot(&self) -> Result<(i64, i64)> {
+        Ok((0, 0))
     }
 }
 
