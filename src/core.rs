@@ -1543,6 +1543,46 @@ mod tests {
         assert!(c.metadata().gc_claim_deletions(10, 1).unwrap().is_empty());
     }
 
+    /// A store that REPORTS "object does not exist" from its own delete()
+    /// (Error::ObjectMissing — unlike MemObjectStore's S3-normalized Ok)
+    /// must hit the executor's absent-object branch: the task completes,
+    /// the pack metadata finalizes away, no retry residue. Baseline test:
+    /// the branch is the S4.2.2 defensive arm and this is its first direct
+    /// end-to-end coverage, so there is no old-behavior red phase.
+    #[test]
+    fn p0a22_object_missing_from_delete_completes_the_task() {
+        let mem = Arc::new(MemObjectStore::new());
+        let c = Core::new(
+            Arc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            mem.clone(),
+        );
+        let p = "packs/p0a22-om.data";
+        c.metadata().register_pack(p, 100).unwrap();
+        c.metadata().mark_pack_uploaded(p, 1).unwrap();
+        c.metadata().wb_finalize_batch_if_terminal(p, 1).unwrap();
+        let (packs, objects) = c.gc_enroll_candidates(i64::MAX).unwrap();
+        assert_eq!((packs, objects), (1, 0));
+        // The store reports ObjectMissing for this key's delete.
+        mem.inject_object_missing_delete(p);
+
+        let (done, failed) = c.gc_execute_deletions(10).unwrap();
+        assert_eq!(
+            (done, failed),
+            (1, 0),
+            "ObjectMissing = already gone, not a failure"
+        );
+        assert!(
+            c.metadata().pack_state(p).unwrap().is_none(),
+            "the pack row is finalized away"
+        );
+        assert!(
+            c.metadata().gc_claim_deletions(10, 1).unwrap().is_empty(),
+            "no retry residue"
+        );
+        let (done, failed) = c.gc_execute_deletions(10).unwrap();
+        assert_eq!((done, failed), (0, 0), "idempotent repeat");
+    }
+
     /// Superseded per-file objects ride the same durable deletion task flow.
     #[test]
     fn p0a_superseded_object_deletion_task_flow() {

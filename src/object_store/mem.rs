@@ -24,6 +24,9 @@ pub struct MemObjectStore {
     /// Test-only failure injection: heads of a key present here error once
     /// (recover() fail-closed coverage without a network).
     head_failures: Mutex<std::collections::HashSet<String>>,
+    /// Test-only injection: the next delete of a key present here returns
+    /// ObjectMissing instead of Ok (absent-object branch coverage).
+    missing_deletes: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Default for MemObjectStore {
@@ -39,6 +42,7 @@ impl MemObjectStore {
             counter: std::sync::atomic::AtomicU64::new(1),
             delete_failures: Mutex::new(std::collections::HashSet::new()),
             head_failures: Mutex::new(std::collections::HashSet::new()),
+            missing_deletes: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -53,6 +57,14 @@ impl MemObjectStore {
     /// deterministically.
     pub fn inject_head_failure(&self, key: &str) {
         self.head_failures.lock().unwrap().insert(key.to_string());
+    }
+
+    /// Test-only: make the next `delete(key)` return `ObjectMissing`
+    /// instead of the S3-normalized `Ok` — covers stores that report
+    /// "object does not exist" from their delete, driving the executor's
+    /// absent-object branch deterministically.
+    pub fn inject_object_missing_delete(&self, key: &str) {
+        self.missing_deletes.lock().unwrap().insert(key.to_string());
     }
 
     fn info(&self, key: &str, e: &Entry) -> ObjectInfo {
@@ -150,6 +162,9 @@ impl ObjectStore for MemObjectStore {
             return Err(Error::Storage(format!(
                 "injected delete failure for testing: {key}"
             )));
+        }
+        if self.missing_deletes.lock().unwrap().remove(key) {
+            return Err(Error::ObjectMissing(key.to_string()));
         }
         self.objects.lock().unwrap().remove(key);
         Ok(())
