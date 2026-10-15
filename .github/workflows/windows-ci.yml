@@ -36,6 +36,25 @@ jobs:
             target/release/lightfs-accept.exe
           retention-days: 7
 
+  unit-tests:
+    # Real-Windows library tests: the cfg(windows) arms (durable staging
+    # directory sync via FlushFileBuffers — forward assertion on a real
+    # directory plus the read-only-handle-must-fail reverse, the P0-d
+    # acceptance condition) only EXECUTE on a Windows host; the
+    # cross-compile check proves compilation, never behavior. The suite is
+    # platform-gated per test, so the full lib target runs as-is.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned)
+        run: |
+          rustup toolchain install 1.85.1 --profile minimal
+          rustup default 1.85.1
+
+      - name: Run library unit tests
+        run: cargo test --lib
+
   mount-smoke:
     # Windows EXPERIMENTAL ADAPTER ACCEPTANCE (not production acceptance):
     # the cross-platform suite (lightfs-accept, same binary the Linux FUSE
