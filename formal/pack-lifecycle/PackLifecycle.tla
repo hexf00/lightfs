@@ -157,10 +157,17 @@ GcSweepDone == /\ gcp = "Sweeping"
                /\ UNCHANGED <<obj, refs, mem, phase, prot, failProne>>
 
 GcEnd == /\ gcp = "Draining"
+         /\ intent \in {"None", "Done", "Failed"}
          /\ gcp' = "Idle"
          /\ UNCHANGED <<pack, obj, refs, intent, mem, lock, phase, prot, failProne>>
-            (* the explicit run exits; unfinished intents wait for the next
-               invocation — nothing retries by itself *)
+            (* gc_run is a synchronous pipeline: a single invocation claims
+               and executes what it registered before it exits, so it cannot
+               end with a Pending or Claimed intent (a crash mid-run is
+               modeled separately by GcCrash). A FAILED intent stays for the
+               NEXT invocation — nothing retries by itself. Without this
+               premise a behavior that always calls gc and always exits
+               before executing starves the drain fairness forever, which
+               the implementation never does. *)
 
 GcCrash == /\ gcp # "Idle"
            /\ gcp' = "Idle"
@@ -501,8 +508,21 @@ SafeInv == /\ RefsSafe /\ DeletionAdmission /\ ObjectTracked
 (*     the server to (re)start or `lightfs gc` to win the lock — forever.  *)
 (*     The implementation's real promise is "the NEXT startup or gc pass    *)
 (*     adjudicates the row"; this assumption says there always IS a next.  *)
-(*   * NoStuckRecovery: no process stays in its sweep phase forever         *)
-(*     (start-crash loops that always interrupt a pass are excluded).       *)
+(*   * RecoveryPassesFinish / GcSweepPassesFinish: every ENTERED sweep      *)
+(*     phase eventually exits (the S4.12.2 task's candidate form; kept      *)
+(*     explicit, implied by the SF assumptions below). The earlier          *)
+(*     <>[]-shaped NoStuckRecovery ("eventually never sweeping again")     *)
+(*     directly CONTRADICTED SweepOpportunitiesInfinitelyOften and made     *)
+(*     FairSpec unsatisfiable — every liveness "pass" was vacuous (TLC      *)
+(*     probe evidence in docs/S4122 report). A pass that exits via Crash    *)
+(*     still finishes, which is NOT enough to converge; the SF assumptions  *)
+(*     below are what force infinitely-often-completed adjudications.       *)
+(*   * SF on RecoverSweep / GcSweepDone / the drain chain: if the action    *)
+(*     is enabled infinitely often it happens infinitely often. Weak       *)
+(*     fairness is NOT enough: a start-crash loop (or gc always dying      *)
+(*     mid-run) keeps interrupting every ENABLED period, so WF debts are   *)
+(*     cancelled forever. SF encodes the operations assumption "repeated   *)
+(*     restarts / gc invocations eventually succeed".                       *)
 (*   * GcRunsInfinitelyOften: `lightfs gc` is invoked infinitely often.     *)
 (*     Explicit CLI path — NOTHING retries deletion automatically between   *)
 (*     invocations; a single run leaves failed intents for the next run.    *)
@@ -513,7 +533,8 @@ SafeInv == /\ RefsSafe /\ DeletionAdmission /\ ObjectTracked
 FaultsEventuallyEnd == <>[]~failProne
 ProtectionEventuallyEnds == <>[](prot = "Unprotected")
 SweepOpportunitiesInfinitelyOften == []<>(phase = "Recovering" \/ gcp = "Sweeping")
-NoStuckRecovery == <>[]((phase # "Recovering") /\ (gcp # "Sweeping"))
+RecoveryPassesFinish == [](phase = "Recovering" => <>(phase # "Recovering"))
+GcSweepPassesFinish == [](gcp = "Sweeping" => <>(gcp # "Sweeping"))
 GcRunsInfinitelyOften == []<>(gcp = "Draining")
 
 FairSpec == Init
@@ -521,13 +542,14 @@ FairSpec == Init
          /\ FaultsEventuallyEnd
          /\ ProtectionEventuallyEnds
          /\ SweepOpportunitiesInfinitelyOften
-         /\ NoStuckRecovery
          /\ GcRunsInfinitelyOften
-         /\ WF_vars(RecoverSweep) /\ WF_vars(GcSweepDone)
-         /\ WF_vars(GcClaim)
-         /\ WF_vars(GcExecuteOk)
-         /\ WF_vars(GcExecuteFail)
-         /\ WF_vars(GcComplete)
+         /\ RecoveryPassesFinish
+         /\ GcSweepPassesFinish
+         /\ SF_vars(RecoverSweep) /\ SF_vars(GcSweepDone)
+         /\ SF_vars(GcClaim)
+         /\ SF_vars(GcExecuteOk)
+         /\ SF_vars(GcExecuteFail)
+         /\ SF_vars(GcComplete)
          /\ WF_vars(StrictPutOk) /\ WF_vars(StrictMark)
          /\ WF_vars(WbPutOk) /\ WF_vars(WbMark)
          /\ WF_vars(WbInlineDeleteConfirmed) /\ WF_vars(WbDropRow)

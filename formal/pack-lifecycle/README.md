@@ -86,14 +86,14 @@ The model is pure TLA+; it does not compile or load any Rust.
 - **Not a proof of the Rust implementation**: a finite-state check of the
   design within these bounds. Unit tests are not state-space checks.
 
-## Results (S4.12.1, all runs completed with no error found)
+## Results (S4.12.2, all runs completed with no error found — AND non-vacuous, see below)
 
 | Run | Mode | Kind | States generated | Distinct | Result |
 |-----|------|------|------------------|----------|--------|
-| 1 | strict | safety | 1 931 | 350 | pass |
-| 2 | wb | safety | 23 071 | 3 682 | pass |
-| 3 | strict | liveness | 1 931 | 350 | pass |
-| 4 | wb | liveness | 23 071 | 3 682 | pass |
+| 1 | strict | safety | 1 895 | 350 | pass |
+| 2 | wb | safety | 22 603 | 3 682 | pass |
+| 3 | strict | liveness | 1 895 | 350 | pass |
+| 4 | wb | liveness | 22 603 | 3 682 | pass |
 
 Action-coverage gate (S4.12.1): every in-mode action has `total > 0` in
 both modes; the only `0:0` entries are the other mode's actions and
@@ -130,56 +130,94 @@ by TLC (each names its real evidence):**
 | I7b kernel-lock semantics | ASSUMPTION at model level (single `lock` enum) | the OS lock excludes a second process and dies with the holder | Rust: `src/fslock.rs` S4.3.4b tests (three-axis rejection, real child SIGKILL), 4b.2 alias tests |
 | I9 SQLite atomicity | ASSUMPTION at model level; becomes an IMPLEMENTATION OBLIGATION: every action marked "one tx" in the mapping table must really be a single SQLite transaction | multi-row couplings (CAS+ref+finalize; flip+intent; complete=row+done) do not interleave | Rust: single `Connection` + `Transaction` blocks per mapping row; S4.2.2 p0a22 crash-window tests |
 
-### Liveness, and the assumptions it needs
+### Liveness: consistency, non-vacuity, and what each property needs
 
-`PackLifecycle-liveness.cfg` checks `FairSpec` with three properties:
+**S4.12.2 audit finding (the reason this section exists):** the S4.12.1
+FairSpec was **unsatisfiable**. `SweepOpportunitiesInfinitelyOften`
+(`[]<>(phase="Recovering" \/ gcp="Sweeping")` — sweep phases occur infinitely
+often) directly contradicted the old
+`NoStuckRecovery` (`<>[]((phase # "Recovering") /\ (gcp # "Sweeping"))` —
+eventually sweep phases never occur again). Under a contradiction every
+property is vacuously true, and TLC indeed printed "no error" for everything —
+including a deliberately-false probe. **None of the S4.12.1 liveness results
+were evidence.** The probe that exposed this is archived:
+`examples/` (the fixed-spec probes below flip to VIOLATED, which is the
+non-vacuity proof).
 
-- **L1 `BuildingConverges`**: `(pack = "Building" /\ ~failProne) ~> pack # "Building"`.
-- **L2 `IntentCompletes`**: a recorded deletion intent reaches `Done`.
-- **L4 `CommittingResolves`**: a Committing pack leaves Committing — for ANY
-  committing pack in strict; in wb only once every member is terminal.
+The fixed liveness spec:
 
-The assumptions, each an environment/operations fact the implementation
-does NOT provide by itself:
+- **Environment/operations assumptions (the implementation does NOT provide
+  these by itself):**
+  1. `FaultsEventuallyEnd == <>[]~failProne` — storage faults are finite.
+  2. `ProtectionEventuallyEnds == <>[](prot = "Unprotected")` — backup
+     retention ends for good.
+  3. `SweepOpportunitiesInfinitelyOften == []<>(phase = "Recovering" \/ gcp = "Sweeping")`
+     — restarts and gc stale-pack phases keep happening. A live engine NEVER
+     sweeps (by design, still modeled), so stale-row convergence rides on
+     there always being a NEXT pass.
+  4. `GcRunsInfinitelyOften == []<>(gcp = "Draining")` — `lightfs gc` keeps
+     being invoked. Explicit CLI path; NO daemon; NO automatic retry between
+     invocations.
+- **Pass-finish properties (the S4.12.2 task's candidate form, kept
+  explicitly; each is implied by the SF clause below):**
+  5. `RecoveryPassesFinish == [](phase = "Recovering" => <>(phase # "Recovering"))`
+  6. `GcSweepPassesFinish == [](gcp = "Sweeping" => <>(gcp # "Sweeping"))`
+- **Strong fairness where weak fairness is provably insufficient:** a
+  start-crash loop (or gc always dying mid-run) interrupts every ENABLED
+  period, cancelling WF debts forever; only SF ("enabled infinitely often ⇒
+  happens infinitely often") encodes the operations assumption that repeated
+  restarts / invocations eventually succeed:
+  `SF_vars(RecoverSweep)`, `SF_vars(GcSweepDone)`, `SF_vars(GcClaim)`,
+  `SF_vars(GcExecuteOk)`, `SF_vars(GcExecuteFail)`, `SF_vars(GcComplete)`.
+  CAS stays UNFAIR on purpose (client-close driven).
+- **`GcEnd` premise fix:** `gc_run` is a synchronous pipeline, so a run
+  cannot exit with a Pending/Claimed intent (`GcEnd` now requires
+  `intent ∈ {None, Done, Failed}`); a crash mid-run is `GcCrash`, unchanged.
+  Without this, a legal "always call gc, always exit before executing"
+  behavior starves the drain fairness forever — something the real
+  implementation never does.
 
-1. `FaultsEventuallyEnd == <>[]~failProne` — storage faults are finite.
-2. `ProtectionEventuallyEnds == <>[](prot = "Unprotected")` — backup
-   retention ends for good.
-3. `SweepOpportunitiesInfinitelyOften == []<>(phase = "Recovering" \/ gcp = "Sweeping")`
-   — **the load-bearing assumption**. A live engine NEVER sweeps, so
-   convergence of a stale row requires server (re)starts or `lightfs gc`
-   winning the engine lock, forever. The implementation's real promise is
-   exactly "the NEXT startup or gc pass adjudicates the row"; this
-   assumption says there always IS a next pass. A permanently-running
-   server whose lock gc never wins is a legal implementation behavior and
-   is correctly EXCLUDED from the property's scope by this assumption.
-4. `NoStuckRecovery == <>[]((phase # "Recovering") /\ (gcp # "Sweeping"))` —
-   no process is interrupted in its sweep phase forever (start-crash loops
-   that always kill the pass are excluded; a started pass completes).
-5. `GcRunsInfinitelyOften == []<>(gcp = "Draining")` — `lightfs gc` is an
-   explicit CLI path with NO daemon and NO automatic retry between
-   invocations: a single run leaves failed intents for the next run. This
-   assumption is the environment promising repeated invocations; it is not
-   a claim that the implementation retries by itself.
-6. WF inside phases: a started pass completes (`WF RecoverSweep` /
-   `WF GcSweepDone`); a draining gc advances (claim/execute/complete); a
-   serving engine progresses on uploads/marks. **CAS stays unfair on
-   purpose** — it is client-close driven.
+**Non-vacuity evidence (S4.12.2 §3 method: deliberately-expected-failure
+probes, isolated, never acceptance properties):**
 
-Known NON-properties (asserted false on purpose; S4.12 traces archived):
+| Probe | PROPERTY | Expected | Result |
+|-------|----------|----------|--------|
+| `VacuityProbe` under the OLD (contradictory) FairSpec | `~<>(intent = "Done")` | "No error" ⇒ empty behavior graph | **No error — vacuity confirmed** |
+| `~BuildingConverges` under the fixed spec (strict) | negation of an accepted property | VIOLATED ⇒ a legal infinite behavior exists | **violated**; lasso `examples/nonvacuity-probe-strict.trace`: `GcStart → GcSweepDone → GcEnd` loop |
+| full-pipeline probe (strict) | `~(<>(phase="Serving") /\ <>(intent="Done"))` | VIOLATED | **violated**; lasso `examples/nonvacuity-probe-full-pipeline.trace`: `Init → EngineStart → RecoverSweep → StrictRegister → StrictPutOk → EngineCrash → GcStart → GcSweepDone → GcClaim → GcExecuteOk → GcComplete → GcEnd → (GcStart → GcSweepDone → GcEnd)*` |
+| full-pipeline probe (wb) | same | VIOLATED | **violated**; `examples/nonvacuity-probe-full-pipeline-wb.trace` |
 
-- `pack = "Building" ~> pack # "Building"` unguarded is FALSE — after a
-  crash with no restart and no gc run the stale row legally stays forever.
-  `examples/L1-unguarded-counterexample.trace`.
-- A stale row is NOT "auto-healed while the engine runs": S4.12.1 removed
-  that modeling error. Convergence rides on the next pass (assumption 3).
-- `mem[x] = "Committed" => refs ≥ 1` holds only at commit instants
-  (namespace unlink retires references) — checked as safety I1, not
-  liveness.
-- Within ONE gc run a failed deletion may stay failed; retry belongs to
-  the next invocation (L2 leans on assumption 5).
+Each lasso satisfies `Init`, `Next`, all environment assumptions, the SF/WF
+clauses and the Finish properties — TLC guarantees this for any
+counter-example; the loop segments above were re-checked by hand against each
+clause.
+
+**The three properties, per mode, with exactly what each depends on:**
+
+| Property (both modes pass) | Implementation guarantees by itself | Depends on faults ending | Depends on protection ending | Depends on next sweep pass existing | Depends on gc being re-invoked | Depends on fairness |
+|---|---|---|---|---|---|---|
+| `BuildingConverges` strict | the next startup/gc pass adjudicates any decidable stale row | yes (undecidable HEAD keeps the row) | no | **yes — load-bearing** | no | yes (SF on passes) |
+| `BuildingConverges` wb | same + failure-arm rows keep the tracker | yes | no | **yes — load-bearing** | no | yes |
+| `IntentCompletes` strict | a failed DELETE leaves a retryable durable intent; a single run drains synchronously | yes | yes | no | **yes — load-bearing** | yes (SF on the drain chain) |
+| `IntentCompletes` wb | same | yes | yes | no | **yes — load-bearing** | yes |
+| `CommittingResolves` strict | the sweep finalizes ANY committing pack (no HEAD needed) | no | no | **yes — load-bearing** | no | yes |
+| `CommittingResolves` wb | an engine never finalizes a batch with a live member; once all members are terminal the next pass resolves it | no | no | **yes — load-bearing** | no | yes (premise `AllTerminal` is a client-side condition the model does not force) |
+
+None of the "depends on" cells is provided automatically by the production
+implementation; each is an environment/operations premise stated in FairSpec.
+A permanently-running server whose lock gc never wins, and an operator who
+never re-runs gc, are legal worlds with NO convergence — the properties do
+not apply there, by construction of the assumptions.
 
 ### Counter-examples
+
+S4.12.2's finding is not a TLC counter-example but an audit result: the
+S4.12.1 FairSpec was self-contradictory (sweep phases infinitely often vs
+eventually never again), making every liveness check vacuous. The fix
+(replace the <>[]-shaped assumption with pass-finish properties + SF where
+WF is provably insufficient; align GcEnd with the synchronous gc_run
+pipeline) was verified non-vacuous by expected-failure probes before any
+property was allowed to count as passing.
 
 S4.12.1 produced **no new TLC counter-example**: after the fidelity fixes
 all five runs passed. The adjudication records below are from S4.12 and
