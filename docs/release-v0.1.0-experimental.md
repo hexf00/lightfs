@@ -100,9 +100,9 @@ this is exercised end-to-end by `scripts/backup-restore-drill.sh` and
 | Batch-Pack drain (Write-Back sub-mode) | verified (experimental, default OFF) | batch crash-contract tests, streaming seal, orphan lifecycle; same FUSE caveat |
 | Backup / restore | verified | `scripts/backup-restore-drill.sh`: byte-exact restore, gc protection, corrupt-manifest fail-closed |
 | FSCK / GC | verified | drill + `scripts/s431-gc-e2e.sh` (all scenarios) + lock-protocol tests (offline commands refuse a live server) |
-| Linux (x86_64/aarch64 GNU) | verified at test level | full `cargo test --lib` suite green in a Debian container; no native end-to-end run in this release |
-| Windows | verified at CI level | windows-ci: unit-tests + build + WinFsp mount-smoke (experimental adapter) |
-| macOS | verified | full gate chain runs on macOS arm64 (dev machine) |
+| Linux (x86_64/aarch64 GNU) | verified at CI + test level | GitHub Actions `ci.yml` on the release commit: unit+integration suites and MinIO contract green on ubuntu-latest; locally the full `cargo test --lib` suite is green in a Debian aarch64 container. **FUSE mounting is NOT verified in this release** — no runner with `/dev/fuse` was available; the FUSE acceptance gate in `release-gates.yml` requires a self-hosted runner and did not run |
+| Windows | verified at CI level | windows-ci run 38967302545: unit-tests + build + WinFsp mount-smoke (experimental adapter) all green; x64 binaries in the `lightfs-windows-x64` artifact |
+| macOS (ARM64) | verified | dev machine (Apple M1): full gate chain + release-bundle E2E (`scripts/v01-restart-check.sh`); GitHub Actions `ci.yml` `macos-arm64` job: release build + lib suite + smoke, binaries in the `lightfs-darwin-arm64-<sha>` artifact. No macOS mount adapter exists — server + RPC only |
 
 ## Known limits (read before experimenting)
 

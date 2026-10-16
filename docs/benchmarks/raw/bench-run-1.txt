@@ -1,0 +1,12 @@
+=== run 1 (2026-10-16T20:56:10Z) ===
+# dataset ready: 200 x 102400B small objects + 32MiB large object (prepare 0.6s)
+raw-s3 serial                     200 reqs    200 files  20480000 bytes     0.19s  103.54 MB/s  1060.2 files/s | lat ms avg   0.94 p50   0.91 p95   1.12 p99   1.54
+raw-s3 par-8                      200 reqs    200 files  20480000 bytes     0.08s  234.00 MB/s  2396.2 files/s | lat ms avg   3.28 p50   3.16 p95   5.35 p99   7.55
+# lfs import: 200 files through product write path in 1.1s
+lfs serial                        200 reqs    200 files  20480000 bytes     0.81s   24.25 MB/s   248.4 files/s | lat ms avg   4.02 p50   4.07 p95   5.78 p99  10.18
+lfs par-8                         200 reqs    200 files  20480000 bytes     0.13s  151.63 MB/s  1552.7 files/s | lat ms avg   5.04 p50   3.62 p95  11.16 p99  18.69
+lfs large full-read                 1 reqs      1 files  33554432 bytes     0.08s  388.29 MB/s    12.1 files/s | lat ms avg  81.06 p50  81.06 p95  81.06 p99  81.06
+lfs large 8MiB-chunked              4 reqs      4 files  33554432 bytes     0.08s  383.15 MB/s    47.9 files/s | lat ms avg  20.80 p50  20.45 p95  22.16 p99  22.16
+lfs large STREAMED-WRITE            1 reqs      1 files  33554432 bytes     0.26s  121.78 MB/s     3.8 files/s | lat ms avg   0.00 p50   0.00 p95   0.00 p99   0.00
+lfs 4KiB-rand par-1               200 reqs    200 files    819200 bytes     0.13s    5.84 MB/s  1494.9 files/s | lat ms avg   0.67 p50   0.67 p95   0.71 p99   0.77
+lfs meta(lookup) par-1            400 reqs    400 files      3800 bytes     0.07s    0.05 MB/s  5508.2 files/s | lat ms avg   0.18 p50   0.18 p95   0.20 p99   0.22
