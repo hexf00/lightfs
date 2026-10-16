@@ -10,8 +10,6 @@ use crate::object_store::s3::S3Config;
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
-    /// embedded | server | client
-    pub mode: String,
     pub s3: S3Section,
     pub metadata: MetadataSection,
     pub server: ServerSection,
@@ -238,7 +236,6 @@ impl Config {
             Some(p) if Path::new(p).exists() => Self::load(p),
             Some(p) => Err(Error::Config(format!("config not found: {p}"))),
             None => Ok(Config {
-                mode: "embedded".into(),
                 s3: S3Section {
                     endpoint: "http://127.0.0.1:9000".into(),
                     region: "us-east-1".into(),
@@ -322,7 +319,6 @@ mod tests {
     fn parse_example_toml() {
         let text = std::fs::read_to_string("config/example.toml").unwrap();
         let cfg: Config = toml::from_str(&text).unwrap();
-        assert_eq!(cfg.mode, "embedded");
         assert_eq!(cfg.s3.endpoint, "http://127.0.0.1:9000");
         assert_eq!(cfg.s3.bucket, "lightfs");
         assert!(cfg.s3.path_style);
@@ -335,7 +331,6 @@ mod tests {
     #[test]
     fn defaults_fill_optional_fields() {
         let cfg = Config::load_or_defaults(None).unwrap();
-        assert_eq!(cfg.mode, "embedded");
         assert_eq!(cfg.server.bind, "127.0.0.1:8080");
     }
 }

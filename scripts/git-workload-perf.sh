@@ -62,7 +62,6 @@ echo $! > "$RUN/minio.pid"
 wait_http http://127.0.0.1:9000/minio/health/live || fail "minio up"
 
 cat > "$RUN/cfg.toml" <<CFGEOF
-mode = "server"
 [s3]
 endpoint = "http://127.0.0.1:9000"
 region = "us-east-1"

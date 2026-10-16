@@ -248,7 +248,6 @@ start_stack() {  # $1 = group label -> fresh bucket + meta.db + server + mount
     mkdir -p "$GDIR"
     {
         cat <<EOF
-mode = "server"
 [s3]
 endpoint = "http://127.0.0.1:$MINIO_PORT"
 region = "us-east-1"

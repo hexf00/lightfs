@@ -48,7 +48,6 @@ curl -s --noproxy '*' -m 1 -o /dev/null http://127.0.0.1:9000/minio/health/live 
     || fail "minio up"
 
 cat > "$RUN/cfg.toml" <<CFGEOF
-mode = "server"
 [s3]
 endpoint = "http://127.0.0.1:9000"
 region = "us-east-1"

@@ -168,7 +168,6 @@ start_container(){
 
 start_server_in_container(){
     docker exec -i "$CTR" sh -c "mkdir -p /g && cat > /g/srv.toml" <<SRVEOF
-mode = "server"
 [s3]
 endpoint = "$S3URL"
 region = "us-east-1"
@@ -200,7 +199,6 @@ SRVEOF
 
 start_mount_in_container(){
     docker exec -i "$CTR" sh -c "cat > /g/mnt.toml" <<MNTEOF
-mode = "server"
 [s3]
 endpoint = "$S3URL"
 region = "us-east-1"

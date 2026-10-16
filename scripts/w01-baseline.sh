@@ -112,7 +112,6 @@ start_stack() {  # $1 = group label -> fresh bucket + meta.db + server + mount
     BUCKET="w01-$1"
     mkdir -p "$GDIR/mnt"
     cat > "$GDIR/cfg.toml" <<EOF
-mode = "server"
 [s3]
 endpoint = "http://127.0.0.1:$MINIO_PORT"
 region = "us-east-1"
@@ -533,7 +532,6 @@ cache_mount() {  # $1 = none|memory|small
         cp "$GDIR/cfg.toml" "$cfg"
     else
         cat > "$cfg" <<EOF
-mode = "server"
 [s3]
 endpoint = "http://127.0.0.1:$MINIO_PORT"
 region = "us-east-1"

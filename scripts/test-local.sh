@@ -11,7 +11,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 echo "== unit tests (no network, no FUSE)"
 cargo test
 
-echo "== MinIO integration (object store, embedded engine, external modification)"
+echo "== MinIO integration (object store, engine, external modification)"
 start_minio
 LIGHTFS_TEST_MINIO=1 cargo test
 
@@ -20,7 +20,6 @@ cargo build -q
 DB="/tmp/lightfs-local-$$-$(date +%s).db"
 CFG="/tmp/lightfs-local-$$-$(date +%s).toml"
 cat > "$CFG" <<EOF
-mode = "embedded"
 [s3]
 endpoint = "${LIGHTFS_S3_ENDPOINT:-http://127.0.0.1:9000}"
 region = "us-east-1"
@@ -42,7 +41,6 @@ echo "== fsck on a clean namespace"
 DB2="/tmp/lightfs-fscklocal-$$-$(date +%s).db"
 CFG2="/tmp/lightfs-fscklocal-$$-$(date +%s).toml"
 cat > "$CFG2" <<EOF
-mode = "embedded"
 [s3]
 endpoint = "${LIGHTFS_S3_ENDPOINT:-http://127.0.0.1:9000}"
 region = "us-east-1"

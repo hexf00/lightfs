@@ -17,7 +17,6 @@ cargo build --release -q
 DB="/tmp/lightfs-bench-$$-$(date +%s).db"
 CFG="/tmp/lightfs-bench-$$-$(date +%s).toml"
 cat > "$CFG" <<EOF
-mode = "server"
 [s3]
 endpoint = "${LIGHTFS_S3_ENDPOINT:-http://127.0.0.1:9000}"
 region = "us-east-1"

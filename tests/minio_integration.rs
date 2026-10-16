@@ -41,7 +41,7 @@ fn embedded_engine_end_to_end() {
         Err(_) => return, // MinIO gate not set; unit tests cover the rest
     };
     let _ = std::fs::remove_file(&cfg.metadata.path);
-    let eng = lightfs::engine::open_embedded(&cfg).expect("embedded engine opens");
+    let eng = lightfs::engine::open_engine(&cfg).expect("embedded engine opens");
 
     // namespace operations through the embedded Core
     eng.core.mkdir("/docs", 0o755).unwrap();
@@ -88,7 +88,7 @@ fn embedded_engine_restart_persists_namespace() {
     let _ = std::fs::remove_file(&cfg.metadata.path);
 
     {
-        let eng = lightfs::engine::open_embedded(&cfg).unwrap();
+        let eng = lightfs::engine::open_engine(&cfg).unwrap();
         eng.core.mkdir("/keep", 0o755).unwrap();
         eng.core.create("/keep/data.bin", 0o644).unwrap();
         let h = eng.core.open_write("/keep/data.bin", None).unwrap();
@@ -97,7 +97,7 @@ fn embedded_engine_restart_persists_namespace() {
     } // engine dropped: "process restart"
 
     {
-        let eng = lightfs::engine::open_embedded(&cfg).unwrap();
+        let eng = lightfs::engine::open_engine(&cfg).unwrap();
         let node = eng.core.lookup("/keep/data.bin").unwrap();
         assert_eq!(node.size, 16);
         assert_eq!(
@@ -121,7 +121,7 @@ fn embedded_mem_engine_network_free() {
         .to_string_lossy()
         .to_string();
     let _ = std::fs::remove_file(&cfg.metadata.path);
-    let eng = lightfs::engine::open_embedded_mem(&cfg).unwrap();
+    let eng = lightfs::engine::open_engine_mem(&cfg).unwrap();
     eng.core.mkdir("/x", 0o755).unwrap();
     eng.core.create("/x/y", 0o644).unwrap();
     let h = eng.core.open_write("/x/y", None).unwrap();
@@ -171,7 +171,7 @@ fn concurrent_commit_race_minio() {
             }
         }
     }
-    let eng = lightfs::engine::open_embedded(&cfg).expect("engine opens");
+    let eng = lightfs::engine::open_engine(&cfg).expect("engine opens");
     eng.core.create("/race", 0o644).unwrap();
     let v = eng.core.lookup("/race").unwrap().version;
     // The previous round's winner key: once superseded it must show up as a
@@ -297,7 +297,7 @@ fn point_in_time_restore_minio() {
     let keep_v1 = b"point-in-time original content";
     let zap_old = b"deleted after backup, must come back";
     {
-        let eng = lightfs::engine::open_embedded(&cfg).unwrap();
+        let eng = lightfs::engine::open_engine(&cfg).unwrap();
         for (path, content) in [("/keep", &keep_v1[..]), ("/zap", &zap_old[..])] {
             eng.core.create(path, 0o644).unwrap();
             let h = eng.core.open_write(path, None).unwrap();
@@ -317,7 +317,7 @@ fn point_in_time_restore_minio() {
 
     // Damage everything recoverable: overwrite, delete, and add.
     {
-        let eng = lightfs::engine::open_embedded(&cfg).unwrap();
+        let eng = lightfs::engine::open_engine(&cfg).unwrap();
         let v = eng.core.lookup("/keep").unwrap().version;
         let h = eng.core.open_write("/keep", Some(v)).unwrap();
         eng.core
@@ -340,7 +340,7 @@ fn point_in_time_restore_minio() {
     let _ = std::fs::remove_file(&restore_cfg.metadata.path);
     std::fs::copy(&snapshot_db, &restore_cfg.metadata.path).unwrap();
     {
-        let eng = lightfs::engine::open_embedded(&restore_cfg).unwrap();
+        let eng = lightfs::engine::open_engine(&restore_cfg).unwrap();
         assert_eq!(eng.core.read("/keep", 0, 100).unwrap(), keep_v1);
         assert_eq!(eng.core.read("/zap", 0, 100).unwrap(), zap_old);
         assert!(
@@ -386,7 +386,7 @@ fn symlinks_with_minio_fsck_and_reopen() {
         Err(_) => return,
     };
     let _ = std::fs::remove_file(&cfg.metadata.path);
-    let eng = lightfs::engine::open_embedded(&cfg).expect("embedded engine opens");
+    let eng = lightfs::engine::open_engine(&cfg).expect("embedded engine opens");
 
     // a real file, a relative link, a dangling link, a dir link
     eng.core.mkdir("/app", 0o755).unwrap();
@@ -422,7 +422,7 @@ fn symlinks_with_minio_fsck_and_reopen() {
     // dropped first — S4.10 engines hold the single-writer lock, so a
     // "reopen" models a real restart where the previous holder is gone.
     drop(eng);
-    let eng2 = lightfs::engine::open_embedded(&cfg).expect("reopen");
+    let eng2 = lightfs::engine::open_engine(&cfg).expect("reopen");
     assert_eq!(eng2.core.readlink("/app/run").unwrap(), "cli.js");
     assert_eq!(eng2.core.readlink("/shortcut").unwrap(), "../app/cli.js");
     assert_eq!(

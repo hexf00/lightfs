@@ -616,7 +616,7 @@ mod tests {
             },
             ..Default::default()
         };
-        crate::engine::open_embedded_mem(&cfg).unwrap().core
+        crate::engine::open_engine_mem(&cfg).unwrap().core
     }
 
     fn cached(core: Arc<Core>, prefix: &str, budget: u64) -> CacheFs {

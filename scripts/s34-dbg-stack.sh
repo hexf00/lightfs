@@ -19,7 +19,6 @@ docker run -d --rm --privileged --device /dev/fuse --name "$CTR" \
   -v "$HOME/code/s34-deploy":/deploy -v "$HOME/code/react-mirror":/data-src:ro \
   -p 127.0.0.1:18095:18095 lightfs-s34:arm64 sleep 3600 >/dev/null
 docker exec -i "$CTR" sh -c 'mkdir -p /g && cat > /g/srv.toml' <<EOF
-mode = "server"
 [s3]
 endpoint = "http://$HOST_IP:19003"
 region = "us-east-1"
@@ -38,7 +37,6 @@ enabled = false
 $( [[ "$BIN" == "C" ]] && printf '[commit]\nmode = "writeback"\n[writeback]\nstaging_dir = "/g/wb"\ndrain_workers = 1\nbatch_pack_bytes = 8388608\nbatch_max_wait_ms = 200\nqueue_max_tasks = 4096\n' )
 EOF
 docker exec -i "$CTR" sh -c 'cat > /g/mnt.toml' <<EOF
-mode = "server"
 [s3]
 endpoint = "http://$HOST_IP:19003"
 region = "us-east-1"

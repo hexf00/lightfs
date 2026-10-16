@@ -30,7 +30,7 @@ impl TestServer {
     fn start(db: &str) -> Result<Self> {
         let cfg = mem_config(db)?;
         let _ = std::fs::remove_file(&cfg.metadata.path);
-        let eng = engine::open_embedded_mem(&cfg)?;
+        let eng = engine::open_engine_mem(&cfg)?;
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let port = server.server_addr().to_ip().unwrap().port();
         std::thread::spawn(move || {

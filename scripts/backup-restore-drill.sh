@@ -29,7 +29,6 @@ cargo build --release -q --bin lightfs --bin lightfs-shell
 
 CFG="$RUN/drill.toml"
 cat > "$CFG" <<CFGEOF
-mode = "server"
 [s3]
 endpoint = "${LIGHTFS_S3_ENDPOINT:-http://127.0.0.1:9000}"
 region = "us-east-1"
@@ -107,7 +106,6 @@ start_server
   cp "$RUN/backup.db" "$RUN/restored.db"
   RC="$RUN/restored.toml"
   cat > "$RC" <<RESTOREOF
-mode = "embedded"
 [s3]
 endpoint = "${LIGHTFS_S3_ENDPOINT:-http://127.0.0.1:9000}"
 region = "us-east-1"

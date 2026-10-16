@@ -63,32 +63,16 @@ fn run(args: Vec<String>) -> Result<(), lightfs::error::Error> {
             },
         ))
     } else {
-        // Default backend: embedded, honoring config mode.
+        // Test-driver default: a local engine in THIS process (`--mem` for
+        // the network-free object store). lightfs-shell is not a production
+        // entry point — the metadata authority is always `lightfs server`.
         let cfg = Config::load_or_defaults(config_path.as_deref())?;
-        if cfg.mode == "server" {
-            // mode=server in config means: talk to the server over the network.
-            let ttl = if cfg.cache.metadata.enabled {
-                Some(std::time::Duration::from_secs(
-                    cfg.cache.metadata.ttl_seconds,
-                ))
-            } else {
-                None
-            };
-            let url = format!("http://{}", cfg.server.bind);
-            Arc::new(lightfs::client::Client::new(
-                lightfs::client::ClientConfig {
-                    url,
-                    metadata_ttl: ttl,
-                },
-            ))
+        let engine = if mem {
+            lightfs::engine::open_engine_mem(&cfg)?
         } else {
-            let engine = if mem {
-                lightfs::engine::open_embedded_mem(&cfg)?
-            } else {
-                lightfs::engine::open_embedded(&cfg)?
-            };
-            engine.core as Arc<dyn FsApi>
-        }
+            lightfs::engine::open_engine(&cfg)?
+        };
+        engine.core as Arc<dyn FsApi>
     };
 
     let _ = embedded;

@@ -120,7 +120,6 @@ run_group(){  # $1 = A|C
     mkdir -p "$GDIR" "$W" "$M"
     {
         cat <<EOF
-mode = "server"
 [s3]
 endpoint = "http://127.0.0.1:$MINIO_PORT"
 region = "us-east-1"

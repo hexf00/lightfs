@@ -26,7 +26,6 @@ cargo build -q
 CFG="/tmp/lightfs-fuse-$$-$(date +%s).toml"
 DB="/tmp/lightfs-fuse-$$-$(date +%s).db"
 cat > "$CFG" <<EOF
-mode = "server"
 [s3]
 endpoint = "${LIGHTFS_S3_ENDPOINT:-http://127.0.0.1:9000}"
 region = "us-east-1"

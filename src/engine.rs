@@ -1,6 +1,6 @@
 //! Engine composition: Filesystem Core + MetadataStore + ObjectStore.
-//! Embedded mode and server mode both start from here (one
-//! server process owns one SQLite metadata store; PostgreSQL postponed).
+//! The server process (and integration tests) start from here. One engine
+//! process owns one SQLite metadata store, enforced by the engine lock.
 
 use std::sync::Arc;
 
@@ -75,11 +75,13 @@ pub(crate) fn engine_lock_path(cfg: &Config) -> Result<std::path::PathBuf> {
 }
 
 /// Build the Core from config, wiring the S3.1 prototype engines (pack /
-/// write-back) when enabled. Shared by embedded and server startup.
+/// write-back) when enabled. Shared by the server and maintenance startup.
 /// `enable_wb = false` (maintenance commands) never constructs the
 /// write-back engine: `gc`/`fsck` stage and drain nothing, and they must
 /// stay usable on a write-back deployment while the live server owns the
-/// staging directory and the capacity ledger.
+/// staging directory and the capacity ledger. Ownership of the engine lock
+/// is NOT taken here for that branch — `open_maintenance` acquires it
+/// before SQLite is opened and hands it to the Core afterwards.
 fn build_core(
     cfg: &Config,
     meta: Arc<dyn MetadataStore>,
@@ -124,12 +126,14 @@ fn build_core(
         core.start_wb_workers(workers);
     } else if enable_wb {
         // S4.10: strict-mode engines take the single-writer engine lock too
-        // (write-back engines acquire it inside their constructor; maintenance
-        // commands never construct an engine and stay lock-free). Two engines
-        // on one database now fail loudly at startup instead of silently
-        // corrupting each other's packs. Holding the lock is also what makes
-        // the startup stale-pack sweep safe: a building/committing row cannot
-        // belong to an in-flight seal of a dead writer once we own the lock.
+        // (write-back engines acquire it inside their constructor; the
+        // maintenance entry acquires it in `open_maintenance` BEFORE SQLite
+        // is opened and never builds an engine branch of its own). Two
+        // engines on one database now fail loudly at startup instead of
+        // silently corrupting each other's packs. Holding the lock is also
+        // what makes the startup stale-pack sweep safe: a building/committing
+        // row cannot belong to an in-flight seal of a dead writer once we
+        // own the lock.
         let lock = crate::fslock::FileLock::try_acquire(&engine_lock_path(cfg)?)?;
         let sweep = core.recover_stale_packs()?;
         if sweep.finalized_committing > 0
@@ -150,8 +154,10 @@ fn build_core(
     Ok(core)
 }
 
-/// Embedded mode: Core + SQLite + S3 in one process. No daemon required.
-pub fn open_embedded(cfg: &Config) -> Result<Engine> {
+/// The engine entry point: Core + SQLite + S3 in one process. `lightfs
+/// server` runs this; integration tests use it to exercise the exact
+/// production wiring.
+pub fn open_engine(cfg: &Config) -> Result<Engine> {
     ensure_parent_dir(&cfg.metadata.path);
     let meta: Arc<dyn MetadataStore> = Arc::new(SqliteMetadataStore::open(&cfg.metadata.path)?);
     let objects: Arc<dyn ObjectStore> = Arc::new(S3ObjectStore::new(cfg.s3_config())?);
@@ -161,9 +167,11 @@ pub fn open_embedded(cfg: &Config) -> Result<Engine> {
     })
 }
 
-/// Embedded engine on the in-memory object store: network-free loop for
-/// tests and throwaway exploration. The SQLite file still persists.
-pub fn open_embedded_mem(cfg: &Config) -> Result<Engine> {
+/// Engine over the in-memory object store: network-free loop for tests and
+/// throwaway exploration. The SQLite file still persists. This is a test
+/// facility, NOT a deployment mode — production code must go through
+/// [`open_engine`] or [`open_maintenance`].
+pub fn open_engine_mem(cfg: &Config) -> Result<Engine> {
     ensure_parent_dir(&cfg.metadata.path);
     let meta: Arc<dyn MetadataStore> = Arc::new(SqliteMetadataStore::open(&cfg.metadata.path)?);
     let objects: Arc<dyn ObjectStore> = Arc::new(crate::object_store::mem::MemObjectStore::new());
@@ -172,18 +180,30 @@ pub fn open_embedded_mem(cfg: &Config) -> Result<Engine> {
     })
 }
 
-/// Maintenance entry (`lightfs gc`, `lightfs fsck`): metadata + object
-/// stores WITHOUT the write-back engine. These commands stage and drain
-/// nothing; skipping the WB engine keeps them lock-free so they run against
-/// a write-back deployment while the live server owns the staging directory
-/// and the capacity ledger.
-pub fn open_embedded_maintenance(cfg: &Config) -> Result<Engine> {
+/// Maintenance entry (`lightfs gc`, `lightfs fsck`): an exclusive, offline
+/// engine. Ownership contract (S4.14): the engine lock is acquired BEFORE
+/// SQLite is opened or initialized, and the lock is held until the process
+/// exits — so a maintenance command against a running server fails loudly
+/// at the lock and never even opens the database, and a server cannot start
+/// while a maintenance pass runs. No write-back engine is constructed:
+/// maintenance stages and drains nothing; the live server owns the staging
+/// directory and the capacity ledger.
+pub fn open_maintenance(cfg: &Config) -> Result<Engine> {
     ensure_parent_dir(&cfg.metadata.path);
+    // The lock derivation (canonical_identity) needs the target file to
+    // exist. Creating an EMPTY file does not open or initialize SQLite —
+    // a real open writes the header page — so lock-before-SQLite holds.
+    if !std::path::Path::new(&cfg.metadata.path).exists() {
+        std::fs::write(&cfg.metadata.path, b"")?;
+    }
+    let lock = crate::fslock::FileLock::try_acquire(&engine_lock_path(cfg)?)?;
     let meta: Arc<dyn MetadataStore> = Arc::new(SqliteMetadataStore::open(&cfg.metadata.path)?);
     let objects: Arc<dyn ObjectStore> = Arc::new(S3ObjectStore::new(cfg.s3_config())?);
     objects.ping()?;
+    let mut core = build_core(cfg, meta, objects, false)?;
+    core.hold_engine_lock(lock);
     Ok(Engine {
-        core: Arc::new(build_core(cfg, meta, objects, false)?),
+        core: Arc::new(core),
     })
 }
 
@@ -232,7 +252,7 @@ mod tests {
             ))
             .to_string_lossy()
             .to_string();
-        let msg = match open_embedded_mem(&cfg) {
+        let msg = match open_engine_mem(&cfg) {
             Err(e) => format!("{e}"),
             Ok(_) => panic!("startup must refuse drain_workers=2"),
         };
@@ -262,7 +282,7 @@ mod tests {
             ))
             .to_string_lossy()
             .to_string();
-        let eng = open_embedded_mem(&cfg).unwrap();
+        let eng = open_engine_mem(&cfg).unwrap();
         // Simulate a crash leftover: a registered pack whose upload never
         // happened (this engine's in-memory object store holds nothing).
         eng.core
@@ -270,14 +290,14 @@ mod tests {
             .register_pack("packs/s410-lost.pack", 5)
             .unwrap();
 
-        let msg = match open_embedded_mem(&cfg) {
+        let msg = match open_engine_mem(&cfg) {
             Err(e) => format!("{e}"),
             Ok(_) => panic!("second strict engine on one db must be refused"),
         };
         assert!(msg.contains("locked"), "got: {msg}");
 
         drop(eng);
-        let eng2 = open_embedded_mem(&cfg).unwrap();
+        let eng2 = open_engine_mem(&cfg).unwrap();
         assert!(
             eng2.core
                 .metadata()
@@ -288,72 +308,20 @@ mod tests {
         );
     }
 
-    /// S4.10: the gc stale-pack phase is gated on single-writer ownership.
-    /// With the lock free it runs; while any engine holds the lock it is
-    /// skipped (`None`) — never guessed around.
+    /// S4.13.1 / S4.14 (model gap A, re-staged): the GC STATE MACHINE under
+    /// LEGITIMATE ownership — the maintenance entry already holds the engine
+    /// lock (see the s414 ownership tests for the refusal side), so this is
+    /// exactly the sequence `lightfs gc` runs: stale-pack sweep FIRST, then
+    /// the enroll/execute pass. Coverage: an intent durably registered
+    /// BEFORE the run, a candidate the run enrolls itself, and a stale
+    /// building row the sweep adjudicates — objects really deleted, pack
+    /// rows really gone, the durable queue fully drained. Every assertion
+    /// reads SQLite row state, object-store state or the intent queue.
     #[test]
-    fn s410_gc_stale_phase_respects_engine_lock() {
-        let mut cfg = Config::default();
-        cfg.metadata.path = std::env::temp_dir()
-            .join(format!(
-                "lightfs-s410-gc-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ))
-            .to_string_lossy()
-            .to_string();
-        let core = crate::core::Core::new(
-            std::sync::Arc::new(
-                crate::metadata::sqlite::SqliteMetadataStore::open_in_memory().unwrap(),
-            ),
-            std::sync::Arc::new(crate::object_store::mem::MemObjectStore::new()),
-        );
-        // canonical_identity refuses a nonexistent database path, so the
-        // lock derivation target must exist — as it always does for a real
-        // engine (the store is opened before any lock is taken).
-        std::fs::write(&cfg.metadata.path, b"").unwrap();
-        assert!(
-            super::super::cmd::gc_stale_pack_phase(&core, &cfg)
-                .unwrap()
-                .is_some()
-        );
-        let _live = crate::fslock::FileLock::try_acquire(&engine_lock_path(&cfg).unwrap()).unwrap();
-        assert!(
-            super::super::cmd::gc_stale_pack_phase(&core, &cfg)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    /// S4.13.1 (model gap A): a live engine lock skips ONLY the stale-pack
-    /// sweep. The deletion-intent drain still runs with its real semantics
-    /// for BOTH kinds of work — an intent durably registered BEFORE gc_run
-    /// is invoked (pack flipped to `deleting` up front) and a candidate the
-    /// run enrolls itself — while the engine's in-flight stale building row
-    /// is NOT touched. A sweep after the lock is released converges it.
-    /// Every assertion reads SQLite row state, object-store state or the
-    /// durable intent queue — never a log line.
-    #[test]
-    fn s413_gc_lock_skip_keeps_stale_row_and_still_drains_intents() {
-        let mut cfg = Config::default();
-        cfg.metadata.path = std::env::temp_dir()
-            .join(format!(
-                "lightfs-s413-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ))
-            .to_string_lossy()
-            .to_string();
-        std::fs::write(&cfg.metadata.path, b"").unwrap();
+    fn s413_gc_state_machine_drains_both_intent_sources_and_converges_stale() {
         let mem = std::sync::Arc::new(crate::object_store::mem::MemObjectStore::new());
-        // retention off: candidates qualify as soon as they exist, so the
-        // pre-existing intent below drains deterministically in one run.
+        // retention off: candidates qualify as soon as they exist, so every
+        // intent below drains deterministically in one run.
         let core = std::sync::Arc::new(crate::core::Core::with_retention(
             std::sync::Arc::new(
                 crate::metadata::sqlite::SqliteMetadataStore::open_in_memory().unwrap(),
@@ -363,14 +331,13 @@ mod tests {
         ));
         let now = 10_000i64;
 
-        // A stale building pack left by the "live engine" (row + object up):
-        // exactly what the sweep must NOT adjudicate behind the owner's back.
+        // A stale building pack (row + object): the sweep's job.
         let stale = "packs/s413-stale.pack";
         core.metadata().register_pack(stale, 5).unwrap();
         mem.put(stale, b"stale").unwrap();
 
-        // (2a) A PRE-EXISTING durable deletion intent: fully registered
-        // BEFORE gc_run is ever called, so the drain below proves it
+        // (a) A PRE-EXISTING durable deletion intent, fully registered
+        // BEFORE gc_run is ever invoked, so the drain below proves it
         // executes work it did not create in this run. Registration and
         // the pending intent row land in ONE transaction, so pack state
         // `deleting` is the durable evidence the intent exists.
@@ -396,7 +363,7 @@ mod tests {
             "registered = flipping unreferenced -> deleting with a pending intent"
         );
 
-        // (2b) A reclaimable pack that is merely unreferenced: NO intent
+        // (b) A reclaimable pack that is merely unreferenced: NO intent
         // yet — gc_run must enroll it itself in this same run.
         let reclaimable = "packs/s413-reclaim.pack";
         core.metadata().register_pack(reclaimable, 9).unwrap();
@@ -412,22 +379,25 @@ mod tests {
             std::env::temp_dir().join(format!("lightfs-s413-root-{}", std::process::id()));
         std::fs::create_dir_all(&backup_root).unwrap();
 
-        // A live engine holds the lock for the whole first phase.
-        let live = crate::fslock::FileLock::try_acquire(&engine_lock_path(&cfg).unwrap()).unwrap();
-
-        // 1) sweep skipped under the live lock ...
-        let sweep = super::super::cmd::gc_stale_pack_phase(&core, &cfg).unwrap();
-        assert!(sweep.is_none(), "gc must skip the stale-pack sweep");
+        // Phase 1 (the sweep, run under the lock before anything else):
+        // the stale building row is adjudicated — building -> deleting
+        // with a durable pending intent. The two deletion candidates are
+        // NOT the sweep's business.
+        let sweep = core.recover_stale_packs().unwrap();
+        assert_eq!(sweep.enrolled_stale, 1, "the stale upload is enrolled");
+        assert_eq!(
+            sweep.dropped_building, 0,
+            "its object is up, nothing to drop"
+        );
         assert_eq!(
             core.metadata().pack_state(stale).unwrap().map(|(s, _)| s),
-            Some("building".into()),
-            "the stale building row survives the skipped sweep untouched"
+            Some("deleting".into()),
+            "building -> deleting under a durable pending intent"
         );
-        assert!(mem.head(stale).is_ok(), "its object is not touched either");
 
-        // 2) ... but the deletion-intent drain still runs to real semantics:
-        //    ONE candidate enrolled fresh this run, TWO intents completed
-        //    (the pre-existing one plus the newly enrolled one).
+        // Phase 2 (the enroll/execute pass): ONE candidate enrolled fresh
+        // this run (the reclaimable pack), THREE intents completed (the
+        // pre-existing one, the freshly enrolled one, and the sweep's).
         let summary =
             crate::cmd::gc_run(&core, Some(backup_root.to_str().unwrap()), 5, 0, now).unwrap();
         assert_eq!(
@@ -435,8 +405,8 @@ mod tests {
             "only the not-yet-registered pack is enrolled by this run"
         );
         assert_eq!(
-            summary.done, 2,
-            "both the pre-existing and the fresh intent execute under the skipped sweep"
+            summary.done, 3,
+            "pre-existing + freshly enrolled + sweep-enrolled intents all execute"
         );
         assert!(
             mem.head(preexisting).is_err(),
@@ -455,48 +425,172 @@ mod tests {
             "its row went with the completed intent"
         );
         assert!(
-            core.metadata()
-                .gc_claim_deletions(10, now)
-                .unwrap()
-                .is_empty(),
-            "no durable intent is left queued after the drain"
+            mem.head(stale).is_err(),
+            "the sweep's intent really deleted the stale object"
         );
-        assert_eq!(
-            core.metadata().pack_state(stale).unwrap().map(|(s, _)| s),
-            Some("building".into()),
-            "the skipped sweep left the stale row exactly as it was"
-        );
-
-        // 3) the engine dies, the lock is released: the NEXT sweep pass
-        //    adjudicates the stale row (HEAD 200 -> deleting + intent).
-        drop(live);
-        let sweep = super::super::cmd::gc_stale_pack_phase(&core, &cfg)
-            .unwrap()
-            .expect("the sweep runs once the lock is free");
-        assert_eq!(sweep.enrolled_stale, 1, "the stale upload is enrolled");
-        assert_eq!(
-            core.metadata().pack_state(stale).unwrap().map(|(s, _)| s),
-            Some("deleting".into()),
-            "building -> deleting under a durable pending intent"
-        );
-
-        // 4) and the next gc run converges it all the way.
-        let summary =
-            crate::cmd::gc_run(&core, Some(backup_root.to_str().unwrap()), 5, 0, now).unwrap();
-        assert_eq!(summary.done, 1, "the enrolled stale pack executes");
-        assert!(mem.head(stale).is_err(), "stale object actually deleted");
         assert!(
             core.metadata().pack_state(stale).unwrap().is_none(),
-            "stale row dropped with its completed intent"
+            "the stale row dropped with its completed intent"
         );
         assert!(
             core.metadata()
                 .gc_claim_deletions(10, now)
                 .unwrap()
                 .is_empty(),
-            "the queue is fully drained"
+            "the durable queue is fully drained — converged in one pass"
+        );
+        let _ = std::fs::remove_dir_all(&backup_root);
+    }
+
+    /// S4.14 ownership contract, in-process layer: `open_maintenance` takes
+    /// the engine lock BEFORE SQLite is opened, and a held lock is a loud
+    /// refusal — never "skip the sweep and continue". The durable evidence
+    /// that SQLite was never opened: the database file is still ZERO bytes
+    /// (a real SQLite open writes the header page). With the lock free the
+    /// same entry succeeds and the file becomes a real database.
+    #[test]
+    fn s414_maintenance_lock_precedes_sqlite_open() {
+        let mut cfg = Config::default();
+        cfg.metadata.path = std::env::temp_dir()
+            .join(format!(
+                "lightfs-s414-mnt-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+            .to_string_lossy()
+            .to_string();
+        // The lock derivation needs the target to exist; an empty file is
+        // the point — creating it does not initialize SQLite.
+        std::fs::write(&cfg.metadata.path, b"").unwrap();
+        // A live engine (exactly what `lightfs server` holds) owns the lock.
+        let live = crate::fslock::FileLock::try_acquire(&engine_lock_path(&cfg).unwrap()).unwrap();
+        let err = match open_maintenance(&cfg) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("maintenance must be refused while the lock is held"),
+        };
+        assert!(
+            err.contains("is locked by"),
+            "maintenance must be refused at the lock, got: {err}"
+        );
+        assert_eq!(
+            std::fs::metadata(&cfg.metadata.path).unwrap().len(),
+            0,
+            "refusal happened BEFORE SQLite was opened — the header was never written"
+        );
+        drop(live);
+        // The lock dies with its holder: a maintenance run is grantable
+        // again. (The granted branch itself — full gc/fsck to completion —
+        // is exercised end-to-end with a real object store by
+        // scripts/s431-gc-e2e.sh; this layer stays network-free.)
+        assert!(
+            crate::fslock::FileLock::try_acquire(&engine_lock_path(&cfg).unwrap()).is_ok(),
+            "the engine lock must be re-acquirable once the holder is gone"
         );
         let _ = std::fs::remove_file(&cfg.metadata.path);
-        let _ = std::fs::remove_dir_all(&backup_root);
+    }
+
+    /// S4.14 child (holder): builds an engine through the exact production
+    /// wiring — `lightfs server` uses open_engine, whose strict branch takes
+    /// the engine lock and holds it for the process lifetime; the _mem
+    /// variant differs only in the object store, the lock path is identical.
+    /// Signals readiness and parks until SIGKILLed. No-op without the env.
+    #[test]
+    fn s414_gc_hold_child_helper() {
+        let Some(db) = std::env::var_os("LIGHTFS_S414_HOLD_DB") else {
+            return;
+        };
+        let db = std::path::PathBuf::from(db);
+        let mut cfg = Config::default();
+        cfg.metadata.path = db.to_string_lossy().to_string();
+        let _eng = open_engine_mem(&cfg).expect("child engine");
+        let ready = db.parent().unwrap().join("child.ready");
+        std::fs::write(ready, b"held").unwrap();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// S4.14 child (gc): a full `lightfs gc` invocation (cmd::gc =
+    /// open_maintenance -> sweep -> gc_run) against the held lock. Exit 3
+    /// with the lock error on stdout's stderr twin; exit 0 would mean the
+    /// ownership contract is broken. No-op without the env.
+    #[test]
+    fn s414_gc_refused_child_helper() {
+        let Some(db) = std::env::var_os("LIGHTFS_S414_GC_DB") else {
+            return;
+        };
+        let mut cfg = Config::default();
+        cfg.metadata.path = db.to_string_lossy().to_string();
+        match crate::cmd::gc(&cfg) {
+            Ok(()) => {
+                eprintln!("S414-GC-UNEXPECTED-OK");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("S414-GC-ERR:{e}");
+                std::process::exit(3);
+            }
+        }
+    }
+
+    /// S4.14 ownership contract, cross-process layer (the one the model
+    /// talks about): a REAL server-path process holds the engine lock, and
+    /// a REAL `lightfs gc` process must fail BEFORE it opens SQLite, let
+    /// alone deletes objects — the lock refusal is the whole pass, not a
+    /// skipped phase. Bounded readiness wait over a ready file + exit-code
+    /// IPC; no timing assumptions.
+    #[test]
+    fn s414_gc_refused_while_server_holds_engine_lock() {
+        let dir = std::env::temp_dir().join(format!("lightfs-s414-own-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("meta.db");
+        let ready = dir.join("child.ready");
+        let exe = std::env::current_exe().unwrap();
+        let holder = std::process::Command::new(&exe)
+            .args(["s414_gc_hold_child_helper", "--nocapture"])
+            .env("LIGHTFS_S414_HOLD_DB", &db)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        struct Guard(std::process::Child);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let guard = Guard(holder);
+        let mut waited = 0u32;
+        while !ready.exists() && waited < 10_000 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        assert!(ready.exists(), "holder child never took the engine lock");
+        let _ = &guard;
+
+        let out = std::process::Command::new(&exe)
+            .args(["s414_gc_refused_child_helper", "--nocapture"])
+            .env("LIGHTFS_S414_GC_DB", &db)
+            .output()
+            .unwrap();
+        let stderr_txt = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "gc must be REFUSED by the held lock; stderr: {stderr_txt}"
+        );
+        assert!(
+            stderr_txt.contains("is locked by"),
+            "the refusal must be the engine lock itself, got: {stderr_txt}"
+        );
+        assert!(
+            !stderr_txt.contains("backup"),
+            "the lock gate sits BEFORE every other gc gate, got: {stderr_txt}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

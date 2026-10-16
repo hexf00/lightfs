@@ -48,7 +48,6 @@ RUN="/tmp/lightfs-oss-$$-$(date +%s)"
 mkdir -p "$RUN"
 CFG="$RUN/oss.toml"
 cat > "$CFG" <<CFGEOF
-mode = "server"
 [s3]
 endpoint = "$LIGHTFS_OSS_ENDPOINT"
 region = "$REGION"

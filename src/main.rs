@@ -1,7 +1,6 @@
 //! `lightfs` — single binary entry point.
 //!
-//! lightfs embedded [--config PATH]   run embedded engine (Core+SQLite+S3)
-//! lightfs server   [--config PATH]   serve the client protocol (Phase 6)
+//! lightfs server   [--config PATH]   own the metadata + serve the protocol
 //! lightfs fsck     [--config PATH]   report metadata/object divergence
 //! lightfs mount    [--config PATH] MOUNTPOINT   FUSE (Linux only, Phase 8)
 //! lightfs version
@@ -18,7 +17,7 @@ fn main() {
 
 fn print_usage() {
     eprintln!(
-        "usage: lightfs [--config PATH] <embedded|server|fsck|mount|backup [--expires-in SECS]|backup prune --id ID|gc|create-bucket [--insecure-public-rw]|version>\n\
+        "usage: lightfs [--config PATH] <server|fsck|mount|backup [--expires-in SECS]|backup prune --id ID|gc|create-bucket [--insecure-public-rw]|version>\n\
          see README"
     );
 }
@@ -137,10 +136,6 @@ fn run(args: Vec<String>) -> Result<(), lightfs::error::Error> {
                 ));
             };
             lightfs::cmd::mount(&cfg, mountpoint, allow_other)
-        }
-        Some("embedded") => {
-            let cfg = Config::load_or_defaults(config_path.as_deref())?;
-            lightfs::cmd::embedded(&cfg)
         }
         None => {
             print_usage();

@@ -145,7 +145,6 @@ start_stack(){  # $1 = group label; endpoint = $S3_ENDPOINT or direct MinIO
     mkdir -p "$GDIR"
     {
         cat <<EOF
-mode = "server"
 [s3]
 endpoint = "$endpoint"
 region = "us-east-1"
@@ -725,7 +724,6 @@ wall_check
 log "== CALIB: bench raw-serial PUT direct vs proxy (target +${RTT_MS}ms RTT) =="
 start_minio
 "$BIN" create-bucket --config <(cat <<EOF
-mode = "server"
 [s3]
 endpoint = "http://127.0.0.1:$MINIO_PORT"
 region = "us-east-1"

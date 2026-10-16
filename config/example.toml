@@ -1,5 +1,3 @@
-mode = "embedded" # embedded | server | client
-
 [s3]
 endpoint = "http://127.0.0.1:9000"
 region = "us-east-1"

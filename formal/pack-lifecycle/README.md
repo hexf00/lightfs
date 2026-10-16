@@ -18,9 +18,12 @@ found in the first round and re-scoped what the checks actually cover:
    stale-pack sweep runs ONLY in the one-shot startup-recovery pass or in
    gc's stale-pack phase — never spontaneously while serving. A live
    engine that keeps running does NOT rediscover stale rows.
-3. The gc process has its own phase (`Idle/Sweeping/Draining`). Losing the
-   engine-lock race (`GcStartBusy`) skips the stale-pack sweep but STILL
-   drains deletion intents, matching `cmd::gc`.
+3. The gc process is OFFLINE maintenance (S4.14): `open_maintenance` takes
+   the engine lock BEFORE SQLite is opened and holds it until the process
+   exits, so gc runs only on a free lock (its phase `Idle/Sweeping/Draining`
+   coincides with holding the lock) and a live server makes the whole
+   command fail at the lock — the old skip-sweep-but-drain path
+   (`GcStartBusy`) is gone from code and model.
 
 **The model found real gaps during its own construction** — see
 [Counter-examples](#counter-examples). None required a production-code
@@ -239,7 +242,7 @@ production code was never modified).
 | Model action | Rust entry | Transaction boundary | Tests |
 |--------------|-----------|---------------------|-------|
 | `EngineStart`/`RecoverSweep`/`EngineCrash` | engine.rs `build_core`: acquire lock → `recover_stale_packs()` once → serve; hold via `hold_engine_lock` | startup pass = several txs, modeled atomic (declared) | S4.3.4b lock tests; `s410_*` |
-| `GcStart`/`GcStartBusy`/`GcSweepDone`/`GcEnd`/`GcCrash` | cmd.rs `gc`: `gc_stale_pack_phase` (try-acquire; None ⇒ skip sweep, drain anyway) then `gc_run` | lock held only for the sweep phase | `s431-gc-e2e.sh` |
+| `GcStart`/`GcSweepDone`/`GcEnd`/`GcCrash` | cmd.rs `gc`: `open_maintenance` (engine lock BEFORE SQLite, held for the whole process) → `recover_stale_packs()` → `gc_run` | lock held start-to-exit (S4.14) | `s414_gc_refused_while_server_holds_engine_lock` (subprocess), `s413_gc_state_machine_*`, `s431-gc-e2e.sh` |
 | `SweepPackNext`/`SweepIntentNext` (shared decision) | `recover_stale_packs` (core.rs) — HEAD three-state | per-row tx | `s410_head_unavailable_keeps_row_next_pass_converges` |
 | `StrictRegister`/`WbRegister` | `register_pack` (metadata.rs:188); `PackEngine::seal` (pack.rs:259); `seal_batch` (wb.rs:1102) | one INSERT; row before bytes | p0a; `s410_*` |
 | strict/wb PUT actions | `objects.put_stream` in seal paths | non-transactional | `s410_uncertain_put_*`, `s411_*` |
@@ -294,6 +297,13 @@ Candidate gaps from the S4.13 task, audited against the code:
   following gc run converges it completely. Corresponds to model actions
   `GcStartBusy` (skip) + `Draining` work + `GcStart`/`GcSweepDone` (later
   pass).
+  **Superseded by S4.14**: the held-lock skip path no longer exists —
+  `lightfs gc` is refused outright while any engine holds the lock
+  (`s414_gc_refused_while_server_holds_engine_lock`, a real subprocess
+  pair), and the drain-both-sources coverage now lives in
+  `s413_gc_state_machine_drains_both_intent_sources_and_converges_stale`
+  under the legitimate lock, mirroring `cmd::gc`'s sweep-then-drain
+  order in one pass.
 - **B. Backup protection vs deletion lifecycle — NO gap.**
   `p0b_protected_object_survives_gc_until_prune`,
   `p0b_gc_end_to_end_enroll_execute_and_protection_filter` and
@@ -331,7 +341,7 @@ Layered evidence matrix (a pass at one layer NEVER claims another layer):
 | I7b kernel-lock semantics | model assumption | fslock unit tests | 4b.2 alias tests | — | S4.3.4b child SIGKILL test | not verified |
 | I9 SQLite tx atomicity | model assumption + obligation | single-transaction code paths | REQUIRED_TABLE_COLUMNS contract; reopen tests | minio_integration reopen | — | `synchronous=FULL` configured (S4.4); physical durability NOT verified |
 | I6 recovery idempotence | construction constraint | repeated-recover s410/s411 | s431 e2e re-run stages | minio reopen | — | not verified |
-| L1 next-pass convergence | ✔ under FairSpec | `s413_gc_lock_skip_*` (new), "next pass converges" tests | s431 e2e | — | — | not verified |
+| L1 next-pass convergence | ✔ under FairSpec | `s413_gc_state_machine_*` (S4.14 re-stage), "next pass converges" tests | s431 e2e | — | — | not verified |
 | L2 next-invocation retry | ✔ under FairSpec | gc retry/failed-keep tests | s431 corruption-interrupt stage | — | — | not verified |
 | L4 Mode-sensitive resolve | ✔ under FairSpec | p0a committing-survival; `s410_committing_zero_refs_*` | — | — | — | not verified |
 

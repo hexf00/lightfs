@@ -43,7 +43,6 @@ echo "minio up"
 # == [2] config (fresh namespace per run)
 mkdir -p "$RUN"
 cat > "$RUN/cfg.toml" <<CFGEOF
-mode = "server"
 [s3]
 endpoint = "${LIGHTFS_S3_ENDPOINT:-http://127.0.0.1:9000}"
 region = "us-east-1"

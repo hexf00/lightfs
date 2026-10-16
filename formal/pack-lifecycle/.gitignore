@@ -4,3 +4,4 @@ tla2tools.jar
 ReachCheck.tla
 _ReachCheck.tla
 states/
+VacuityCheck.tla

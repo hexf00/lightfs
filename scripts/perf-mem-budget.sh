@@ -17,7 +17,6 @@ DB="/tmp/lightfs-mem-server-PLACEHOLDER.db"
 DB="${DB/PLACEHOLDER/$$-$(date +%s)}"
 CFG="/tmp/lightfs-mem-$$-$(date +%s).toml"
 cat > "$CFG" <<CFGEOF
-mode = "server"
 [s3]
 endpoint = "${LIGHTFS_S3_ENDPOINT:-http://127.0.0.1:9000}"
 region = "us-east-1"

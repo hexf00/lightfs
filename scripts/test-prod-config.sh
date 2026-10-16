@@ -18,7 +18,6 @@ PROD_BUCKET="${LIGHTFS_PROD_BUCKET:-lightfs-prod-sim}"
 cat > "$CFG" <<EOF
 # Production-shaped config: only endpoint/bucket/credentials/region change
 # when moving from MinIO to real S3/OSS.
-mode = "embedded"
 [s3]
 endpoint = "${LIGHTFS_PROD_ENDPOINT:-${LIGHTFS_S3_ENDPOINT:-http://127.0.0.1:9000}}"
 region = "${LIGHTFS_PROD_REGION:-cn-hangzhou}"

@@ -513,7 +513,7 @@ mod tests {
             },
             ..Default::default()
         };
-        crate::engine::open_embedded_mem(&cfg).unwrap().core
+        crate::engine::open_engine_mem(&cfg).unwrap().core
     }
 
     fn local_rule(prefix: &str, root: &Path) -> RawRule {

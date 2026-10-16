@@ -13,7 +13,6 @@ DB="/tmp/lightfs-srvtest-$$-$(date +%s).db"
 CFG="/tmp/lightfs-srvtest-$$-$(date +%s).toml"
 PORT=18084
 cat > "$CFG" <<EOF
-mode = "server"
 [s3]
 endpoint = "${LIGHTFS_S3_ENDPOINT:-http://127.0.0.1:9000}"
 region = "us-east-1"

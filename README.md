@@ -39,7 +39,7 @@ cp config/example.toml cfg.toml      # edit endpoint/bucket/credentials
 ./target/release/lightfs mount --config cfg.toml /mnt/lightfs   # Linux + /dev/fuse
 ```
 
-CLI: `lightfs {embedded|server|mount|fsck|backup|gc|create-bucket|version}`
+CLI: `lightfs {server|mount|fsck|backup|gc|create-bucket|version}`
 
 ## Backup & gc
 
@@ -49,6 +49,10 @@ sha256-pinned `backup.json`, published atomically. Each is protected
 forever unless created with `--expires-in SECS`; remove one with
 `backup prune --id ID`.
 
+`gc` (and `fsck`) is OFFLINE maintenance (S4.14): it takes the engine
+lock BEFORE it opens the metadata store, and holds it until the process
+exits. Against a running server it fails at the lock and never touches
+the database — stop the server first, run the maintenance pass, restart.
 `gc` is the only path that deletes objects, and it is safe by gates: with
 no `[backup] root` configured it refuses to delete anything; it verifies
 EVERY manifest in the root first (one corrupt backup fails the whole pass,
@@ -70,7 +74,7 @@ oversight:
   *calling process's* root, so they can and do point outside the mount
   point. A FUSE mount of LightFS is therefore **not** an isolation
   boundary - do not use it as a security mechanism.
-- **RPC / embedded Core**: the server-side path walker clamps resolution
+- **RPC core**: the server-side path walker clamps resolution
   at the virtual root (chroot-style). Direct path arguments may not
   contain `..` components - an independent path-validation rule that
   applies to every RPC call. Relative targets resolve against the

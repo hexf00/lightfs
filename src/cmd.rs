@@ -8,7 +8,7 @@ use crate::error::{Error, Result};
 /// `lightfs server`: own the metadata authority and serve the client
 /// protocol. Clients never touch the metadata DB directly.
 pub fn server(cfg: &Config) -> Result<()> {
-    let eng = engine::open_embedded(cfg)?;
+    let eng = engine::open_engine(cfg)?;
     crate::server::serve(eng, &cfg.server.bind)
 }
 
@@ -90,8 +90,9 @@ pub fn gc_run(
 }
 
 /// `lightfs gc` (P0-b): the ONLY production path to real object deletion.
-/// Gate order is load-bearing: [backup] root configured → maintenance lock
-/// → every manifest verified fail-closed → protected keys filtered →
+/// Gate order is load-bearing: [backup] root configured → engine lock (via
+/// the offline maintenance entry, BEFORE SQLite is opened) → maintenance
+/// lock → every manifest verified fail-closed → protected keys filtered →
 /// durable deletion tasks. The lock covers the whole window, so a backup
 /// publishing concurrently is structurally excluded.
 ///
@@ -100,24 +101,21 @@ pub fn gc_run(
 /// only thing that drains them. `retention_secs` only shapes the candidate
 /// cutoff (0 → candidates qualify as soon as they are registered).
 pub fn gc(cfg: &Config) -> Result<()> {
-    // Maintenance entry: no write-back engine (P0-c supplement) — gc stages
-    // and drains nothing and must run while the live server owns the
-    // staging directory and the capacity ledger.
-    let eng = engine::open_embedded_maintenance(cfg)?;
-    match gc_stale_pack_phase(&eng.core, cfg)? {
-        Some(sweep) => println!(
-            "gc: stale packs: {} committing finalized, {} building row(s) dropped, \
-             {} stale upload(s) enrolled, {} head unavailable (kept)",
-            sweep.finalized_committing,
-            sweep.dropped_building,
-            sweep.enrolled_stale,
-            sweep.head_unavailable,
-        ),
-        None => println!(
-            "gc: stale packs: sweep skipped — a live engine holds the engine lock; \
-             its own startup recovery and the next gc pass cover the rows"
-        ),
-    }
+    // Offline maintenance (S4.14): the engine lock is acquired BEFORE the
+    // metadata store is opened, and held for the whole process. Against a
+    // running server this fails at the lock and never touches the database.
+    let eng = engine::open_maintenance(cfg)?;
+    // We own the lock, so the stale-pack sweep runs unconditionally — its
+    // intents are drained by THIS gc run's enroll/execute pass below.
+    let sweep = eng.core.recover_stale_packs()?;
+    println!(
+        "gc: stale packs: {} committing finalized, {} building row(s) dropped, \
+         {} stale upload(s) enrolled, {} head unavailable (kept)",
+        sweep.finalized_committing,
+        sweep.dropped_building,
+        sweep.enrolled_stale,
+        sweep.head_unavailable,
+    );
     let summary = gc_run(
         &eng.core,
         cfg.backup.root.as_deref(),
@@ -137,22 +135,6 @@ pub fn gc(cfg: &Config) -> Result<()> {
         summary.skipped_protected,
     );
     Ok(())
-}
-
-/// S4.10 stale-pack phase of `lightfs gc`: adjudicate `building`/`committing`
-/// pack rows left by failed uploads or crashes, BEFORE the enroll/execute
-/// pass so intents recorded here are drained by THIS gc run. Safety requires
-/// single-writer ownership, which is only provable while NO engine holds the
-/// engine lock (i.e. the owning server is stopped): a live server keeps its
-/// lock, the phase is skipped and `None` is returned.
-pub(crate) fn gc_stale_pack_phase(
-    core: &crate::core::Core,
-    cfg: &Config,
-) -> Result<Option<crate::core::StalePackSweep>> {
-    match crate::fslock::FileLock::try_acquire(&engine::engine_lock_path(cfg)?) {
-        Ok(_lock) => Ok(Some(core.recover_stale_packs()?)),
-        Err(_) => Ok(None),
-    }
 }
 
 fn now_secs() -> i64 {
@@ -191,9 +173,9 @@ pub fn create_bucket(cfg: &Config, public: bool) -> Result<()> {
 /// `lightfs fsck`: report metadata/object divergence; `--fix` adopts the
 /// data plane's state into metadata (never deletes anything).
 pub fn fsck(cfg: &Config, fix_problems: bool) -> Result<()> {
-    // Maintenance entry: no write-back engine (P0-c supplement), same
-    // reasoning as `gc`.
-    let eng = engine::open_embedded_maintenance(cfg)?;
+    // Offline maintenance (S4.14): engine lock before SQLite, same contract
+    // as `gc` — a running server makes this fail at the lock.
+    let eng = engine::open_maintenance(cfg)?;
     let report = crate::fsck::fsck(&eng.core)?;
     print!("{}", report.render());
     if fix_problems {
@@ -206,19 +188,16 @@ pub fn fsck(cfg: &Config, fix_problems: bool) -> Result<()> {
     Ok(())
 }
 
-/// `lightfs mount`: FUSE adapter (Linux only). The backend follows the
-/// config mode: embedded opens Core+SQLite+S3 in this process; server mode
-/// mounts through the network client.
+/// `lightfs mount`: FUSE adapter (Linux only). Mounting always goes through
+/// the network client — the metadata authority is the `lightfs server`
+/// process, never this one (S4.14: no second production execution path).
 #[cfg(all(feature = "fuse", target_os = "linux"))]
 pub fn mount(cfg: &Config, mountpoint: &str, allow_other: bool) -> Result<()> {
-    let fs: std::sync::Arc<dyn crate::api::FsApi> = if cfg.mode == "server" {
+    let fs: std::sync::Arc<dyn crate::api::FsApi> =
         std::sync::Arc::new(crate::client::Client::new(crate::client::ClientConfig {
             url: format!("http://{}", cfg.server.bind),
             metadata_ttl: cache_ttl(cfg),
-        }))
-    } else {
-        engine::open_embedded(cfg)?.core
-    };
+        }));
     // Path policy (Phase P): route by rule, or pass the backend through
     // untouched when no client-local rule is configured.
     let fs: std::sync::Arc<dyn crate::api::FsApi> = match crate::routing::RoutingFs::build(
@@ -237,14 +216,11 @@ pub fn mount(cfg: &Config, mountpoint: &str, allow_other: bool) -> Result<()> {
 /// the mounting user via -o uid/gid=-1).
 #[cfg(all(feature = "fuse", target_os = "windows"))]
 pub fn mount(cfg: &Config, mountpoint: &str, _allow_other: bool) -> Result<()> {
-    let fs: std::sync::Arc<dyn crate::api::FsApi> = if cfg.mode == "server" {
+    let fs: std::sync::Arc<dyn crate::api::FsApi> =
         std::sync::Arc::new(crate::client::Client::new(crate::client::ClientConfig {
             url: format!("http://{}", cfg.server.bind),
             metadata_ttl: cache_ttl(cfg),
-        }))
-    } else {
-        engine::open_embedded(cfg)?.core
-    };
+        }));
     let fs: std::sync::Arc<dyn crate::api::FsApi> = match crate::routing::RoutingFs::build(
         fs.clone(),
         cfg.policy.as_ref(),
@@ -277,22 +253,5 @@ fn cache_ttl(cfg: &Config) -> Option<std::time::Duration> {
         ))
     } else {
         None
-    }
-}
-
-/// `lightfs embedded`: open the embedded engine, verify the object store is
-/// reachable, and stay alive until interrupted. The primary Agent/CI loop
-/// uses the in-process engine through lightfs-shell; this daemon form exists
-/// for interactive inspection.
-pub fn embedded(cfg: &Config) -> Result<()> {
-    let _eng = engine::open_embedded(cfg)?;
-    println!(
-        "lightfs embedded ready: mode=embedded db={} s3={}/{}",
-        cfg.metadata.path, cfg.s3.endpoint, cfg.s3.bucket
-    );
-    // Block until SIGINT/SIGTERM. std has no signal API; parking forever is
-    // enough for v1 — the OS tears the process down.
-    loop {
-        std::thread::park();
     }
 }

@@ -3669,7 +3669,7 @@ mod tests {
             cfg.writeback.staging_dir = staging.to_string_lossy().to_string();
             cfg
         };
-        let eng = crate::engine::open_embedded_mem(&cfg_for(&db, &dir.join("s1"))).unwrap();
+        let eng = crate::engine::open_engine_mem(&cfg_for(&db, &dir.join("s1"))).unwrap();
         let alias = {
             #[cfg(unix)]
             {
@@ -3680,7 +3680,7 @@ mod tests {
                 dot
             }
         };
-        let e = p0c2_expect_refused(crate::engine::open_embedded_mem(&cfg_for(
+        let e = p0c2_expect_refused(crate::engine::open_engine_mem(&cfg_for(
             &alias,
             &dir.join("s2"),
         )));
@@ -3693,7 +3693,7 @@ mod tests {
         drop(eng);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let _eng2 = loop {
-            match crate::engine::open_embedded_mem(&cfg_for(&alias, &dir.join("s2"))) {
+            match crate::engine::open_engine_mem(&cfg_for(&alias, &dir.join("s2"))) {
                 Ok(e) => break e,
                 Err(_) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(20))
@@ -4144,7 +4144,7 @@ mod tests {
         let mut cfg = p0d_cfg(&dir.join("meta.db"), &dir.join("staging"));
         cfg.writeback.batch_pack_bytes = 8388608;
         cfg.writeback.batch_max_wait_ms = 600_000;
-        let eng = crate::engine::open_embedded_mem(&cfg).expect("child engine");
+        let eng = crate::engine::open_engine_mem(&cfg).expect("child engine");
         let c = &eng.core;
         c.create("/f", 0o644).unwrap();
         write_via_rpc(c, "/f", P0D_R16_BODY, Some(0));
@@ -4243,7 +4243,7 @@ mod tests {
         let cfg = p0d_cfg(&dir.join("meta.db"), &staging_dir);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let eng = loop {
-            match crate::engine::open_embedded_mem(&cfg) {
+            match crate::engine::open_engine_mem(&cfg) {
                 Ok(eng) => break eng,
                 Err(e) => {
                     if std::time::Instant::now() >= deadline {
@@ -4299,8 +4299,8 @@ mod tests {
         cfg.metadata.path = db.to_string_lossy().to_string();
         cfg.commit.mode = "writeback".into();
         cfg.writeback.staging_dir = staging.to_string_lossy().to_string();
-        // 1 worker: open_embedded refuses 0 (an embedded engine must
-        // drain). The parent polls the SETTLED state instead of racing
+        // 1 worker: open_engine refuses 0 (a live engine must drain).
+        // The parent polls the SETTLED state instead of racing
         // intermediate queue shapes.
         cfg.writeback.drain_workers = 1;
         cfg.writeback.batch_pack_bytes = 0;

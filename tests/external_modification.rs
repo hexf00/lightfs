@@ -42,7 +42,7 @@ fn external_s3_mutation_detected_and_reconciled() {
         let store = lightfs::object_store::s3::S3ObjectStore::new(cfg.s3_config()).unwrap();
         store.ensure_bucket().unwrap();
     }
-    let eng = engine::open_embedded(&cfg).unwrap();
+    let eng = engine::open_engine(&cfg).unwrap();
 
     // normal path: create and write through Core
     eng.core.mkdir("/ext", 0o755).unwrap();

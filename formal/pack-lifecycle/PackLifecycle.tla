@@ -11,9 +11,11 @@
 (*     stale-pack sweep runs ONLY in the startup-recovery pass or in      *)
 (*     gc's stale-pack phase — never "whenever a lock holder feels like   *)
 (*     it" during normal serving. A recover pass is ATOMIC (see below).   *)
-(*   * The gc process has its own phase (Idle/Sweeping/Draining). Failing *)
-(*     to take the engine lock (GcStartBusy) skips the sweep but STILL    *)
-(*     drains deletion intents — matching cmd::gc.                         *)
+(*   * The gc process is OFFLINE maintenance (S4.14): it runs only when    *)
+(*     NO engine holds the lock, and it holds the engine lock itself for   *)
+(*     its whole lifetime (open_maintenance: lock BEFORE SQLite, held      *)
+(*     until the process exits). Its phase (Idle/Sweeping/Draining)        *)
+(*     therefore coincides with holding the lock.                          *)
 (*                                                                         *)
 (* One pack instance is modeled end-to-end through the six persistent row  *)
 (* states, the real object behind it, the durable deletion intent, two     *)
@@ -132,34 +134,33 @@ EngineCrash == /\ lock = EngineLock
                /\ UNCHANGED <<pack, obj, refs, intent, mem, gcp, prot, failProne>>
 
 (***************************************************************************)
-(* GC process lifecycle (cmd::gc): try the engine lock for the stale-pack  *)
-(* phase; win -> sweep (atomic pass) then release and drain; lose ->       *)
-(* SKIP the sweep and STILL drain deletion intents. Draining = enroll +    *)
-(* claim + execute + complete; a run ends (GcEnd) or dies (GcCrash) with   *)
-(* intents left for the NEXT explicit gc invocation — there is no daemon.  *)
+(* GC process lifecycle (cmd::gc, S4.14): OFFLINE maintenance. The entry    *)
+(* takes the engine lock BEFORE it opens the metadata store and holds it    *)
+(* until the process exits, so gc can only START on a free lock (the        *)
+(* owning server is stopped) and no engine can start while gc runs. The     *)
+(* stale-pack sweep always runs, then the drain (enroll + claim + execute   *)
+(* + complete). A run ends (GcEnd) or dies (GcCrash) with intents left      *)
+(* for the NEXT explicit gc invocation — there is no daemon.                *)
 (***************************************************************************)
 GcStart == /\ gcp = "Idle" /\ lock = "NoLock"
+              (* startable ONLY on a free lock: a live engine means the *)
+              (* maintenance command is refused before it opens SQLite  *)
            /\ gcp' = "Sweeping" /\ lock' = "GC"
            /\ UNCHANGED <<pack, obj, refs, intent, mem, phase, prot, failProne>>
-
-GcStartBusy == /\ gcp = "Idle" /\ lock # "NoLock"
-               /\ gcp' = "Draining"      (* sweep skipped: a live engine owns *)
-                                            (* the lock; its own startup recovery *)
-                                            (* and the next gc pass cover the rows *)
-               /\ UNCHANGED <<pack, obj, refs, intent, mem, lock, phase, prot, failProne>>
 
 GcSweepDone == /\ gcp = "Sweeping"
                /\ pack' = SweepPackNext
                /\ intent' = SweepIntentNext
-               /\ gcp' = "Draining" /\ lock' = "NoLock"
-                  (* the engine lock is released when the stale-pack phase
-                     ends; gc_run's drain needs no engine lock *)
-               /\ UNCHANGED <<obj, refs, mem, phase, prot, failProne>>
+               /\ gcp' = "Draining"
+                  (* S4.14: the lock is HELD — open_maintenance owns it until
+                     the process exits; the drain runs under it too *)
+               /\ UNCHANGED <<obj, refs, mem, lock, phase, prot, failProne>>
 
 GcEnd == /\ gcp = "Draining"
          /\ intent \in {"None", "Done", "Failed"}
-         /\ gcp' = "Idle"
-         /\ UNCHANGED <<pack, obj, refs, intent, mem, lock, phase, prot, failProne>>
+         /\ gcp' = "Idle" /\ lock' = "NoLock"
+            (* the maintenance process exits: the lock dies with it *)
+         /\ UNCHANGED <<pack, obj, refs, intent, mem, phase, prot, failProne>>
             (* gc_run is a synchronous pipeline: a single invocation claims
                and executes what it registered before it exits, so it cannot
                end with a Pending or Claimed intent (a crash mid-run is
@@ -170,10 +171,9 @@ GcEnd == /\ gcp = "Draining"
                the implementation never does. *)
 
 GcCrash == /\ gcp # "Idle"
-           /\ gcp' = "Idle"
-           /\ lock' = IF lock = "GC" THEN "NoLock" ELSE lock
-              (* a gc process crash mid-sweep = that pass never happened;
-                 the row stays exactly as it was *)
+           /\ gcp' = "Idle" /\ lock' = "NoLock"
+              (* a gc process crash = that pass never happened; the row
+                 stays exactly as it was. The lock dies with the process. *)
            /\ UNCHANGED <<pack, obj, refs, intent, mem, phase, prot, failProne>>
 
 (***************************************************************************)
@@ -433,7 +433,7 @@ Unprotect == /\ prot = "Protected" /\ prot' = "Unprotected"
              /\ UNCHANGED <<pack, obj, refs, intent, mem, lock, phase, gcp, failProne>>
 
 Next == \/ EngineStart \/ RecoverSweep \/ EngineCrash
-        \/ GcStart \/ GcStartBusy \/ GcSweepDone \/ GcEnd \/ GcCrash
+        \/ GcStart \/ GcSweepDone \/ GcEnd \/ GcCrash
         \/ StrictRegister \/ StrictPutOk \/ StrictPutUncertain
         \/ StrictMark \/ StrictCAS \/ StrictCASConflict
         \/ WbRegister \/ WbPutOk \/ WbPutUncertain
@@ -485,8 +485,9 @@ BackupGuard == prot = "Protected" => intent # "Done"
 (* doing WHAT — the part of I7 that IS checkable as a state predicate.       *)
 ProcessLockInv == /\ (phase # "Down") => (lock = EngineLock)
                   /\ (phase = "Down") => (lock # EngineLock)
-                  /\ (lock = "GC") <=> (gcp = "Sweeping")
-                  /\ (gcp = "Draining") => (lock # "GC")
+                     (* S4.14: gc holds the engine lock from start to exit —
+                        sweep AND drain; no engine can start in between *)
+                  /\ (lock = "GC") <=> (gcp # "Idle")
 
 SafeInv == /\ RefsSafe /\ DeletionAdmission /\ ObjectTracked
            /\ IntentConsistent /\ UnknownNotMissing /\ BackupGuard
@@ -505,7 +506,10 @@ SafeInv == /\ RefsSafe /\ DeletionAdmission /\ ObjectTracked
 (*   * SweepOpportunitiesInfinitelyOften: startup-recovery passes or gc     *)
 (*     stale-pack phases occur infinitely often. THIS IS LOAD-BEARING: a    *)
 (*     live engine NEVER sweeps, so convergence of a stale row requires    *)
-(*     the server to (re)start or `lightfs gc` to win the lock — forever.  *)
+(*     the server to (re)start or `lightfs gc` to run — forever. Under     *)
+(*     the S4.14 contract gc runs only while the server is STOPPED, so     *)
+(*     this assumption is an OPERATIONS commitment (someone keeps doing    *)
+(*     stop/gc/start), stronger than before gc could skip the sweep.       *)
 (*     The implementation's real promise is "the NEXT startup or gc pass    *)
 (*     adjudicates the row"; this assumption says there always IS a next.  *)
 (*   * RecoveryPassesFinish / GcSweepPassesFinish: every ENTERED sweep      *)
@@ -526,6 +530,8 @@ SafeInv == /\ RefsSafe /\ DeletionAdmission /\ ObjectTracked
 (*   * GcRunsInfinitelyOften: `lightfs gc` is invoked infinitely often.     *)
 (*     Explicit CLI path — NOTHING retries deletion automatically between   *)
 (*     invocations; a single run leaves failed intents for the next run.    *)
+(*     Each invocation now owns the engine lock for its whole lifetime     *)
+(*     (offline maintenance), so "invoked" also means "while stopped".      *)
 (*   * WF inside phases: a started pass completes; a draining gc advances;  *)
 (*     a serving engine progresses on uploads/marks. CAS stays UNFAIR on    *)
 (*     purpose: it is client-close driven.                                  *)
