@@ -245,10 +245,14 @@ const REQUIRED_TABLE_COLUMNS: [(&str, &[&str]); 7] = [
 /// Spelled out as a literal (not derived from the current list at
 /// runtime) so the accepted upgrade boundary is reviewable line by line:
 /// identical to [`REQUIRED_TABLE_COLUMNS`] except that the
-/// `version_candidates` table does not exist yet. Every other difference
-/// — a missing column anywhere, an extra/renamed table, a database older
-/// than S4.15.2 — stays fail-closed, exactly as the S4.2.1 discipline
-/// requires.
+/// `version_candidates` table does not exist yet. Enforced as an EXACT
+/// signature by [`Self::database_matches_s4152_schema`] (S4.16.2): a
+/// database qualifies only with exactly these six tables, exactly these
+/// columns, nothing else in the application object space. Every other
+/// difference — a missing column anywhere, an undeclared extra column,
+/// an extra/renamed table, a pre-existing version_candidates, a database
+/// older than S4.15.2 — stays fail-closed, exactly as the S4.2.1
+/// discipline requires.
 const REQUIRED_TABLE_COLUMNS_THROUGH_S4152: [(&str, &[&str]); 6] = [
     (
         "nodes",
@@ -501,13 +505,17 @@ impl SqliteMetadataStore {
     /// recorded (see [`Self::database_matches_current_schema`]), never on
     /// the stored SQL text:
     ///
-    /// - current schema → open as-is;
-    /// - S4.15.2 schema → the ONE permitted incremental upgrade
+    /// - current schema → open as-is (required-subset contract: extra
+    ///   tables/columns are tolerated and NEVER migrated over, because
+    ///   this path writes nothing);
+    /// - EXACT S4.15.2 signature → the ONE permitted incremental upgrade
     ///   (S4.16.1): create the `version_candidates` table in a single
-    ///   transaction, then re-verify the full current schema. No data is
-    ///   touched and nothing is backfilled (objects uploaded before
-    ///   S4.16 were never registered; fsck keeps reporting them under
-    ///   the existing safety boundary);
+    ///   transaction, then re-verify the full current schema. The
+    ///   signature is exact (S4.16.2): same six tables, exactly the
+    ///   declared columns, no extra table/view/trigger, no
+    ///   version_candidates. No data is touched and nothing is backfilled
+    ///   (objects uploaded before S4.16 were never registered; fsck keeps
+    ///   reporting them under the existing safety boundary);
     /// - anything else — a `nodes` table predating AUTOINCREMENT id
     ///   allocation, any missing table/column, forged or foreign
     ///   schemas — is rejected with zero writes: no schema change, no
@@ -550,7 +558,9 @@ impl SqliteMetadataStore {
                 return Err(Error::Storage(
                     "database schema predates the S4.15.2 schema (AUTOINCREMENT id \
                      allocation and/or the S4 pack-lifecycle tables: packs.state, \
-                     wb_tasks.pack_key/uploaded_key, gc_deletions) or is otherwise \
+                     wb_tasks.pack_key/uploaded_key, gc_deletions), does not match \
+                     it EXACTLY (an extra table, view, trigger, or column; a \
+                     version_candidates table that already exists), or is otherwise \
                      malformed. Stable identity and the lifecycle invariants are \
                      not satisfiable on this database. The ONLY supported upgrade \
                      is S4.15.2 → current (adding version_candidates); anything \
@@ -561,11 +571,18 @@ impl SqliteMetadataStore {
                 ));
             }
             // Engine-lock ordering: every production open entry acquires
-            // the engine lock BEFORE SQLite is opened (S4.14.1), so this
-            // runs under an established single-writer title. The
-            // migration itself is one idempotent transaction, so even an
-            // unsynchronized second construction serializes on the write
-            // lock and converges.
+            // the engine lock BEFORE SQLite is opened (S4.14.1), so in
+            // production the migration always runs under an established
+            // single-writer title. A construction that skips that layer
+            // (tests, ad-hoc tooling) falls back to the database-level
+            // backstop — and its behavior is FAST-FAILURE, not waiting:
+            // this connection has no busy_timeout yet, so BEGIN IMMEDIATE
+            // against a held write lock returns SQLITE_BUSY ("database is
+            // locked") immediately. The migration is one idempotent
+            // transaction, so the caller's next open attempt (retried,
+            // or after the holder exits) converges — pinned by
+            // s4161_migration_failure_is_atomic_and_retry_converges,
+            // which also asserts the error really is the busy class.
             Self::migrate_s416_add_version_candidates(&mut conn)?;
             // The migration's whole job is to make the CURRENT
             // verification pass; if it still does not, stop loudly —
@@ -629,15 +646,77 @@ impl SqliteMetadataStore {
     ///   not pass. The marker is engine-managed: a hand-forged
     ///   sqlite_sequence row is out-of-model tampering, the same class as
     ///   external tools writing the table directly.
+    ///
+    /// S4.16.2 audit note: this is a REQUIRED-SUBSET contract, not an
+    /// exact structure match — it checks that every required table/column
+    /// is present and says nothing about EXTRA tables or columns. That is
+    /// the S4.2.1 contract, unchanged: opening a current-schema database
+    /// writes nothing and triggers no migration, so there is nothing an
+    /// extra structure could subvert. The strict exact signature is
+    /// reserved for [`Self::database_matches_s4152_schema`], where this
+    /// build would actually mutate the database.
     fn database_matches_current_schema(conn: &Connection) -> Result<bool> {
         Self::database_matches_required(conn, &REQUIRED_TABLE_COLUMNS)
     }
 
-    /// The S4.15.2 upgrade-source check (S4.16.1): the same
-    /// definition-level contract (engine-recorded tables/columns + the
-    /// AUTOINCREMENT engine marker) against the previous required list.
+    /// The S4.15.2 upgrade-source check (S4.16.1; boundary tightened to
+    /// an EXACT signature in S4.16.2). Admission to the one permitted
+    /// upgrade requires ALL of:
+    ///
+    /// - each of the six S4.15.2 tables exists with EXACTLY the declared
+    ///   column set (`pragma_table_info`): no missing column AND no
+    ///   undeclared extra column;
+    /// - the application object space is EXACTLY those six tables — no
+    ///   extra table, no extra view, no trigger. Objects named
+    ///   `sqlite_%` are engine-internal and exempt (the AUTOINCREMENT
+    ///   marker itself lives in `sqlite_sequence`; `sqlite_stat*` is
+    ///   ANALYZE output owned by SQLite);
+    /// - the engine-recorded AUTOINCREMENT marker is present.
+    ///
+    /// A trigger would even change what the migration's DDL does, and an
+    /// extra table means no S4.15.2 build could have written this file —
+    /// anything extra stays fail-closed. Indexes are deliberately NOT
+    /// part of the signature (unchanged since S4.2.1): they are derived
+    /// objects with no semantic authority, and the schema batch
+    /// re-creates missing indexes idempotently on every open — including
+    /// the open that performs this migration.
+    ///
+    /// This is STRICTER than [`Self::database_matches_current_schema`],
+    /// and deliberately so: strictness is applied to the domain where
+    /// this build MUTATES a foreign database (the migration). Opening a
+    /// current-schema database keeps the S4.2.1 required-subset contract
+    /// — it writes nothing and admits no migration, so extra structures
+    /// there are recorded as tolerated, never migrated over.
     fn database_matches_s4152_schema(conn: &Connection) -> Result<bool> {
-        Self::database_matches_required(conn, &REQUIRED_TABLE_COLUMNS_THROUGH_S4152)
+        for (table, required) in &REQUIRED_TABLE_COLUMNS_THROUGH_S4152 {
+            let present = table_columns(conn, table)?;
+            if present.len() != required.len()
+                || required.iter().any(|col| !present.iter().any(|c| c == col))
+            {
+                return Ok(false);
+            }
+        }
+        let app_objects: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+                 AND type IN ('table', 'view', 'trigger')",
+            [],
+            |r| r.get(0),
+        )?;
+        if app_objects != REQUIRED_TABLE_COLUMNS_THROUGH_S4152.len() as i64 {
+            return Ok(false);
+        }
+        // The sqlite_sequence table itself exists only once some
+        // AUTOINCREMENT table exists; a database without the marker has
+        // no engine-recorded id allocation to vouch for.
+        let marker: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_sequence WHERE name = 'nodes'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        Ok(marker > 0)
     }
 
     fn database_matches_required(
@@ -3315,14 +3394,23 @@ mod tests {
         for (t, n, s) in rows {
             out.push_str(&format!("{t}|{n}|{}\n", s.unwrap_or_default()));
         }
-        for table in [
-            "nodes",
-            "packs",
-            "wb_tasks",
-            "gc_deletions",
-            "superseded_objects",
-            "wb_capacity",
-        ] {
+        // every APPLICATION table (engine-internal sqlite_% excluded) —
+        // dynamic, so a snapshot also covers e.g. a pre-existing
+        // version_candidates table's rows, not just the six known ones
+        let tables: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master \
+                     WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+                     ORDER BY name",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        for table in &tables {
             out.push_str(table);
             out.push(':');
             let mut stmt = conn
@@ -3557,9 +3645,19 @@ mod tests {
             blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
             {
                 let mut conn = Connection::open(&path).unwrap();
-                // the migration fails as a WHOLE (write lock unavailable)
+                // the migration fails as a WHOLE, and fast: the migration
+                // connection has no busy_timeout, so a held write lock is
+                // reported as SQLITE_BUSY right away — it does NOT wait
+                // for the holder (S4.16.2: callers retry instead).
+                let busy = match SqliteMetadataStore::migrate_s416_add_version_candidates(&mut conn)
+                {
+                    Ok(()) => panic!("a held write lock must fail the migration"),
+                    Err(e) => e,
+                };
+                let msg = format!("{busy}");
                 assert!(
-                    SqliteMetadataStore::migrate_s416_add_version_candidates(&mut conn).is_err()
+                    msg.contains("locked") || msg.contains("busy"),
+                    "the failure must be the SQLITE_BUSY class, not anything else: {msg}"
                 );
             }
             // release the lock before inspecting: an EXCLUSIVE holder also
@@ -3599,5 +3697,174 @@ mod tests {
             SCHEMA,
             format!("{SCHEMA_THROUGH_S4152}{VERSION_CANDIDATES_DDL}")
         );
+    }
+
+    // ---- S4.16.2: the migration's ADMISSION boundary is an exact
+    // signature ----
+    //
+    // The upgrade fires only for a database that matches the S4.15.2
+    // schema EXACTLY: same six tables, exactly the declared columns, and
+    // nothing else in the application object space (no extra table/view/
+    // trigger, no pre-existing version_candidates). Every test here
+    // pairs the rejection with a whole-database snapshot comparison, so
+    // "refused" and "untouched" are proven together. Snapshot = DDL text
+    // of every object plus every row of every application table.
+
+    /// An S4.15.2 database carrying one extra application table is NOT
+    /// the S4.15.2 schema: no S4.15.2 build could have written it, so
+    /// the migration must refuse it and leave it byte-identical.
+    #[test]
+    fn s4162_extra_application_table_rejected_and_snapshot_identical() {
+        let path = s4161_build_s4152_db("s4162-xtab");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE user_notes (note_id INTEGER PRIMARY KEY, body TEXT);
+                 INSERT INTO user_notes VALUES (1, 'operator scribble');",
+            )
+            .unwrap();
+        }
+        let before = s4161_snapshot(&path);
+        let err = match SqliteMetadataStore::open(&path) {
+            Ok(_) => panic!("an extra application table must not be migrated over"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("predates the S4.15.2 schema") && msg.contains("Re-initialize"),
+            "the rejection must name the exact-signature rule and the way out: {msg}"
+        );
+        assert_eq!(
+            before,
+            s4161_snapshot(&path),
+            "a refused database must be untouched (schema AND rows, including the extra table)"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Same contract when a required table carries an undeclared extra
+    /// column: column sets must be EXACTLY equal, so this is not the
+    /// S4.15.2 signature and must not be migrated.
+    #[test]
+    fn s4162_extra_column_on_required_table_rejected_and_snapshot_identical() {
+        let path = s4161_build_s4152_db("s4162-xcol");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE wb_capacity ADD COLUMN auditor INTEGER NOT NULL DEFAULT 0;",
+            )
+            .unwrap();
+        }
+        let before = s4161_snapshot(&path);
+        let err = match SqliteMetadataStore::open(&path) {
+            Ok(_) => panic!("an extra column on a required table must not be migrated over"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("predates the S4.15.2 schema"),
+            "the rejection must name the exact-signature rule: {msg}"
+        );
+        assert_eq!(
+            before,
+            s4161_snapshot(&path),
+            "a refused database must be untouched"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A pre-existing version_candidates table means the database is not
+    /// the S4.15.2 signature (which by definition has no such table) —
+    /// refuse BEFORE the migration runs: the rejection must be the
+    /// admission error, never the post-migration verification error, and
+    /// the database (including the foreign table's rows) stays identical.
+    #[test]
+    fn s4162_premature_version_candidates_rejected_before_migration() {
+        let path = s4161_build_s4152_db("s4162-premature");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE version_candidates (k TEXT PRIMARY KEY);
+                 INSERT INTO version_candidates VALUES ('objects/42/w-9.data');",
+            )
+            .unwrap();
+        }
+        let before = s4161_snapshot(&path);
+        let err = match SqliteMetadataStore::open(&path) {
+            Ok(_) => panic!("a pre-existing version_candidates table must not be migrated over"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("predates the S4.15.2 schema"),
+            "this must be the ADMISSION rejection: {msg}"
+        );
+        assert!(
+            !msg.contains("post-migration"),
+            "the refusal happens before any migration runs: {msg}"
+        );
+        assert_eq!(
+            before,
+            s4161_snapshot(&path),
+            "refusal before migration must not write — not even into the foreign table"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The audit's recorded asymmetry: a CURRENT-schema database with an
+    /// EXTRA column on version_candidates opens under the S4.2.1
+    /// required-subset contract — it is never migrated (there is nothing
+    /// to migrate), never rewritten, and the extra structure survives
+    /// untouched. This is the proof that extra structures in the current
+    /// domain cannot make the migration mutate an unsupported database:
+    /// they never reach it.
+    #[test]
+    fn s4162_extra_structures_in_current_domain_open_without_migration() {
+        let path = temp_path("s4162-curdom");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_THROUGH_S4152).unwrap();
+            conn.execute_batch(
+                "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, mode)
+                 VALUES (1, NULL, '', 'dir', 0, 1, 493);
+                 CREATE TABLE version_candidates (
+                     key TEXT PRIMARY KEY,
+                     registered_at INTEGER NOT NULL,
+                     foreign_extra TEXT
+                 );
+                 INSERT INTO version_candidates VALUES ('objects/42/w-9.data', 5, 'kept');",
+            )
+            .unwrap();
+        }
+        let before = s4161_snapshot(&path);
+        let store = SqliteMetadataStore::open(&path).unwrap();
+        use crate::metadata::MetadataStore as _;
+        // the store opens on it and the candidate machinery works on the
+        // two contract columns — the extra column is nobody's business
+        assert_eq!(
+            store.version_candidate_rows().unwrap(),
+            vec![("objects/42/w-9.data".to_string(), 5)],
+        );
+        // exactly one version_candidates table: the migration did NOT
+        // fire (it would have been a no-op anyway — nothing was created)
+        let conn = Connection::open(&path).unwrap();
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'version_candidates'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 1, "open must not create a second candidate table");
+        // and the open wrote nothing: schema objects and all rows,
+        // including the foreign column's data, are exactly as before
+        assert_eq!(
+            before,
+            s4161_snapshot(&path),
+            "opening a current-domain database must not rewrite anything"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
     }
 }
