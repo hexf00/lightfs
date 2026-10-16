@@ -239,7 +239,7 @@ jobs:
       - name: Smoke — binaries start; dead-endpoint path fails loudly
         run: |
           set -euo pipefail
-          ./target/release/lightfs --help > /dev/null
+          ./target/release/lightfs version
           cat > /tmp/smoke.toml <<'CFG'
           [s3]
           endpoint = "http://127.0.0.1:1"

@@ -3336,14 +3336,29 @@ mod tests {
 
         // Restart: the ledger is rebuilt from REAL files only.
         drop(core);
-        let eng = WriteBackEngine::new(
-            meta.clone(),
-            objects,
-            StdArc::new(Metrics::default()),
-            &p0c2_opts(&staging_dir),
-            false,
-        )
-        .unwrap();
+        // Bounded retry (2s) — same family as the SIGKILL tests below: the
+        // kernel lock release on drop/close can stay invisible to an
+        // immediate reopen for a few tens of microseconds (observed on a
+        // 2-core Linux runner). A lock genuinely held by a live engine
+        // still fails.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let eng = loop {
+            match WriteBackEngine::new(
+                meta.clone(),
+                objects.clone(),
+                StdArc::new(Metrics::default()),
+                &p0c2_opts(&staging_dir),
+                false,
+            ) {
+                Ok(eng) => break eng,
+                Err(e) => {
+                    if std::time::Instant::now() >= deadline {
+                        panic!("staging lock not reacquired after drop: {e}");
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        };
         eng.recover().unwrap();
         assert_eq!(
             eng.reconcile_capacity_and_report().unwrap(),
