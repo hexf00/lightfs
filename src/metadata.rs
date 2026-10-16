@@ -288,6 +288,42 @@ pub trait MetadataStore: Send + Sync {
         let _ = (key, now);
         Ok(false)
     }
+
+    // ---- S4.16 durable version-candidate lifecycle. A per-file version
+    // key is REGISTERED here BEFORE its remote PUT, so an upload that fails
+    // uncertainly (the remote may have stored the object) always has a
+    // durable tracker. One row per key — retries generate fresh keys and
+    // never overwrite an earlier attempt's row. The row leaves the table
+    // ONLY at a confirmed point: consumed atomically inside the CAS
+    // transaction that makes the key live, dropped after a CONFIRMED
+    // absent HEAD/DELETE, or retired atomically into `gc_deletions` by
+    // [`MetadataStore::retire_version_candidate_to_gc`]. Default
+    // implementations report unsupported; SQLite is the implementing
+    // backend.
+
+    /// Persist the candidate row for `key` BEFORE the remote PUT happens.
+    fn register_version_candidate(&self, key: &str, now: i64) -> Result<()> {
+        let _ = (key, now);
+        Err(Error::Storage("version candidates unsupported".into()))
+    }
+    /// Remove the candidate row after the object is CONFIRMED absent
+    /// (DELETE 2xx/404-missing-key, or a HEAD that answered ObjectMissing).
+    fn drop_version_candidate(&self, key: &str) -> Result<()> {
+        let _ = key;
+        Err(Error::Storage("version candidates unsupported".into()))
+    }
+    /// Every candidate key still tracked (put may or may not have landed).
+    fn unresolved_version_candidates(&self) -> Result<Vec<String>> {
+        Err(Error::Storage("version candidates unsupported".into()))
+    }
+    /// ONE transaction: re-check live references, ensure the key has a
+    /// durable `gc_deletions` intent (existing or newly created), and only
+    /// then remove the candidate row — so the tracker can never vanish
+    /// without either live ownership or a durable intent taking over.
+    fn retire_version_candidate_to_gc(&self, key: &str, now: i64) -> Result<CandidateRetire> {
+        let _ = (key, now);
+        Err(Error::Storage("version candidates unsupported".into()))
+    }
     /// Claim deletion work: `deleting` rows from a crashed executor re-enter
     /// the queue (the remote delete is idempotent), then pending/failed rows
     /// move to `deleting` and are returned.
@@ -372,6 +408,16 @@ pub trait MetadataStore: Send + Sync {
     /// Test-only readback of pack rows: (key, state).
     #[cfg(test)]
     fn pack_rows_debug(&self) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
+    /// Test-only readback of version-candidate rows: (key, registered_at).
+    #[cfg(test)]
+    fn version_candidate_rows(&self) -> Result<Vec<(String, i64)>> {
+        Ok(Vec::new())
+    }
+    /// Test-only readback of deletion-intent rows: (key, kind, state).
+    #[cfg(test)]
+    fn gc_deletion_rows(&self) -> Result<Vec<(String, String, String)>> {
         Ok(Vec::new())
     }
     fn wb_set_state(&self, id: i64, state: &str, now: i64) -> Result<()> {
@@ -477,4 +523,22 @@ pub struct GcDeletion {
     pub key: String,
     /// 'pack' | 'object' — drives the local cleanup on completion.
     pub kind: String,
+}
+
+/// Outcome of [`MetadataStore::retire_version_candidate_to_gc`] (S4.16):
+/// the one-transaction handoff of an unresolved version candidate. Unlike
+/// `gc_enqueue_orphan_object`'s bool, the three values are distinguishable
+/// — a caller never has to guess whether "false" meant a live reference or
+/// an already-existing intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateRetire {
+    /// No candidate row existed (already consumed/dropped elsewhere).
+    NotTracked,
+    /// A live node's `object_key` IS this key: live metadata owns it, the
+    /// candidate row was removed, and NO deletion intent may exist for it.
+    LiveOwned,
+    /// The key is referenced by nobody: a durable `gc_deletions` intent is
+    /// now guaranteed (created or already present) and the candidate row
+    /// was removed in the same transaction.
+    IntentEnsured,
 }

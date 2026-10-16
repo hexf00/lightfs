@@ -883,6 +883,11 @@ impl WriteBackEngine {
             }
         };
         let version_key = crate::core::new_version_key_for(task.node_id);
+        // S4.16 §3.1: durable registration BEFORE the remote PUT — same
+        // contract as the strict paths; the candidate row keeps an
+        // uncertain upload trackable when uploaded_key never lands.
+        self.meta
+            .register_version_candidate(&version_key, self.now())?;
         let put = self
             .objects
             .put_stream(&version_key, &mut f, task.size as u64);
@@ -930,7 +935,14 @@ impl WriteBackEngine {
                 // Never corrupt the winner: dead-letter with bytes retained.
                 self.metrics.conflicts.fetch_add(1, Ordering::Relaxed);
                 self.metrics.wb_conflicts.fetch_add(1, Ordering::Relaxed);
-                let _ = self.objects.delete(&version_key);
+                // S4.16 §3.3: shared cleanup — an uncertain delete keeps
+                // the candidate row for the resolution sweep (the winner's
+                // key is a different key, so this key can never be live).
+                crate::core::cleanup_version_candidate_after_failed_put(
+                    &*self.meta,
+                    &*self.objects,
+                    &version_key,
+                );
                 self.meta
                     .wb_mark_dead(task.id, CLASS_CONFLICT, self.now())?;
                 eprintln!(
@@ -943,12 +955,20 @@ impl WriteBackEngine {
                 // raced with unlink after the get_node above: TERMINAL
                 // discard, counted (S3.5 - never a silent disappearance)
                 self.metrics.wb_discarded.fetch_add(1, Ordering::Relaxed);
-                let _ = self.objects.delete(&version_key);
+                crate::core::cleanup_version_candidate_after_failed_put(
+                    &*self.meta,
+                    &*self.objects,
+                    &version_key,
+                );
                 self.meta.wb_finish(task.id)?;
                 self.remove_staged(&task);
             }
             Err(e) => {
-                let _ = self.objects.delete(&version_key);
+                crate::core::cleanup_version_candidate_after_failed_put(
+                    &*self.meta,
+                    &*self.objects,
+                    &version_key,
+                );
                 // S4.4: the class comes from the error's ORIGIN — transient
                 // upload failures requeue with a bounded budget; permanent
                 // remote verdicts and unjudgeable errors dead-letter now
@@ -5407,6 +5427,360 @@ mod tests {
             ro.sync_all().is_err(),
             "a GENERIC_READ-only directory handle must not flush"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- S4.16 durable version-candidate lifecycle (WB drain path) -------
+
+    fn s416_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// SC5 injector: the remote PUT lands, and WHILE IT IS IN FLIGHT the
+    /// file is unlinked — the raced-with-unlink window that turns the CAS
+    /// into NotFound. The cleanup delete afterwards fails uncertainly.
+    struct W5RaceObjects {
+        inner: MemObjectStore,
+        meta: StdArc<dyn crate::metadata::MetadataStore>,
+        node_id: std::sync::atomic::AtomicI64,
+        fail_delete: std::sync::atomic::AtomicBool,
+    }
+
+    impl W5RaceObjects {
+        fn new(meta: StdArc<dyn crate::metadata::MetadataStore>) -> Self {
+            Self {
+                inner: MemObjectStore::new(),
+                meta,
+                node_id: std::sync::atomic::AtomicI64::new(0),
+                fail_delete: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl crate::object_store::ObjectStore for W5RaceObjects {
+        fn put(
+            &self,
+            key: &str,
+            data: &[u8],
+        ) -> crate::error::Result<crate::object_store::ObjectInfo> {
+            self.inner.put(key, data)
+        }
+        fn put_stream(
+            &self,
+            key: &str,
+            reader: &mut dyn std::io::Read,
+            len: u64,
+        ) -> crate::error::Result<crate::object_store::ObjectInfo> {
+            let info = self.inner.put_stream(key, reader, len)?;
+            // the unlink races the in-flight upload
+            let id = self.node_id.load(std::sync::atomic::Ordering::SeqCst);
+            if id != 0 {
+                let _ = self.meta.delete_node(id);
+            }
+            Ok(info)
+        }
+        fn get(
+            &self,
+            key: &str,
+            range: Option<crate::object_store::Range>,
+        ) -> crate::error::Result<crate::object_store::ObjectData> {
+            self.inner.get(key, range)
+        }
+        fn get_stream(
+            &self,
+            key: &str,
+            range: Option<crate::object_store::Range>,
+        ) -> crate::error::Result<(Box<dyn std::io::Read + Send>, u64)> {
+            self.inner.get_stream(key, range)
+        }
+        fn head(&self, key: &str) -> crate::error::Result<crate::object_store::ObjectInfo> {
+            self.inner.head(key)
+        }
+        fn delete(&self, key: &str) -> crate::error::Result<()> {
+            if self
+                .fail_delete
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::error::Error::Storage(
+                    "injected: delete uncertain (5xx)".into(),
+                ));
+            }
+            self.inner.delete(key)
+        }
+        fn list(
+            &self,
+            prefix: &str,
+            token: Option<&str>,
+            max: usize,
+        ) -> crate::error::Result<crate::object_store::ListPage> {
+            self.inner.list(prefix, token, max)
+        }
+        fn ping(&self) -> crate::error::Result<()> {
+            self.inner.ping()
+        }
+    }
+
+    fn s416_candidate_rows(c: &Core) -> Vec<String> {
+        let mut v: Vec<String> = c
+            .metadata()
+            .version_candidate_rows()
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn s416_intents(c: &Core) -> Vec<(String, String, String)> {
+        let mut v = c.metadata().gc_deletion_rows().unwrap();
+        v.sort();
+        v
+    }
+
+    /// Scenario 5: the drain's PUT succeeds while an unlink races it in
+    /// flight; the CAS hits NotFound (terminal discard) and the cleanup
+    /// delete fails UNCERTAINLY — the candidate row must survive, and one
+    /// resolution sweep turns it into exactly one durable intent that the
+    /// gc executor drains.
+    #[test]
+    fn s416_w5_notfound_uncertain_delete_candidate_survives() {
+        let meta: StdArc<dyn crate::metadata::MetadataStore> =
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap());
+        let objs = StdArc::new(W5RaceObjects::new(meta.clone()));
+        let dir = std::env::temp_dir().join(format!(
+            "lightfs-s416-w5-{}-{}",
+            std::process::id(),
+            tmp_unique()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Core::with_options(
+            meta.clone(),
+            objs.clone(),
+            crate::core::DEFAULT_SUPERSEDED_SECS,
+            None,
+            Some(WbOptions {
+                staging_dir: dir.join("staging").to_string_lossy().to_string(),
+                drain_workers: 0,
+                batch_pack_bytes: 0,
+                batch_max_wait_ms: 0,
+                queue_max_tasks: 0,
+                staging_budget_bytes: 0,
+
+                probe_fault: false,
+            }),
+        )
+        .unwrap();
+        c.create("/f", 0o644).unwrap();
+        let body = b"raced while draining";
+        write_via_rpc(&c, "/f", body, Some(0));
+        let task = c.metadata().wb_active_tasks().unwrap().pop().unwrap();
+        objs.node_id
+            .store(task.node_id, std::sync::atomic::Ordering::SeqCst);
+        objs.fail_delete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        c.wb().unwrap().drain_once().unwrap();
+        // the task terminated (NotFound arm: finish + drop staging)
+        assert!(c.metadata().wb_task_rows().unwrap().is_empty());
+        // the upload really happened; its cleanup delete was uncertain
+        let cands = s416_candidate_rows(&c);
+        assert_eq!(cands.len(), 1, "uncertain cleanup keeps the candidate");
+        let key = cands[0].clone();
+        assert!(c.objects().head(&key).is_ok(), "object still on the remote");
+        // the sweep enrolls exactly one intent; gc drains it
+        let sweep = crate::core::resolve_version_candidates(c.metadata(), c.objects()).unwrap();
+        assert_eq!(sweep.intent_ensured, 1);
+        assert_eq!(
+            s416_intents(&c),
+            vec![(key.clone(), "object".into(), "pending".into())]
+        );
+        let (done, failed, skipped) = c.gc_execute_deletions(10, &Default::default()).unwrap();
+        assert_eq!((done, failed, skipped), (1, 0, 0));
+        assert!(c.objects().head(&key).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Scenario 7: the drain PUT landed but the process died before
+    /// wb_set_uploaded_key/CAS — the candidate registered BEFORE the PUT
+    /// is the only witness. Recovery re-drains the task (new key, CAS
+    /// consumes the new candidate), and one sweep turns the orphaned
+    /// first-PUT key into one intent; the live key never joins the queue.
+    #[test]
+    fn s416_w7_crash_before_uploaded_key_still_tracked() {
+        let dir = std::env::temp_dir().join(format!(
+            "lightfs-s416-w7-{}-{}",
+            std::process::id(),
+            tmp_unique()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("meta.db");
+        let staging = dir.join("staging");
+        let opts = |staging: &String| WbOptions {
+            staging_dir: staging.clone(),
+            drain_workers: 0,
+            batch_pack_bytes: 0,
+            batch_max_wait_ms: 0,
+            queue_max_tasks: 0,
+            staging_budget_bytes: 0,
+
+            probe_fault: false,
+        };
+        let body = b"put landed, then the process died";
+        let store: StdArc<dyn crate::object_store::ObjectStore> =
+            StdArc::new(MemObjectStore::new());
+        let dead_key = {
+            let c = Core::with_options(
+                StdArc::new(SqliteMetadataStore::open(db.to_string_lossy().as_ref()).unwrap()),
+                store.clone(),
+                crate::core::DEFAULT_SUPERSEDED_SECS,
+                None,
+                Some(opts(&staging.to_string_lossy().to_string())),
+            )
+            .unwrap();
+            c.create("/f", 0o644).unwrap();
+            write_via_rpc(&c, "/f", body, Some(0));
+            let task = c.metadata().wb_active_tasks().unwrap().pop().unwrap();
+            // the drain's first attempt: register → PUT → (die before
+            // wb_set_uploaded_key / CAS)
+            let vkey = crate::core::new_version_key_for(task.node_id);
+            c.metadata()
+                .register_version_candidate(&vkey, s416_now())
+                .unwrap();
+            c.objects().put(&vkey, body).unwrap();
+            vkey
+            // Core dropped = crash: the task is still queued, the first
+            // PUT's object is on the remote, its candidate row is durable
+        };
+        // restart: recovery requeues, the drain replays with a NEW key
+        let c = Core::with_options(
+            StdArc::new(SqliteMetadataStore::open(db.to_string_lossy().as_ref()).unwrap()),
+            store,
+            crate::core::DEFAULT_SUPERSEDED_SECS,
+            None,
+            Some(opts(&staging.to_string_lossy().to_string())),
+        )
+        .unwrap();
+        c.wb().unwrap().recover().unwrap();
+        let cands = s416_candidate_rows(&c);
+        assert_eq!(
+            cands,
+            vec![dead_key.clone()],
+            "the crashed PUT's candidate must be the tracked one"
+        );
+        c.wb().unwrap().drain_once().unwrap();
+        let n = c.lookup("/f").unwrap();
+        assert_eq!(n.version, 1);
+        assert_eq!(c.read("/f", 0, 64).unwrap(), body);
+        let live_key = n.object_key.clone().unwrap();
+        assert_ne!(live_key, dead_key);
+        assert_eq!(
+            s416_candidate_rows(&c),
+            vec![dead_key.clone()],
+            "the CAS consumed only the new attempt's candidate"
+        );
+        let sweep = crate::core::resolve_version_candidates(c.metadata(), c.objects()).unwrap();
+        assert_eq!(sweep.intent_ensured, 1);
+        let intents = s416_intents(&c);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].0, dead_key);
+        assert_ne!(intents[0].0, live_key, "the live key is never a task");
+        let (done, failed, _) = c.gc_execute_deletions(10, &Default::default()).unwrap();
+        assert_eq!((done, failed), (1, 0));
+        assert!(c.objects().head(&dead_key).is_err());
+        assert!(c.objects().head(&live_key).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Scenario 10: the same key arrives at the intent pipeline through
+    /// BOTH the legacy uploaded_key path (dead task) and the new candidate
+    /// mechanism — gc_deletions.key is UNIQUE and the candidate retire
+    /// uses INSERT OR IGNORE, so the outcome is exactly ONE intent.
+    #[test]
+    fn s416_w10_same_key_single_intent_across_paths() {
+        let dir = std::env::temp_dir().join(format!(
+            "lightfs-s416-w10-{}-{}",
+            std::process::id(),
+            tmp_unique()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("meta.db");
+        let staging = dir.join("staging");
+        let opts = |staging: &String| WbOptions {
+            staging_dir: staging.clone(),
+            drain_workers: 0,
+            batch_pack_bytes: 0,
+            batch_max_wait_ms: 0,
+            queue_max_tasks: 0,
+            staging_budget_bytes: 0,
+
+            probe_fault: false,
+        };
+        let body = b"one key, one intent";
+        let store: StdArc<dyn crate::object_store::ObjectStore> =
+            StdArc::new(MemObjectStore::new());
+        let key = {
+            let c = Core::with_options(
+                StdArc::new(SqliteMetadataStore::open(db.to_string_lossy().as_ref()).unwrap()),
+                store.clone(),
+                crate::core::DEFAULT_SUPERSEDED_SECS,
+                None,
+                Some(opts(&staging.to_string_lossy().to_string())),
+            )
+            .unwrap();
+            c.create("/f", 0o644).unwrap();
+            write_via_rpc(&c, "/f", body, Some(0));
+            let task = c.metadata().wb_active_tasks().unwrap().pop().unwrap();
+            let vkey = crate::core::new_version_key_for(task.node_id);
+            // the new mechanism's registration + the upload
+            c.metadata()
+                .register_version_candidate(&vkey, s416_now())
+                .unwrap();
+            c.objects().put(&vkey, body).unwrap();
+            // the legacy path's witness: uploaded_key on a DEAD task whose
+            // node is gone
+            c.metadata()
+                .wb_set_uploaded_key(task.id, &vkey, s416_now())
+                .unwrap();
+            c.metadata()
+                .wb_mark_dead(task.id, "upload-permanent", s416_now())
+                .unwrap();
+            c.metadata().delete_node(task.node_id).unwrap();
+            vkey
+        };
+        // restart: recover() walks the legacy path (dead_task_orphans →
+        // HEAD ok → enroll intent); the candidate row for the SAME key is
+        // still there
+        let c = Core::with_options(
+            StdArc::new(SqliteMetadataStore::open(db.to_string_lossy().as_ref()).unwrap()),
+            store,
+            crate::core::DEFAULT_SUPERSEDED_SECS,
+            None,
+            Some(opts(&staging.to_string_lossy().to_string())),
+        )
+        .unwrap();
+        c.wb().unwrap().recover().unwrap();
+        let rows = s416_intents(&c);
+        assert_eq!(
+            rows,
+            vec![(key.clone(), "object".into(), "pending".into())],
+            "the legacy path must leave exactly one intent"
+        );
+        // the shared sweep retires the candidate for the SAME key: the
+        // existing intent is reused (INSERT OR IGNORE), never duplicated
+        let sweep = crate::core::resolve_version_candidates(c.metadata(), c.objects()).unwrap();
+        assert_eq!(sweep.intent_ensured, 1);
+        assert_eq!(
+            s416_intents(&c),
+            vec![(key.clone(), "object".into(), "pending".into())],
+            "still exactly one intent for the key"
+        );
+        assert!(s416_candidate_rows(&c).is_empty());
+        let (done, failed, _) = c.gc_execute_deletions(10, &Default::default()).unwrap();
+        assert_eq!((done, failed), (1, 0));
+        assert!(c.objects().head(&key).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

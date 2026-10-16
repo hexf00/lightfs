@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use lightfs::core::Core;
 use lightfs::error::{Error, Result};
-use lightfs::metadata::{MetadataStore, Node, NodeKind, sqlite::SqliteMetadataStore};
+use lightfs::metadata::{CandidateRetire, MetadataStore, Node, NodeKind, sqlite::SqliteMetadataStore};
 use lightfs::object_store::{
     ListPage, ObjectData, ObjectInfo, ObjectStore, Range, mem::MemObjectStore,
 };
@@ -201,6 +201,21 @@ impl MetadataStore for FaultyMeta {
     }
     fn all_superseded(&self) -> Result<Vec<String>> {
         self.inner.all_superseded()
+    }
+    // S4.16: the candidate lifecycle delegates to the real SQLite store so
+    // the strict write paths keep their register-before-PUT contract under
+    // the injected CAS failures.
+    fn register_version_candidate(&self, key: &str, now: i64) -> Result<()> {
+        self.inner.register_version_candidate(key, now)
+    }
+    fn drop_version_candidate(&self, key: &str) -> Result<()> {
+        self.inner.drop_version_candidate(key)
+    }
+    fn unresolved_version_candidates(&self) -> Result<Vec<String>> {
+        self.inner.unresolved_version_candidates()
+    }
+    fn retire_version_candidate_to_gc(&self, key: &str, now: i64) -> Result<CandidateRetire> {
+        self.inner.retire_version_candidate_to_gc(key, now)
     }
 }
 

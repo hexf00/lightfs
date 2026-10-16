@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
-use crate::metadata::{GcDeletion, MetadataStore, Node, NodeKind};
+use crate::metadata::{CandidateRetire, GcDeletion, MetadataStore, Node, NodeKind};
 
 pub struct SqliteMetadataStore {
     conn: Mutex<Connection>,
@@ -84,6 +84,10 @@ CREATE TABLE IF NOT EXISTS wb_capacity (
     staged_bytes INTEGER NOT NULL DEFAULT 0,
     reserved_bytes INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS version_candidates (
+    key TEXT PRIMARY KEY,
+    registered_at INTEGER NOT NULL
+);
 "#;
 
 /// S4.2.1 single-schema contract: every table and column this build
@@ -92,7 +96,7 @@ CREATE TABLE IF NOT EXISTS wb_capacity (
 /// database missing any piece predates this schema and is rejected at open
 /// (re-initialize the store instead); a fresh database simply gets all of
 /// it from `SCHEMA`.
-const REQUIRED_TABLE_COLUMNS: [(&str, &[&str]); 6] = [
+const REQUIRED_TABLE_COLUMNS: [(&str, &[&str]); 7] = [
     (
         "nodes",
         &[
@@ -147,6 +151,7 @@ const REQUIRED_TABLE_COLUMNS: [(&str, &[&str]); 6] = [
         ],
     ),
     ("wb_capacity", &["id", "staged_bytes", "reserved_bytes"]),
+    ("version_candidates", &["key", "registered_at"]),
 ];
 
 /// Column names of `table`; empty when the table does not exist.
@@ -653,6 +658,17 @@ impl MetadataStore for SqliteMetadataStore {
         }
         pack_ref_new_tx(&tx, Some(new_object_key), mtime)?;
         pack_ref_gone_tx(&tx, old_key.as_deref(), mtime)?;
+        // S4.16: a successful CAS makes `new_object_key` live; the pre-PUT
+        // candidate registration is consumed in the SAME transaction
+        // (spec §3.2), so a crash between commit and cleanup can never
+        // leave the live key tracked as a deletion candidate. Unconditional
+        // DELETE: the row is simply absent when this write never registered
+        // (e.g. a caller that has no remote PUT at this key) — no signature
+        // change at any of the CAS call sites.
+        tx.execute(
+            "DELETE FROM version_candidates WHERE key = ?1",
+            params![new_object_key],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1206,6 +1222,98 @@ impl MetadataStore for SqliteMetadataStore {
         )?;
         tx.commit()?;
         Ok(true)
+    }
+
+    // ---- S4.16 durable version-candidate lifecycle ----
+
+    fn register_version_candidate(&self, key: &str, now: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        // Idempotent: a retried registration of the same attempt key must
+        // not fail (one row per key, never overwritten by a DIFFERENT key —
+        // each attempt generates its own unique version key).
+        conn.execute(
+            "INSERT OR REPLACE INTO version_candidates (key, registered_at) VALUES (?1, ?2)",
+            params![key, now],
+        )?;
+        Ok(())
+    }
+
+    fn drop_version_candidate(&self, key: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM version_candidates WHERE key = ?1",
+            params![key],
+        )?;
+        Ok(())
+    }
+
+    fn unresolved_version_candidates(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT key FROM version_candidates ORDER BY registered_at, key")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
+    }
+
+    fn retire_version_candidate_to_gc(&self, key: &str, now: i64) -> Result<CandidateRetire> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tracked: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM version_candidates WHERE key = ?1)",
+            params![key],
+            |r| r.get(0),
+        )?;
+        if !tracked {
+            return Ok(CandidateRetire::NotTracked);
+        }
+        // Live reference wins INSIDE the same transaction: a key that is
+        // (still) some node's object key belongs to the tree — the candidate
+        // row is dropped WITHOUT any deletion intent (spec §3.3/§4: never
+        // enqueue a live key).
+        let live: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM nodes WHERE object_key = ?1)",
+            params![key],
+            |r| r.get(0),
+        )?;
+        if live {
+            tx.execute(
+                "DELETE FROM version_candidates WHERE key = ?1",
+                params![key],
+            )?;
+            tx.commit()?;
+            return Ok(CandidateRetire::LiveOwned);
+        }
+        // Not live: hand the key to the existing gc_deletions pipeline in
+        // THIS transaction — "ensure intent" and "remove candidate" have no
+        // window between them (spec §3.4). INSERT OR IGNORE: an intent for
+        // the same key may already exist (gc_deletions.key is UNIQUE).
+        tx.execute(
+            "INSERT OR IGNORE INTO gc_deletions (key, kind, state, updated_at) \
+             VALUES (?1, 'object', 'pending', ?2)",
+            params![key, now],
+        )?;
+        tx.execute(
+            "DELETE FROM version_candidates WHERE key = ?1",
+            params![key],
+        )?;
+        tx.commit()?;
+        Ok(CandidateRetire::IntentEnsured)
+    }
+
+    #[cfg(test)]
+    fn version_candidate_rows(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT key, registered_at FROM version_candidates")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<(String, i64)>>>()?)
+    }
+
+    #[cfg(test)]
+    fn gc_deletion_rows(&self) -> Result<Vec<(String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT key, kind, state FROM gc_deletions")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<(String, String, String)>>>()?)
     }
 
     fn gc_claim_deletions(&self, limit: usize, now: i64) -> Result<Vec<GcDeletion>> {

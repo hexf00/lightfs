@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::config::PackSection;
 use crate::error::{Error, Result};
-use crate::metadata::{MetadataStore, Node, NodeKind};
+use crate::metadata::{CandidateRetire, MetadataStore, Node, NodeKind};
 use crate::object_store::ObjectStore;
 use crate::pack::{PackEngine, PackReadCache};
 use crate::wb::{WbOptions, WriteBackEngine};
@@ -1046,6 +1046,17 @@ impl Core {
             }
         }
         let version_key = self.new_version_key(node.id);
+        // S4.16 §3.1: durable registration BEFORE the remote PUT — an
+        // uncertain failure or crash can never leave an uploaded object
+        // without a tracking row. Registration failure aborts the write
+        // (nothing was uploaded yet), with the create-if-missing phantom
+        // cleanup the PUT-failure arm would have done.
+        if let Err(e) = self.meta.register_version_candidate(&version_key, self.now()) {
+            if drop_created_node {
+                let _ = self.meta.delete_node(node.id);
+            }
+            return Err(e);
+        }
         let info = match self.objects.put_stream(&version_key, reader, len) {
             Ok(info) => info,
             Err(e) => {
@@ -1054,7 +1065,11 @@ impl Core {
                 if drop_created_node {
                     let _ = self.meta.delete_node(node.id);
                 }
-                let _ = self.objects.delete(&version_key);
+                cleanup_version_candidate_after_failed_put(
+                    &*self.meta,
+                    &*self.objects,
+                    &version_key,
+                );
                 return Err(e);
             }
         };
@@ -1082,11 +1097,21 @@ impl Core {
             }
             Err(e @ Error::Conflict { .. }) => {
                 self.metrics.conflicts.fetch_add(1, Ordering::Relaxed);
-                let _ = self.objects.delete(&version_key);
+                // S4.16 §3.3: best-effort delete; on an uncertain delete
+                // the candidate row survives for the resolution sweep.
+                cleanup_version_candidate_after_failed_put(
+                    &*self.meta,
+                    &*self.objects,
+                    &version_key,
+                );
                 Err(e)
             }
             Err(e) => {
-                let _ = self.objects.delete(&version_key);
+                cleanup_version_candidate_after_failed_put(
+                    &*self.meta,
+                    &*self.objects,
+                    &version_key,
+                );
                 Err(e)
             }
         }
@@ -1241,7 +1266,21 @@ impl Core {
         }
 
         let version_key = self.new_version_key(node.id);
-        let info = self.objects.put(&version_key, &content)?;
+        // S4.16 §3.1: durable registration BEFORE the remote PUT (same
+        // contract as the streaming path).
+        self.meta
+            .register_version_candidate(&version_key, self.now())?;
+        let info = match self.objects.put(&version_key, &content) {
+            Ok(info) => info,
+            Err(e) => {
+                cleanup_version_candidate_after_failed_put(
+                    &*self.meta,
+                    &*self.objects,
+                    &version_key,
+                );
+                return Err(e);
+            }
+        };
         self.metrics.s3_put.fetch_add(1, Ordering::Relaxed);
 
         let cas = self.meta.commit_content_cas(
@@ -1272,16 +1311,23 @@ impl Core {
             Err(e @ Error::Conflict { .. }) => {
                 self.metrics.conflicts.fetch_add(1, Ordering::Relaxed);
                 // Losing writer cleans up after itself; the winner's object
-                // was never touched (different key).
+                // was never touched (different key). S4.16 §3.3: the
+                // candidate row survives an uncertain delete for the sweep.
                 if self.objects.delete(&version_key).is_ok() {
                     self.metrics.s3_delete.fetch_add(1, Ordering::Relaxed);
+                    let _ = self.meta.drop_version_candidate(&version_key);
                 }
                 Err(e)
             }
             Err(e) => {
                 // CAS could not run (node vanished, storage/db error): drop
-                // our orphan-in-waiting.
-                let _ = self.objects.delete(&version_key);
+                // our orphan-in-waiting (candidate row kept if the delete
+                // is uncertain — resolution sweep settles it, S4.16 §3.3).
+                cleanup_version_candidate_after_failed_put(
+                    &*self.meta,
+                    &*self.objects,
+                    &version_key,
+                );
                 Err(e)
             }
         }
@@ -1503,6 +1549,112 @@ pub(crate) fn recover_stale_packs(
             Err(e) => {
                 eprintln!(
                     "lightfs: stale pack upload {key}: head unavailable ({e}); row kept for next pass"
+                );
+                s.head_unavailable += 1;
+            }
+        }
+    }
+    Ok(s)
+}
+
+/// S4.16 — outcome counters of one [`resolve_version_candidates`] pass.
+#[derive(Debug, Default)]
+pub(crate) struct VersionCandidateSweep {
+    /// HEAD OK, no live node references the key: a durable deletion intent
+    /// was ensured and the candidate row removed in one transaction.
+    pub intent_ensured: u64,
+    /// HEAD OK but the key is (still) a live node's object key: candidate
+    /// dropped WITHOUT intent (the CAS that made it live won the race).
+    pub live_owned: u64,
+    /// HEAD 404: the object is confirmed absent — nothing to track.
+    pub dropped_absent: u64,
+    /// HEAD unavailable (5xx/transport/NoSuchBucket/…): row kept — an
+    /// undecided key is never resolved by guessing (spec §3.3).
+    pub head_unavailable: u64,
+    /// metadata-side retire/drop error: row kept, retried next pass.
+    pub retire_failed: u64,
+}
+
+/// S4.16 shared failure-arm cleanup after an uncommitted per-file PUT —
+/// the strict streaming path, the strict buffered-session path and the WB
+/// drain all route through this one helper (spec §2: one contract). It
+/// best-effort deletes the attempt key remotely; the durable candidate
+/// row is dropped ONLY when that delete is CONFIRMED (the ObjectStore
+/// contract: Ok = confirmed absent or already absent; 403/5xx/transport/
+/// NoSuchBucket are Err). Any uncertain delete keeps the row — the
+/// resolution sweep settles it later from HEAD evidence, never from the
+/// ambiguous error (spec §3.3).
+pub(crate) fn cleanup_version_candidate_after_failed_put(
+    meta: &dyn MetadataStore,
+    objects: &dyn ObjectStore,
+    key: &str,
+) {
+    if objects.delete(key).is_ok() {
+        let _ = meta.drop_version_candidate(key);
+    }
+}
+
+/// S4.16 shared resolution sweep for per-file version candidates
+/// (registered before every remote PUT on all three per-file sites). One
+/// pass, one verdict per key — decided ONLY from evidence:
+/// - HEAD OK: [`MetadataStore::retire_version_candidate_to_gc`] — a live
+///   reference drops the candidate without intent (LiveOwned); no live
+///   reference ensures the deletion intent and drops the candidate in the
+///   SAME transaction (IntentEnsured). This sweep never deletes remote
+///   objects itself; the existing gc executor drains the intent (§3.4).
+/// - HEAD ObjectMissing: the object is confirmed absent — drop the row.
+/// - HEAD unavailable: keep the row for the next pass.
+///
+/// Runs wherever the stale-pack sweep runs (engine startup, WB recover,
+/// offline maintenance), so the gc pass converges candidates without any
+/// new background worker (§4).
+pub(crate) fn resolve_version_candidates(
+    meta: &Arc<dyn MetadataStore>,
+    objects: &Arc<dyn ObjectStore>,
+) -> Result<VersionCandidateSweep> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let mut s = VersionCandidateSweep::default();
+    for key in meta.unresolved_version_candidates()? {
+        match objects.head(&key) {
+            Ok(_) => match meta.retire_version_candidate_to_gc(&key, now) {
+                Ok(CandidateRetire::IntentEnsured) => {
+                    eprintln!(
+                        "lightfs: version candidate {key}: object exists, no live reference — deletion intent ensured"
+                    );
+                    s.intent_ensured += 1;
+                }
+                Ok(CandidateRetire::LiveOwned) => {
+                    eprintln!(
+                        "lightfs: version candidate {key}: key is live (committed) — candidate dropped, no intent"
+                    );
+                    s.live_owned += 1;
+                }
+                Ok(CandidateRetire::NotTracked) => {}
+                Err(e) => {
+                    eprintln!(
+                        "lightfs: version candidate {key}: retire failed ({e}); kept for next pass"
+                    );
+                    s.retire_failed += 1;
+                }
+            },
+            Err(Error::ObjectMissing(_)) => match meta.drop_version_candidate(&key) {
+                Ok(()) => {
+                    eprintln!("lightfs: version candidate {key} dropped (object confirmed absent)");
+                    s.dropped_absent += 1;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "lightfs: version candidate {key}: could not drop ({e}); kept for next pass"
+                    );
+                    s.retire_failed += 1;
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "lightfs: version candidate {key}: head unavailable ({e}); kept for next pass"
                 );
                 s.head_unavailable += 1;
             }
@@ -3047,6 +3199,686 @@ mod symlink_tests {
                 "allocation continues above everything seen before the restart"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- S4.16 durable version-candidate lifecycle -------------------------
+
+    use crate::object_store::{ListPage, ObjectData, ObjectInfo, Range};
+
+    static S416_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn tmp_unique() -> u128 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        (nanos << 8) | S416_TMP_SEQ.fetch_add(1, Ordering::Relaxed) as u128
+    }
+
+    /// Uncertain-PUT injection: the object is REALLY stored (remote side
+    /// effect done) and only then the call fails — the exact fault shape
+    /// the lifecycle must survive (spec §5: a plain failed PUT without a
+    /// side effect proves nothing). Independent kill switches for delete
+    /// and head drive the other two verdict legs.
+    struct CandidateFaultObjects {
+        inner: MemObjectStore,
+        uncertain_put: std::sync::atomic::AtomicBool,
+        fail_delete: std::sync::atomic::AtomicBool,
+        /// HEAD fails (uncertain) for exactly THIS key, once — a blunt
+        /// one-shot flag cannot target one key inside a multi-key sweep.
+        fail_head_key: std::sync::Mutex<Option<String>>,
+    }
+
+    impl CandidateFaultObjects {
+        fn new() -> Self {
+            Self {
+                inner: MemObjectStore::new(),
+                uncertain_put: std::sync::atomic::AtomicBool::new(false),
+                fail_delete: std::sync::atomic::AtomicBool::new(false),
+                fail_head_key: std::sync::Mutex::new(None),
+            }
+        }
+        fn arm_uncertain_put(&self) {
+            self.uncertain_put
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn arm_fail_delete(&self) {
+            self.fail_delete
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn arm_fail_head_for(&self, key: &str) {
+            *self.fail_head_key.lock().unwrap() = Some(key.to_string());
+        }
+        fn has(&self, key: &str) -> bool {
+            self.inner.head(key).is_ok()
+        }
+    }
+
+    impl ObjectStore for CandidateFaultObjects {
+        fn put(&self, key: &str, data: &[u8]) -> Result<ObjectInfo> {
+            if self
+                .uncertain_put
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.inner.put(key, data)?;
+                return Err(Error::Storage("injected: put failed after write".into()));
+            }
+            self.inner.put(key, data)
+        }
+        fn put_stream(
+            &self,
+            key: &str,
+            reader: &mut dyn std::io::Read,
+            len: u64,
+        ) -> Result<ObjectInfo> {
+            if self
+                .uncertain_put
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                let mut buf = vec![0u8; len as usize];
+                reader
+                    .read_exact(&mut buf)
+                    .map_err(|e| Error::Io(e.to_string()))?;
+                self.inner.put(key, &buf)?;
+                return Err(Error::Storage(
+                    "injected: put_stream failed after write".into(),
+                ));
+            }
+            self.inner.put_stream(key, reader, len)
+        }
+        fn get(&self, key: &str, range: Option<Range>) -> Result<ObjectData> {
+            self.inner.get(key, range)
+        }
+        fn get_stream(
+            &self,
+            key: &str,
+            range: Option<Range>,
+        ) -> Result<(Box<dyn std::io::Read + Send>, u64)> {
+            self.inner.get_stream(key, range)
+        }
+        fn head(&self, key: &str) -> Result<ObjectInfo> {
+            let mut guard = self.fail_head_key.lock().unwrap();
+            if guard.as_deref() == Some(key) {
+                guard.take();
+                return Err(Error::Storage("injected: head unavailable".into()));
+            }
+            drop(guard);
+            self.inner.head(key)
+        }
+        fn delete(&self, key: &str) -> Result<()> {
+            if self
+                .fail_delete
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(Error::Storage("injected: delete uncertain (5xx)".into()));
+            }
+            self.inner.delete(key)
+        }
+        fn list(&self, prefix: &str, token: Option<&str>, max: usize) -> Result<ListPage> {
+            self.inner.list(prefix, token, max)
+        }
+        fn ping(&self) -> Result<()> {
+            self.inner.ping()
+        }
+    }
+
+    fn candidate_core(tag: &str) -> (Core, std::sync::Arc<CandidateFaultObjects>) {
+        let objs = std::sync::Arc::new(CandidateFaultObjects::new());
+        let c = Core::new(
+            Arc::new(crate::metadata::sqlite::SqliteMetadataStore::open_in_memory().unwrap()),
+            objs.clone(),
+        );
+        let _ = tag;
+        (c, objs)
+    }
+
+    fn candidate_rows(c: &Core) -> Vec<String> {
+        let mut v: Vec<String> = c
+            .metadata()
+            .version_candidate_rows()
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn intents(c: &Core) -> Vec<(String, String, String)> {
+        let mut v = c.metadata().gc_deletion_rows().unwrap();
+        v.sort();
+        v
+    }
+
+    fn write_failing_stream(c: &Core, path: &str, body: &[u8]) -> crate::error::Result<Node> {
+        c.write_stream(
+            path,
+            None,
+            false,
+            &mut std::io::Cursor::new(body.to_vec()),
+            body.len() as u64,
+        )
+    }
+
+    /// Scenario 1: PUT fails UNCERTAINLY (bytes already on the remote) and
+    /// the failure-arm delete CONFIRMS — the candidate is consumed, nothing
+    /// is left tracked, no intent exists.
+    #[test]
+    fn s416_c1_uncertain_put_confirmed_delete_leaves_nothing() {
+        let (c, objs) = candidate_core("c1");
+        c.create("/f", 0o644).unwrap();
+        objs.arm_uncertain_put();
+        assert!(write_failing_stream(&c, "/f", b"v1").is_err());
+        // the remote side effect is real: the object exists under the key
+        // the write generated; the confirmed delete removed it.
+        assert!(intents(&c).is_empty(), "no deletion intent may exist");
+        assert!(
+            candidate_rows(&c).is_empty(),
+            "confirmed cleanup must consume the candidate"
+        );
+    }
+
+    /// Scenario 2: PUT fails uncertainly AND the cleanup delete fails
+    /// uncertainly (5xx) — the candidate row is KEPT, then one resolution
+    /// sweep turns it into exactly one durable intent, which the gc
+    /// executor drains (the object is really deleted).
+    #[test]
+    fn s416_c2_uncertain_put_uncertain_delete_keeps_candidate() {
+        let (c, objs) = candidate_core("c2");
+        c.create("/f", 0o644).unwrap();
+        objs.arm_uncertain_put();
+        objs.arm_fail_delete();
+        assert!(write_failing_stream(&c, "/f", b"v1").is_err());
+        let cands = candidate_rows(&c);
+        assert_eq!(cands.len(), 1, "uncertain delete must keep the candidate");
+        let key = cands[0].clone();
+        assert!(objs.has(&key), "the uploaded object must still exist");
+        // resolve: HEAD ok, no live reference → exactly one intent
+        let sweep = resolve_version_candidates(c.metadata(), c.objects()).unwrap();
+        assert_eq!(sweep.intent_ensured, 1);
+        assert_eq!(candidate_rows(&c), Vec::<String>::new());
+        let rows = intents(&c);
+        assert_eq!(rows, vec![(key.clone(), "object".into(), "pending".into())]);
+        // the gc pipeline drains it; the candidate path never deletes
+        // remotely itself
+        let (done, failed, skipped) = c.gc_execute_deletions(10, &Default::default()).unwrap();
+        assert_eq!((done, failed, skipped), (1, 0, 0));
+        assert!(!objs.has(&key), "gc must have deleted the orphan object");
+        assert!(intents(&c).iter().all(|(_, _, s)| s == "done"));
+    }
+
+    /// Scenario 3: PUT + CAS success — the CAS consumes the candidate in
+    /// the SAME transaction: no candidate row, no intent, key live.
+    #[test]
+    fn s416_c3_cas_success_consumes_candidate_atomically() {
+        let (c, _objs) = candidate_core("c3");
+        c.create("/f", 0o644).unwrap();
+        let n = write_failing_stream(&c, "/f", b"v1").unwrap();
+        let key = n.object_key.clone().unwrap();
+        assert_eq!(candidate_rows(&c), Vec::<String>::new());
+        assert!(intents(&c).is_empty());
+        assert_eq!(n.version, 1);
+        assert!(c.read("/f", 0, 16).unwrap() == b"v1");
+        // the key must never appear as a deletion task while live
+        assert!(intents(&c).iter().all(|(k, _, _)| *k != key));
+    }
+
+    /// Scenario 4: CAS Conflict (a stale writer races a committed winner)
+    /// and the loser's cleanup delete fails uncertainly — the loser's
+    /// candidate is kept, the sweep enrolls ONLY the loser's key, the
+    /// winner's live key is never a deletion task, and the winner's
+    /// content is intact.
+    #[test]
+    fn s416_c4_conflict_uncertain_delete_enrolls_only_loser() {
+        let (c, objs) = candidate_core("c4");
+        c.create("/f", 0o644).unwrap();
+        let winner = write_failing_stream(&c, "/f", b"winner").unwrap();
+        let winner_key = winner.object_key.clone().unwrap();
+        // stale writer: its PUT succeeds, the CAS then loses (expected 0
+        // vs the winner's version 1); its cleanup delete is uncertain.
+        objs.arm_fail_delete();
+        let err = c
+            .write_stream(
+                "/f",
+                Some(0),
+                false,
+                &mut std::io::Cursor::new(b"loser".to_vec()),
+                5,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::Conflict { .. }));
+        let cands = candidate_rows(&c);
+        assert_eq!(cands.len(), 1);
+        assert_ne!(cands[0], winner_key);
+        let sweep = resolve_version_candidates(c.metadata(), c.objects()).unwrap();
+        assert_eq!(sweep.intent_ensured, 1);
+        let rows = intents(&c);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, cands[0], "only the loser key may be enrolled");
+        assert_ne!(rows[0].0, winner_key, "a live key must never be a task");
+        assert_eq!(c.read("/f", 0, 16).unwrap(), b"winner");
+    }
+
+    /// Scenario 6: repeated failing attempts each leave their own row
+    /// (one per key, never overwritten), a confirmed cleanup drops its
+    /// row, and the eventual success is consumed by the CAS. One sweep
+    /// resolves the leftover to exactly one intent; the live key stays out
+    /// of the deletion queue.
+    #[test]
+    fn s416_c6_multiple_failed_keys_then_success() {
+        let (c, objs) = candidate_core("c6");
+        c.create("/f", 0o644).unwrap();
+        // attempt 1: uncertain put + uncertain delete → row kept
+        objs.arm_uncertain_put();
+        objs.arm_fail_delete();
+        assert!(write_failing_stream(&c, "/f", b"a1").is_err());
+        // attempt 2: uncertain put + confirmed delete → row consumed
+        objs.arm_uncertain_put();
+        assert!(write_failing_stream(&c, "/f", b"a2").is_err());
+        // attempt 3: success → CAS consumed the row
+        let n = write_failing_stream(&c, "/f", b"a3").unwrap();
+        let live_key = n.object_key.clone().unwrap();
+        let cands = candidate_rows(&c);
+        assert_eq!(cands.len(), 1, "only the uncertain-delete attempt stays");
+        let stale_key = cands[0].clone();
+        assert_ne!(stale_key, live_key);
+        let sweep = resolve_version_candidates(c.metadata(), c.objects()).unwrap();
+        assert_eq!(sweep.intent_ensured, 1);
+        assert!(intents(&c).iter().all(|(k, _, _)| *k != live_key));
+        c.gc_execute_deletions(10, &Default::default()).unwrap();
+        assert!(!objs.has(&stale_key));
+        assert_eq!(c.read("/f", 0, 16).unwrap(), b"a3");
+    }
+
+    /// Scenario 8 + 9 (HEAD tri-state): one sweep classifies by evidence
+    /// only — object present + unreferenced → intent; object confirmed
+    /// absent → row dropped; HEAD unavailable → row KEPT (never guessed).
+    /// Scenario 8's window (delete confirmed, row-drop crashed) converges
+    /// through the same absent branch.
+    #[test]
+    fn s416_c9_head_tri_state_verdicts() {
+        let (c, objs) = candidate_core("c9");
+        let now = 1_000i64;
+        // present + unreferenced
+        c.metadata()
+            .register_version_candidate("objects/9/a-w-1.data", now)
+            .unwrap();
+        c.objects().put("objects/9/a-w-1.data", b"x").unwrap();
+        // confirmed absent (e.g. cleanup crashed after the remote delete)
+        c.metadata()
+            .register_version_candidate("objects/9/b-w-2.data", now)
+            .unwrap();
+        // undecidable
+        c.metadata()
+            .register_version_candidate("objects/9/c-w-3.data", now)
+            .unwrap();
+        objs.arm_fail_head_for("objects/9/c-w-3.data");
+        let sweep = resolve_version_candidates(c.metadata(), c.objects()).unwrap();
+        assert_eq!(sweep.intent_ensured, 1);
+        assert_eq!(sweep.dropped_absent, 1);
+        assert_eq!(sweep.head_unavailable, 1);
+        assert_eq!(candidate_rows(&c), vec!["objects/9/c-w-3.data".to_string()]);
+        assert_eq!(
+            intents(&c),
+            vec![(
+                "objects/9/a-w-1.data".into(),
+                "object".into(),
+                "pending".into()
+            )]
+        );
+        // a later pass resolves the kept row — the uncertain PUT's bytes
+        // turn out to exist once HEAD recovers → intent, never a guess
+        c.objects().put("objects/9/c-w-3.data", b"x").unwrap();
+        let sweep = resolve_version_candidates(c.metadata(), c.objects()).unwrap();
+        assert_eq!(sweep.intent_ensured, 1);
+        assert_eq!(candidate_rows(&c), Vec::<String>::new());
+    }
+
+    /// Scenario 8 (cleanup crash) through the shared helper itself: a
+    /// confirmed delete drops the row, an uncertain delete keeps it.
+    #[test]
+    fn s416_c8_helper_drops_only_on_confirmed_delete() {
+        let (c, objs) = candidate_core("c8");
+        // confirmed delete → row dropped
+        c.metadata()
+            .register_version_candidate("objects/8/a-w-1.data", 1)
+            .unwrap();
+        c.objects().put("objects/8/a-w-1.data", b"x").unwrap();
+        cleanup_version_candidate_after_failed_put(
+            c.metadata().as_ref(),
+            c.objects().as_ref(),
+            "objects/8/a-w-1.data",
+        );
+        assert_eq!(candidate_rows(&c), Vec::<String>::new());
+        // uncertain delete → row kept (the sweep settles it later)
+        c.metadata()
+            .register_version_candidate("objects/8/b-w-2.data", 1)
+            .unwrap();
+        c.objects().put("objects/8/b-w-2.data", b"x").unwrap();
+        objs.arm_fail_delete();
+        cleanup_version_candidate_after_failed_put(
+            c.metadata().as_ref(),
+            c.objects().as_ref(),
+            "objects/8/b-w-2.data",
+        );
+        assert_eq!(candidate_rows(&c), vec!["objects/8/b-w-2.data".to_string()]);
+        assert!(objs.has("objects/8/b-w-2.data"));
+    }
+
+    /// retire_version_candidate_to_gc decides INSIDE one transaction: a
+    /// candidate row for a key that is ALREADY live is retired as
+    /// LiveOwned — dropped, never enqueued, whatever the row's origin.
+    /// (A key made live by a CAS never even reaches the sweep: the CAS
+    /// consumed the row in its own transaction, so the sweep verdict is
+    /// NotTracked — the structural form of the same guarantee, covered by
+    /// the CAS-success scenarios.)
+    #[test]
+    fn s416_c14_retire_live_reference_never_enqueues() {
+        let meta = crate::metadata::sqlite::SqliteMetadataStore::open_in_memory().unwrap();
+        let key = "objects/77/w-1.data";
+        let node = meta
+            .create_node(1, "f", crate::metadata::NodeKind::File, 0o644, None)
+            .unwrap();
+        meta.commit_content_cas(node.id, 0, 3, 5, key, "etag")
+            .unwrap();
+        // a row for a now-live key (unknown/legacy origin)
+        meta.register_version_candidate(key, 1).unwrap();
+        assert_eq!(
+            meta.retire_version_candidate_to_gc(key, 10).unwrap(),
+            CandidateRetire::LiveOwned
+        );
+        assert!(meta.version_candidate_rows().unwrap().is_empty());
+        assert!(meta.gc_deletion_rows().unwrap().is_empty());
+    }
+
+    /// SQLite FILE database: the CAS/candidate consumption is durable —
+    /// close and REOPEN the store and the consumed state persists (the
+    /// atomic boundary lives in the committed transaction, not in memory).
+    #[test]
+    fn s416_c11_file_db_candidate_consumption_is_durable() {
+        let dir = std::env::temp_dir().join(format!(
+            "lightfs-s416-c11-{}-{}",
+            std::process::id(),
+            tmp_unique()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("meta.db");
+        let key = "objects/11/w-1.data";
+        {
+            let meta =
+                crate::metadata::sqlite::SqliteMetadataStore::open(db.to_string_lossy().as_ref())
+                    .unwrap();
+            meta.register_version_candidate(key, 1).unwrap();
+            assert_eq!(meta.version_candidate_rows().unwrap().len(), 1);
+            let node = meta
+                .create_node(1, "f", crate::metadata::NodeKind::File, 0o644, None)
+                .unwrap();
+            // a CAS committing THIS key consumes the candidate in its own
+            // transaction; reopening below proves it committed.
+            meta.commit_content_cas(node.id, 0, 3, 5, key, "etag")
+                .unwrap();
+        }
+        {
+            let meta =
+                crate::metadata::sqlite::SqliteMetadataStore::open(db.to_string_lossy().as_ref())
+                    .unwrap();
+            assert!(meta.version_candidate_rows().unwrap().is_empty());
+            assert!(meta.gc_deletion_rows().unwrap().is_empty());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NotTracked: retiring an unknown key is a no-op (the mem-store
+    /// default and a wiped row converge to the same verdict).
+    #[test]
+    fn s416_c13_retire_not_tracked_is_noop() {
+        let meta = crate::metadata::sqlite::SqliteMetadataStore::open_in_memory().unwrap();
+        assert_eq!(
+            meta.retire_version_candidate_to_gc("objects/1/none.data", 1)
+                .unwrap(),
+            CandidateRetire::NotTracked
+        );
+        assert!(meta.gc_deletion_rows().unwrap().is_empty());
+    }
+
+    // ---- S4.16 real subprocess crash test ---------------------------------
+
+    /// Directory-backed ObjectStore shared ACROSS processes: the harness
+    /// for the crash test (a MemObjectStore lives only inside one process).
+    /// `crash_after_put` turns put_stream into: bytes durably on the
+    /// "remote", then the process EXITS — the real crash shape.
+    struct TestFileStore {
+        root: std::path::PathBuf,
+    }
+
+    impl TestFileStore {
+        fn new(root: &std::path::Path) -> Self {
+            Self {
+                root: root.to_path_buf(),
+            }
+        }
+        fn path(&self, key: &str) -> std::path::PathBuf {
+            self.root.join(key)
+        }
+        fn exists(&self, key: &str) -> bool {
+            self.path(key).is_file()
+        }
+    }
+
+    impl ObjectStore for TestFileStore {
+        fn put(&self, key: &str, data: &[u8]) -> Result<ObjectInfo> {
+            let p = self.path(key);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, data).unwrap();
+            Ok(ObjectInfo {
+                key: key.to_string(),
+                size: data.len() as u64,
+                etag: format!("fs-{}", data.len()),
+                version_id: None,
+            })
+        }
+        fn put_stream(
+            &self,
+            key: &str,
+            reader: &mut dyn std::io::Read,
+            len: u64,
+        ) -> Result<ObjectInfo> {
+            let mut buf = vec![0u8; len as usize];
+            reader
+                .read_exact(&mut buf)
+                .map_err(|e| Error::Io(e.to_string()))?;
+            self.put(key, &buf)?;
+            if std::env::var("LIGHTFS_S416_CHILD_CRASH").is_ok() {
+                // THE crash: the remote side effect is durable on disk,
+                // the process dies before the CAS is ever attempted.
+                std::process::exit(9);
+            }
+            Ok(ObjectInfo {
+                key: key.to_string(),
+                size: len,
+                etag: format!("fs-{len}"),
+                version_id: None,
+            })
+        }
+        fn get(&self, key: &str, range: Option<Range>) -> Result<ObjectData> {
+            let info = self.head(key)?;
+            let data = std::fs::read(self.path(key)).map_err(|e| Error::Io(e.to_string()))?;
+            let (offset, data) = match range {
+                None => (0u64, data),
+                Some(r) => (
+                    r.start,
+                    data[r.start as usize..(r.start + r.len) as usize].to_vec(),
+                ),
+            };
+            Ok(ObjectData { info, offset, data })
+        }
+        fn get_stream(
+            &self,
+            key: &str,
+            _range: Option<Range>,
+        ) -> Result<(Box<dyn std::io::Read + Send>, u64)> {
+            self.head(key)?;
+            let data = std::fs::read(self.path(key)).map_err(|e| Error::Io(e.to_string()))?;
+            let n = data.len() as u64;
+            Ok((Box::new(std::io::Cursor::new(data)), n))
+        }
+        fn head(&self, key: &str) -> Result<ObjectInfo> {
+            let p = self.path(key);
+            if !p.is_file() {
+                return Err(Error::ObjectMissing(key.to_string()));
+            }
+            let size = std::fs::metadata(&p).unwrap().len();
+            Ok(ObjectInfo {
+                key: key.to_string(),
+                size,
+                etag: format!("fs-{size}"),
+                version_id: None,
+            })
+        }
+        fn delete(&self, key: &str) -> Result<()> {
+            match std::fs::remove_file(self.path(key)) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(Error::Io(e.to_string())),
+            }
+        }
+        fn list(&self, prefix: &str, token: Option<&str>, max: usize) -> Result<ListPage> {
+            let mut keys: Vec<String> = Vec::new();
+            let skip = token.map(|t| t.to_string()).unwrap_or_default();
+            walk_files(&self.root, &mut keys);
+            keys.sort();
+            let mut next = None;
+            let mut items = Vec::new();
+            for k in keys {
+                if !k.starts_with(prefix) || k <= skip {
+                    continue;
+                }
+                if items.len() >= max {
+                    next = Some(k.clone());
+                    break;
+                }
+                let size = std::fs::metadata(self.path(&k))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                items.push(ObjectInfo {
+                    key: k,
+                    size,
+                    etag: format!("fs-{size}"),
+                    version_id: None,
+                });
+            }
+            Ok(ListPage {
+                items,
+                next_token: next,
+            })
+        }
+        fn ping(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn walk_files(dir: &std::path::Path, out: &mut Vec<String>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk_files(&p, out);
+            } else if let Ok(k) = p.strip_prefix(dir) {
+                out.push(k.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+
+    /// The CHILD half of the crash test: write one file through the
+    /// production streaming path; TestFileStore stores the object durably
+    /// and the process exits before the CAS. The candidate row was
+    /// committed BEFORE the PUT — it must be in the database when the
+    /// parent looks.
+    #[test]
+    fn s416_crash_child_helper() {
+        // Runs as a no-op inside the normal suite; the crash parent spawns
+        // the test binary with the env set (the engine.rs child-helper
+        // pattern) and the injected crash exits below.
+        if std::env::var("LIGHTFS_S416_CHILD_CRASH").is_err() {
+            return;
+        }
+        let db = std::env::var("LIGHTFS_S416_CHILD_DB").unwrap();
+        let objdir = std::env::var("LIGHTFS_S416_CHILD_OBJDIR").unwrap();
+        let meta = crate::metadata::sqlite::SqliteMetadataStore::open(&db).unwrap();
+        let objs = TestFileStore::new(std::path::Path::new(&objdir));
+        let c = Core::new(Arc::new(meta), Arc::new(objs));
+        c.create("/f", 0o644).unwrap();
+        let _ = write_failing_stream(&c, "/f", b"crash-between-put-and-cas");
+        panic!("child must have exited inside put_stream before this line");
+    }
+
+    /// Scenario 7 (crash window): a REAL subprocess performs the remote
+    /// PUT and dies before the CAS. After the crash the candidate row is
+    /// in the database, the object is on the remote; the shared sweep
+    /// (the engine-startup entry) turns the candidate into one durable
+    /// intent, and the gc executor deletes the object. No bytes are ever
+    /// untracked.
+    #[test]
+    fn s416_c12_subprocess_crash_keeps_candidate_trackable() {
+        let dir = std::env::temp_dir().join(format!(
+            "lightfs-s416-c12-{}-{}",
+            std::process::id(),
+            tmp_unique()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("meta.db");
+        let objdir = dir.join("objects-root");
+        std::fs::create_dir_all(&objdir).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(&exe)
+            .args(["s416_crash_child_helper", "--nocapture", "--test-threads=1"])
+            .env("LIGHTFS_S416_CHILD_DB", &db)
+            .env("LIGHTFS_S416_CHILD_OBJDIR", &objdir)
+            .env("LIGHTFS_S416_CHILD_CRASH", "1")
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(9),
+            "child must die at the injected crash point; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // post-crash state: object on the remote, candidate durable, no CAS
+        let meta =
+            crate::metadata::sqlite::SqliteMetadataStore::open(db.to_string_lossy().as_ref())
+                .unwrap();
+        let objs = TestFileStore::new(&objdir);
+        let cands = meta.version_candidate_rows().unwrap();
+        assert_eq!(cands.len(), 1, "the candidate must have survived the crash");
+        let key = cands[0].0.clone();
+        assert!(
+            objs.exists(&key),
+            "the uploaded object must be on the remote"
+        );
+        assert!(
+            meta.gc_deletion_rows().unwrap().is_empty(),
+            "no intent may pre-exist the resolution"
+        );
+        // engine-startup sweep (build_core runs exactly this): intent
+        let meta: Arc<dyn MetadataStore> = Arc::new(meta);
+        let objs: Arc<dyn ObjectStore> = Arc::new(objs);
+        let sweep = resolve_version_candidates(&meta, &objs).unwrap();
+        assert_eq!(sweep.intent_ensured, 1);
+        // reopen the metadata to prove the intent is DURABLE
+        let meta =
+            crate::metadata::sqlite::SqliteMetadataStore::open(db.to_string_lossy().as_ref())
+                .unwrap();
+        assert!(meta.version_candidate_rows().unwrap().is_empty());
+        let rows = meta.gc_deletion_rows().unwrap();
+        assert_eq!(rows, vec![(key.clone(), "object".into(), "pending".into())]);
+        // the gc executor drains the intent through the object store
+        let c = Core::new(Arc::new(meta), Arc::new(TestFileStore::new(&objdir)));
+        let (done, failed, skipped) = c.gc_execute_deletions(10, &Default::default()).unwrap();
+        assert_eq!((done, failed, skipped), (1, 0, 0));
+        assert!(!TestFileStore::new(&objdir).exists(&key));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

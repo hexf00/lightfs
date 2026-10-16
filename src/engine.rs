@@ -147,7 +147,13 @@ fn build_core(
     } else {
         None
     };
-    let core = Core::with_options(meta, objects, cfg.retention.superseded_secs, pack, wb)?;
+    let core = Core::with_options(
+        meta.clone(),
+        objects.clone(),
+        cfg.retention.superseded_secs,
+        pack,
+        wb,
+    )?;
     if core.wb().is_some() {
         core.wb().unwrap().recover()?;
         let workers = resolve_wb_workers(
@@ -177,6 +183,29 @@ fn build_core(
                 sweep.head_unavailable
             );
         }
+    }
+    // S4.16: resolve per-file version candidates on EVERY engine startup —
+    // server (strict and write-back) and offline maintenance share this one
+    // sweep (spec §4: one recovery entry, no Strict/WB duplicated loops).
+    // Verdicts come from HEAD evidence only: intent-ensured keys are drained
+    // by the existing gc executor, live-owned keys are forgotten, confirmed
+    // absent keys are dropped, undecided keys stay tracked for the next
+    // pass. No new background worker.
+    let cand = crate::core::resolve_version_candidates(&meta, &(objects.clone()))?;
+    if cand.intent_ensured > 0
+        || cand.live_owned > 0
+        || cand.dropped_absent > 0
+        || cand.head_unavailable > 0
+        || cand.retire_failed > 0
+    {
+        eprintln!(
+            "lightfs: startup version-candidate sweep: {} intents ensured, {} live-owned dropped, {} confirmed absent, {} head unavailable (kept), {} retire failed (kept)",
+            cand.intent_ensured,
+            cand.live_owned,
+            cand.dropped_absent,
+            cand.head_unavailable,
+            cand.retire_failed
+        );
     }
     Ok(core)
 }
