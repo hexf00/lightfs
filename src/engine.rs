@@ -327,4 +327,135 @@ mod tests {
                 .is_none()
         );
     }
+
+    /// S4.13 (model gap A): a live engine lock skips ONLY the stale-pack
+    /// sweep. The deletion-intent drain still runs with its real semantics,
+    /// the engine's in-flight stale building row is NOT touched while the
+    /// lock is held, and a sweep after the lock is released converges it.
+    /// Every assertion reads SQLite row state, object-store state or the
+    /// durable intent queue — never a log line.
+    #[test]
+    fn s413_gc_lock_skip_keeps_stale_row_and_still_drains_intents() {
+        let mut cfg = Config::default();
+        cfg.metadata.path = std::env::temp_dir()
+            .join(format!(
+                "lightfs-s413-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+            .to_string_lossy()
+            .to_string();
+        std::fs::write(&cfg.metadata.path, b"").unwrap();
+        let mem = std::sync::Arc::new(crate::object_store::mem::MemObjectStore::new());
+        // retention off: candidates qualify as soon as they exist, so the
+        // pre-existing intent below drains deterministically in one run.
+        let core = std::sync::Arc::new(crate::core::Core::with_retention(
+            std::sync::Arc::new(
+                crate::metadata::sqlite::SqliteMetadataStore::open_in_memory().unwrap(),
+            ),
+            mem.clone(),
+            0,
+        ));
+        let now = 10_000i64;
+
+        // A stale building pack left by the "live engine" (row + object up):
+        // exactly what the sweep must NOT adjudicate behind the owner's back.
+        let stale = "packs/s413-stale.pack";
+        core.metadata().register_pack(stale, 5).unwrap();
+        mem.put(stale, b"stale").unwrap();
+
+        // A reclaimable pack that is already unreferenced: its durable
+        // deletion intent is exactly the work the drain must keep doing
+        // even while the sweep is skipped.
+        let reclaimable = "packs/s413-reclaim.pack";
+        core.metadata().register_pack(reclaimable, 7).unwrap();
+        core.metadata().mark_pack_uploaded(reclaimable, 1).unwrap();
+        core.metadata()
+            .wb_finalize_batch_if_terminal(reclaimable, 1)
+            .unwrap();
+        mem.put(reclaimable, b"dead").unwrap();
+
+        // Backup root exists but holds no manifest: the protection set is
+        // empty and gc_run may run (fail-closed gate satisfied).
+        let backup_root =
+            std::env::temp_dir().join(format!("lightfs-s413-root-{}", std::process::id()));
+        std::fs::create_dir_all(&backup_root).unwrap();
+
+        // A live engine holds the lock for the whole first phase.
+        let live = crate::fslock::FileLock::try_acquire(&engine_lock_path(&cfg).unwrap()).unwrap();
+
+        // 1) sweep skipped under the live lock ...
+        let sweep = super::super::cmd::gc_stale_pack_phase(&core, &cfg).unwrap();
+        assert!(sweep.is_none(), "gc must skip the stale-pack sweep");
+        assert_eq!(
+            core.metadata().pack_state(stale).unwrap().map(|(s, _)| s),
+            Some("building".into()),
+            "the stale building row survives the skipped sweep untouched"
+        );
+        assert!(mem.head(stale).is_ok(), "its object is not touched either");
+
+        // 2) ... but the deletion-intent drain still runs to real semantics.
+        let summary =
+            crate::cmd::gc_run(&core, Some(backup_root.to_str().unwrap()), 5, 0, now).unwrap();
+        assert_eq!(
+            (summary.enrolled.0, summary.done),
+            (1, 1),
+            "the reclaimable pack is enrolled and executed while the sweep is skipped"
+        );
+        assert!(
+            mem.head(reclaimable).is_err(),
+            "the drain really deleted the reclaimable object"
+        );
+        assert!(
+            core.metadata().pack_state(reclaimable).unwrap().is_none(),
+            "its row went with the completed intent"
+        );
+        assert!(
+            core.metadata()
+                .gc_claim_deletions(10, now)
+                .unwrap()
+                .is_empty(),
+            "no durable intent is left queued after the drain"
+        );
+        assert_eq!(
+            core.metadata().pack_state(stale).unwrap().map(|(s, _)| s),
+            Some("building".into()),
+            "the skipped sweep left the stale row exactly as it was"
+        );
+
+        // 3) the engine dies, the lock is released: the NEXT sweep pass
+        //    adjudicates the stale row (HEAD 200 -> deleting + intent).
+        drop(live);
+        let sweep = super::super::cmd::gc_stale_pack_phase(&core, &cfg)
+            .unwrap()
+            .expect("the sweep runs once the lock is free");
+        assert_eq!(sweep.enrolled_stale, 1, "the stale upload is enrolled");
+        assert_eq!(
+            core.metadata().pack_state(stale).unwrap().map(|(s, _)| s),
+            Some("deleting".into()),
+            "building -> deleting under a durable pending intent"
+        );
+
+        // 4) and the next gc run converges it all the way.
+        let summary =
+            crate::cmd::gc_run(&core, Some(backup_root.to_str().unwrap()), 5, 0, now).unwrap();
+        assert_eq!(summary.done, 1, "the enrolled stale pack executes");
+        assert!(mem.head(stale).is_err(), "stale object actually deleted");
+        assert!(
+            core.metadata().pack_state(stale).unwrap().is_none(),
+            "stale row dropped with its completed intent"
+        );
+        assert!(
+            core.metadata()
+                .gc_claim_deletions(10, now)
+                .unwrap()
+                .is_empty(),
+            "the queue is fully drained"
+        );
+        let _ = std::fs::remove_file(&cfg.metadata.path);
+        let _ = std::fs::remove_dir_all(&backup_root);
+    }
 }

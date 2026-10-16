@@ -274,6 +274,63 @@ appear in the structural-constraints table above and are NOT TLC results.
 | L2 next-invocation retry | gc executor leaves failed intents | s431 corruption-interrupt stage | no daemon retry: by design, documented |
 | L4 Mode-sensitive resolution | strict sweep finalize vs wb AllTerminal | `s410_committing_zero_refs_*`; wb bind/finalize tests | wb "live Bound member parks Committing" is by-design, untested as such — documented |
 
+### S4.13 audit: the three candidate gaps, and the layered evidence matrix
+
+Candidate gaps from the S4.13 task, audited against the code:
+
+- **A. GC losing the engine-lock race — REAL GAP, closed.** The old test
+  (`s410_gc_stale_phase_respects_engine_lock`) only asserted the
+  `Some/None` return of `gc_stale_pack_phase`. New test
+  `s413_gc_lock_skip_keeps_stale_row_and_still_drains_intents` (src/engine.rs)
+  pins the full behavior with row/object/intent assertions: under a held
+  engine lock the sweep is skipped AND the stale building row (and its
+  object) survive untouched, while the deletion-intent drain still runs to
+  real semantics (enroll + execute + complete on an unrelated unreferenced
+  pack); after the lock is released the next sweep adjudicates the stale row
+  (building → deleting + pending intent) and the following gc run converges
+  it completely. Corresponds to model actions `GcStartBusy` (skip) +
+  `Draining` work + `GcStart`/`GcSweepDone` (later pass).
+- **B. Backup protection vs deletion lifecycle — NO gap.**
+  `p0b_protected_object_survives_gc_until_prune`,
+  `p0b_gc_end_to_end_enroll_execute_and_protection_filter` and
+  `p0b_expired_backup_releases_protection_but_still_fails_closed_when_corrupt`
+  already assert row/object state: a protected key is never enrolled nor
+  executed, and after prune/expiry the durable state converges via gc.
+  Reality check on the model: the protection set is a SNAPSHOT taken once
+  per `gc_run` under the backup `MaintenanceLock`, which also serializes
+  backup publish/prune — so "protection changes between delete and
+  complete" is NOT reachable in the real system. The model's per-action
+  `prot = "Unprotected"` premises therefore OVER-approximate the possible
+  interleavings (conservative direction: the model checks a larger world
+  than reality and the invariants still hold). The model is kept as-is;
+  this paragraph is the declared mapping note.
+- **C. WB Bound member waits for client close — NO gap.**
+  `p0a_committing_zero_refs_survives_until_batch_members_terminal`
+  (sqlite.rs) already pins: with a member still queued (non-terminal), a
+  committing pack stays committing even at zero references and across an
+  unlink; once the member reaches a terminal state the batch resolves
+  (unreferenced, retention starts). Path C/D rename-overwrite and unlink
+  tests cover the reference-event side (`pack_ref_gone_tx`), and the S4.7
+  three-outcome tests cover member success/conflict/terminal-failure.
+
+Layered evidence matrix (a pass at one layer NEVER claims another layer):
+
+| Property | TLC exhaustive (model) | Rust deterministic unit | SQLite file/integration | Real MinIO | Real child-process crash | Power loss / physical durability |
+|---|---|---|---|---|---|---|
+| I1 refs safe | ✔ (350/3682 states) | p0a path C/D; `s410_partial_cas_*` | — | `concurrent_commit_race_minio` | — | not verified |
+| I2 building unreferencable | ✔ | `pack_ref_new_tx` refusal tests | schema contract tests | — | — | not verified |
+| I3 object tracked | ✔ | `s410_uncertain_put_*`, `s411_uncertain_delete_*` | s431-gc-e2e.sh stages | symlinks+fsck+reopen | — | not verified |
+| I4 intent coupling | ✔ | p0a crash matrix (p0a22) | — | — | — | not verified |
+| I5 unknown ≠ missing | ✔ | `s410/s411_head_unavailable_*`, delete_outcome | — | contract suite (etag/404 semantics) | — | not verified |
+| I8 backup guard | ✔ (over-approximated interleavings, see B) | p0b protection tests | s431-gc-e2e.sh protection stages | — | — | not verified |
+| ProcessLockInv (model part) | ✔ | — | — | — | — | — |
+| I7b kernel-lock semantics | model assumption | fslock unit tests | 4b.2 alias tests | — | S4.3.4b child SIGKILL test | not verified |
+| I9 SQLite tx atomicity | model assumption + obligation | single-transaction code paths | REQUIRED_TABLE_COLUMNS contract; reopen tests | minio_integration reopen | — | `synchronous=FULL` configured (S4.4); physical durability NOT verified |
+| I6 recovery idempotence | construction constraint | repeated-recover s410/s411 | s431 e2e re-run stages | minio reopen | — | not verified |
+| L1 next-pass convergence | ✔ under FairSpec | `s413_gc_lock_skip_*` (new), "next pass converges" tests | s431 e2e | — | — | not verified |
+| L2 next-invocation retry | ✔ under FairSpec | gc retry/failed-keep tests | s431 corruption-interrupt stage | — | — | not verified |
+| L4 Mode-sensitive resolve | ✔ under FairSpec | p0a committing-survival; `s410_committing_zero_refs_*` | — | — | — | not verified |
+
 **Out of scope / uncovered** (stated, not hidden): power loss; SQLite
 `synchronous=FULL` mechanics; real kernel-lock semantics (fslock-test
 territory); multi-pack interactions; members/refs > 2; MinIO object-store
