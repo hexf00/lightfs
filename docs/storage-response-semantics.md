@@ -71,14 +71,17 @@ operation context, not the variant, decides.
 
 Bridge to the shorthand used in earlier rounds and in some table rows:
 **CONFIRMED** meant axis 1 decided (present or absent); **UNCERTAIN**
-meant axis 1 unresolved; **FAILED** meant a definite negative about the
-operation's EFFECT — never about the object's presence. The canonical
-example of that last point: a 403 on a DELETE definitively did not delete
-(effect negative → intent retained, 2d/6b), while a 403 on a PUT is
-axis-2 `upload-permanent` AND axis-1 unresolved — the object may still
-have been stored (multipart parts). Wherever those three words appear
-below they mean the axis judgments above, never a raw status-code
-mapping.
+meant axis 1 unresolved; **FAILED** meant a definite REFUSAL — the
+request provably did not take effect. Three facts this vocabulary must
+never conflate: "the request was refused" (403 on a DELETE: not executed,
+so the deletion did not happen — and the refusal still does not prove the
+object exists), "the object currently does not exist" (404-missing-key on
+a DELETE: idempotent success), and "the request's outcome is unresolved"
+(a 5xx or transport failure on that same DELETE: the server may have
+deleted before failing — 2e/6b). Likewise a 403 on a PUT is axis-2
+`upload-permanent` AND axis-1 unresolved — the object may still have been
+stored (multipart parts). Wherever those three words appear below they
+mean these axis judgments, never a raw status-code mapping.
 
 ## 2. L0 baseline: response → `Error` (read this before the table)
 
@@ -134,7 +137,8 @@ caller, keyed by operation — never at the status code alone.
 | 2a | `ObjectStore::delete` on an existing key | 204 (or any 2xx) | confirmed deleted | (caller-side transitions: rows 6, 4b) | — | `s3.rs:1007 delete` | `contract.rs delete_and_listing` (mem + MinIO) | 2xx must mean gone-for-later-GETs |
 | 2b | `delete` on a key that never existed | 404 / body `NoSuchKey` | idempotent success — a missing key IS a deleted key | same as 2a | no retry needed; a retried delete cannot resurrect anything | `delete_outcome` `s3.rs:324` | `s3.rs p0a22_delete_outcome_missing_key_is_idempotent_success` | 404-with-missing-key must be Ok, never an error |
 | 2c | `delete` with the bucket missing | body `NoSuchBucket` | namespace failure — fail-closed, NOT "already gone" | caller keeps the deletion intent (row 6f) | retained and retried by the next gc pass | `delete_outcome` checks the body BEFORE `map_status` | `s3.rs p0a22_delete_outcome_bucket_permission_and_server_errors_stay_errors` | MUST re-check the XML error code; a bare 404 must NOT be treated as bucket-missing |
-| 2d | `delete` — permissions / 5xx / transport | 403 etc. → `Storage` | FAILED about the EFFECT: the deletion definitively did NOT happen; the object's presence is not the question (a transport error would leave even the deletion unresolved) | intent retained | next gc pass retries; transport 503s retried by `with_retry` | `s3.rs:1007` | `contract.rs delete_and_listing` | non-absence failures must ERROR |
+| 2d | `delete` — definite REFUSALS (403, 400; NoSuchBucket as a namespace refusal) | 403 etc. → `Storage` | the request provably did NOT take effect: the deletion did not happen. The object's presence is UNCHANGED and remains unresolved — a refusal never proves the object exists | intent retained | next gc pass retries; the refusal is definite, so the retry re-issues the same idempotent delete | `s3.rs:1007` | `contract.rs delete_and_listing`, `s3.rs p0a22_delete_outcome_bucket_permission_and_server_errors_stay_errors` | refusals must ERROR, never fold into "already gone" |
+| 2e | `delete` — 5xx / transport / timeout | `Error::Storage("s3 transport: …")` or `s3 5xx …` | OUTCOME UNRESOLVED: the server may have deleted before failing, or not deleted at all — the answer exists only server-side | intent retained | next gc pass re-issues the idempotent delete, which converges either way (already-deleted → 2a/2b); transport 503s retried by `with_retry` | `s3.rs:1007` | `contract.rs delete_and_listing` | unresolved outcomes must ERROR and must never be read as success OR as definite non-deletion |
 | 3 | Strict pack seal: PUT fails after `register_pack` (`pack.rs seal`, error arm) | any PUT error — transport, 5xx, even 403: per the trait contract the remote state is UNSPECIFIED after ANY Err (axis 1 = unresolved, regardless of axis 2 classification) | unresolved presence: the object MAY exist. The row (registered BEFORE the bytes) is the pack's durable lifecycle tracker | `packs` row KEPT in `building` (S4.10). fsck would still SEE a rowless `packs/` object (it reports "pack without row"), but a report is not an owner: the HEAD three-state sweep iterates ROWS (`all_packs()`), so without the row nothing would ever adjudicate or reclaim the object (mechanism detailed in G3) | NO inline delete; the row waits for the HEAD three-state (1a/1b/1c) at the next startup or gc pass. Members get their flush errors; per-entry CAS failures are local dead bytes and never touch the pack | `pack.rs:277-344` | `pack.rs s410_uncertain_put_keeps_tracker_row_sweep_reclaims` | `put`/`put_stream` failure semantics: after Ok, atomic overwrite + non-empty etag; after Err, remote state UNSPECIFIED (`object_store.rs:54-61`) |
 | 4a | WB `seal_batch`: PUT fails, inline delete CONFIRMED (`Ok` via `delete_outcome`) | PUT error + DELETE 2xx/404 | uncertain PUT, then confirmed cleanup | `drop_pack` — the `building` row is removed ONLY now (S4.11); members requeued or dead-lettered per row 5 | members: transient → requeue (budget 3, `wb_retry_or_dead`), else dead-letter | `wb.rs:1117-1154` | `wb.rs s411_plain_failure_confirmed_delete_drops_object_and_row` | delete confirmation uses the SAME `delete_outcome` contract (2c included: NoSuchBucket keeps the row) |
 | 4b | WB `seal_batch`: PUT fails AND inline delete fails | PUT error + DELETE `Storage` | uncertain PUT, uncertain cleanup — never widen uncertainty into absence | `building` row KEPT as the durable tracker; converges via the stale-pack sweep (1a/1b/1c) "potentially much later under a lasting outage — the accepted safety-first cost" | same passive sweep as row 3 | `wb.rs:1149-1153` | `wb.rs s411_uncertain_delete_fails_tracker_survives_then_gc_closes` | a failed cleanup must leave the tracker row intact |
@@ -146,7 +150,7 @@ caller, keyed by operation — never at the status code alone.
 | 5d | — anything unjudgeable (protocol/parse leftovers, non-`Storage` errors) | other | UNKNOWN: never masquerade as retryable | `error_class='unknown'`, `state='dead'` | dead-letter; excluded from `retry_admissible` by construction | `wb.rs:236-238` | `p0d_r17_unknown_error_never_requeues`, `p0d_r17_error_class_origin_and_admission_table` | unparseable outcomes must classify unknown, never transient |
 | 5e | per-file drain (`drain_task`) upload failure — the SAME disposition, different cleanup | any upload error | classification as 5a-5d; the version key is single-file scoped | best-effort inline delete of the version key (`let _`), then requeue/dead-letter. On a dead task whose PUT had SUCCEEDED, `wb_set_uploaded_key` makes `recover()` enroll the orphan candidate | requeue budget 3, shared wording via `log_upload_dead(Task \| BatchMember)` | `wb.rs:950-969` | `p0d_r17_*` series (per-file arms) | see gap G4: an uncertain PUT whose cleanup delete ALSO fails leaves an fsck-visible, untracked orphan — accepted for single-file keys, never for packs |
 | 6a | gc executor: claimed deletion intent, remote delete succeeds (2xx or 404-missing-key; `NotFound`/`ObjectMissing` accepted defensively) | `delete_outcome` = Ok | CONFIRMED gone (or already gone) | one tx (`gc_complete_deletion`): kind=`pack` → `DELETE FROM packs`; kind=`object` → `DELETE FROM superseded_objects`; intent → `done` | terminal | `core.rs:382-419`, `sqlite.rs:1245` | `core.rs p0a22_object_missing_from_delete_completes_the_task`, `p0a22_remote_deleted_before_finalize_converges_on_recover`, `p0a_deletion_failure_persists_then_retry_succeeds` | same idempotent-delete contract as 2a/2b |
-| 6b | gc executor: remote delete fails (NoSuchBucket, 403, transport) | `Storage` | FAILED about the EFFECT — the deletion did not happen; the intent must never be lost (a transport error leaves even that unresolved, same disposition) | `gc_fail_deletion`: intent stays, `state='failed'`, error text persisted | next gc pass re-claims (`gc_claim_deletions` re-queues `pending` AND `failed`; a crash left `deleting` re-enters as `pending` — the remote delete is idempotent) | `core.rs:411-414`, `sqlite.rs:1211` | `p0a_deletion_failure_persists_then_retry_succeeds` | failures must persist for retry, not abort the pass |
+| 6b | gc executor: remote delete fails (NoSuchBucket/403 refusal, or 5xx/transport unresolved) | `Storage` | refusal: the deletion did not happen (presence unchanged); unresolved: it may or may not have happened — either way the intent must never be lost and the disposition is identical | `gc_fail_deletion`: intent stays, `state='failed'`, error text persisted | next gc pass re-claims (`gc_claim_deletions` re-queues `pending` AND `failed`; a crash left `deleting` re-enters as `pending` — the idempotent re-delete converges both cases) | `core.rs:411-414`, `sqlite.rs:1211` | `p0a_deletion_failure_persists_then_retry_succeeds` | failures must persist for retry, not abort the pass; the two certainty classes stay distinguishable in persisted error text |
 | 6c | gc executor: key is in the protected set | (before any call) | manifest protection beats reclamation | intent left in `deleting`, `skipped_protected` counted; "a protected intent is never completed"; the next claim re-queues it | passive: protection expires via backup `prune`/expiry, then 6a proceeds | `core.rs:390-394` | `backup/tests.rs p0b_protected_object_survives_gc_until_prune`, `s431_retention_off_gc_keeps_protected_object_and_task`; end-to-end: `scripts/backup-restore-drill.sh` (asserts `skipped-protected 2` / `deleted 1`) | the protection check MUST precede the delete call |
 | 6d | gc entry: protection-set derivation | backup manifests | unexpired manifest keys are protected; live refs are guarded UPSTREAM (retire's live-reference guard, `gc_register_*`'s `NOT EXISTS (nodes …)` predicates) — the executor only arbitrates intents | verification is fail-closed: one unverifiable manifest → zero deletes (`p0b_scan_fails_closed_on_any_unverifiable_backup`), missing `[backup]` root → gc refuses entirely | `cmd.rs:54 gc_run`, `backup.rs protected_keys` | `p0b_gc_fail_closed_makes_zero_delete_calls`, `p0b_gc_end_to_end_enroll_execute_and_protection_filter`, `s431_retention_off_corrupt_manifest_fails_closed_zero_deletes` | manifest integrity (sha256 anchor) must be checked before any delete |
 
@@ -249,11 +253,15 @@ Answer key, derived from the table:
   confirmed-absent probe behind it.
 - **G4 — per-file uncertain orphan (row 5e).** A `drain_task` PUT that
   uncertainly succeeded AND whose best-effort cleanup delete also failed
-  leaves an untracked `objects/…` orphan (visible in fsck's
-  `orphan_objects`, no auto-reclamation). Accepted for single-file keys;
-  the pack path must never do this — a pack's tracker row is its only
-  lifecycle owner, and dropping it without a confirmed delete would
-  create exactly the visible-but-ownerless state G3 describes.
+  leaves an untracked `objects/…` key: nothing persistent records it (the
+  task's `uploaded_key` is written only after a successful PUT), so no
+  pass ever reclaims it. fsck still SEES it — as a stale version under
+  the live node id, or as an orphan object once the node is gone — but
+  fsck only reports. Accepted for single-file keys (full audit and the
+  minimal repair design: S4.15.2 evaluation); the pack path must never do
+  this — a pack's tracker row is its only lifecycle owner, and dropping
+  it without a confirmed delete would create exactly the
+  visible-but-ownerless state G3 describes.
 - **G5 — physical durability.** Everything above is process-crash tested
   at best. Power-loss behavior of the local SQLite file and staging
   directory is asserted by construction (fsync gates, S4.4) but never
