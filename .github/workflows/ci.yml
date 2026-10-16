@@ -14,6 +14,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # S4.17.1: repeatable candidate verification WITHOUT merging the
+  # experimental branch to main — dispatch this workflow on any ref
+  # (e.g. the release-candidate branch) to run the full Linux gate
+  # (tests + MinIO contract + perf-smoke with artifact) on that exact
+  # commit.
+  workflow_dispatch: {}
 
 jobs:
   test:
@@ -204,5 +210,60 @@ jobs:
         with:
           name: perf-smoke
           path: perf-smoke.txt
+          retention-days: 30
+
+  macos-arm64:
+    # S4.17.1 — macOS ARM64 experimental-release gate (moved into this
+    # registered workflow: GitHub only dispatches workflows that exist on
+    # the default branch, so a branch-only workflow file cannot be a
+    # dispatch target). Builds the release CLI/server/bench binaries on
+    # Apple Silicon and runs the network-free library suite. Scope stated
+    # honestly: NO macOS mount claim — LightFS has no macOS mount adapter
+    # (fuse.rs is Linux-gated; the Windows adapter is WinFsp); macOS usage
+    # is server + RPC (shell/bench).
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned)
+        run: |
+          rustup toolchain install 1.85.1 --profile minimal
+          rustup default 1.85.1
+
+      - name: Build release binaries
+        run: cargo build --release --bin lightfs --bin lightfs-shell --bin lightfs-bench
+
+      - name: Library suite (network-free)
+        run: cargo test --lib
+
+      - name: Smoke — binaries start; dead-endpoint path fails loudly
+        run: |
+          set -euo pipefail
+          ./target/release/lightfs --help > /dev/null
+          cat > /tmp/smoke.toml <<'CFG'
+          [s3]
+          endpoint = "http://127.0.0.1:1"
+          region = "us-east-1"
+          bucket = "smoke"
+          access_key = "minioadmin"
+          secret_key = "minioadmin"
+          path_style = true
+          [metadata]
+          path = "/tmp/smoke-meta.db"
+          CFG
+          if ./target/release/lightfs create-bucket --config /tmp/smoke.toml; then
+            echo "create-bucket against a dead endpoint must fail" >&2
+            exit 1
+          fi
+          echo "smoke: binaries start; dead-endpoint path fails loudly"
+
+      - name: Upload binaries (macOS ARM64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: lightfs-darwin-arm64-${{ github.sha }}
+          path: |
+            target/release/lightfs
+            target/release/lightfs-shell
+            target/release/lightfs-bench
           retention-days: 30
 

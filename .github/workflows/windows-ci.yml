@@ -24,7 +24,7 @@ jobs:
           rustup default 1.85.1
 
       - name: Build release binaries
-        run: cargo build --release --bin lightfs --bin lightfs-shell --bin lightfs-accept
+        run: cargo build --release --bin lightfs --bin lightfs-shell --bin lightfs-accept --bin lightfs-bench
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
@@ -34,7 +34,8 @@ jobs:
             target/release/lightfs.exe
             target/release/lightfs-shell.exe
             target/release/lightfs-accept.exe
-          retention-days: 7
+            target/release/lightfs-bench.exe
+          retention-days: 30
 
   unit-tests:
     # Real-Windows library tests: the cfg(windows) arms (durable staging
