@@ -85,6 +85,15 @@ kernel SYMLOOP_MAX bound) and fail with an error instead of hanging on
 link loops. `rename` and `unlink` act on the link node itself and never
 follow the final path component.
 
+## Storage response semantics
+
+How an object-store response (2xx / 404 / NoSuchBucket / transport error)
+becomes a domain decision and a durable SQLite state transition — the
+authoritative table for HEAD adjudication, idempotent deletes, strict-pack
+and write-back upload-failure handling, upload-failure classification, and
+gc deletion intents lives in
+[docs/storage-response-semantics.md](docs/storage-response-semantics.md).
+
 ## License
 
 Apache-2.0

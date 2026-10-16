@@ -245,6 +245,14 @@ production code was never modified).
 
 ## Mapping: model actions ↔ implementation (anchors at S4.12.1 baseline `146dc2c`)
 
+> The HTTP-response ↔ domain-semantics side of this mapping (which raw S3
+> result becomes CONFIRMED / UNCERTAIN / FAILED, and which durable state
+> each produces) is tabulated in
+> [../../docs/storage-response-semantics.md](../../docs/storage-response-semantics.md).
+> The model abstracts that entire layer behind `obj ∈ {Present, Absent}`
+> and `failProne` — a green model run makes no claim about any specific
+> status code or error code.
+
 | Model action | Rust entry | Transaction boundary | Tests |
 |--------------|-----------|---------------------|-------|
 | `EngineStart`/`RecoverSweep`/`EngineCrash` | engine.rs `open_engine`/`open_engine_mem`/`open_maintenance` (S4.14.1): engine lock FIRST, before SQLite is opened → `build_core`: `recover_stale_packs()` once → serve; held via `hold_engine_lock` for the engine lifetime | startup pass = several txs, modeled atomic (declared) | S4.3.4b lock tests; `s410_*`; `s4141_*` race/alias, `s414_*` both refusal directions |
