@@ -33,6 +33,21 @@ fn ensure_parent_dir(path: &str) {
 /// followed). Callers then resolve the canonical identity of a file that
 /// is guaranteed to exist.
 fn ensure_db_file_exists(path: &str) -> Result<()> {
+    // Dangling symlink: refuse EXPLICITLY, before any filesystem mutation.
+    // On unix, create_new's O_EXCL already refuses (EEXIST, no follow) but
+    // the subsequent canonicalize would fail with a bare "No such file or
+    // directory" that names no cause; on platforms whose create follows
+    // symlinks, initialization could silently land at the SYMLINK TARGET
+    // instead of the configured path. A dangling metadata path is a
+    // configuration error; report it as one and touch nothing. A VALID
+    // symlink (target exists) keeps the alias semantics unchanged.
+    if let Ok(md) = std::fs::symlink_metadata(path) {
+        if md.file_type().is_symlink() && std::fs::metadata(path).is_err() {
+            return Err(crate::error::Error::InvalidArgument(format!(
+                "metadata path {path:?} is a dangling symlink; refusing to initialize a database through it"
+            )));
+        }
+    }
     match std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -644,6 +659,62 @@ mod tests {
 
     // ---- S4.14.1: race-safe initialization + direction B ------------------
 
+    /// S4.14.3 contract: a DANGLING symlink at the metadata path is a
+    /// configuration error and is refused with a clear message BEFORE any
+    /// filesystem mutation — the symlink is not followed, no file is
+    /// created at its target, and the symlink itself is untouched. (A
+    /// valid symlink keeps the alias semantics; that is pinned by the
+    /// s4141_alias tests, which initialize and lock through one.) The
+    /// detection precedes create_new, so the contract holds by
+    /// construction on every platform; the test itself is unix-only
+    /// because creating symlinks needs privileges on Windows.
+    #[test]
+    #[cfg(unix)]
+    fn s4143_dangling_symlink_is_refused_cleanly() {
+        use std::os::unix::fs::symlink;
+        let dir =
+            std::env::temp_dir().join(format!("lightfs-s4143-dangling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("m.db");
+        let target = dir.join("elsewhere.db");
+        symlink(&target, &link).unwrap();
+        assert!(!target.exists(), "precondition: the target must not exist");
+
+        let mut cfg = Config::default();
+        cfg.metadata.path = link.to_string_lossy().to_string();
+        let msg = match open_engine_mem(&cfg) {
+            Ok(_) => panic!("a dangling symlink metadata path must be refused"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(
+            msg.contains("dangling symlink"),
+            "the refusal must name the dangling symlink, got: {msg}"
+        );
+        assert!(
+            !target.exists(),
+            "initialization must not create a file at the symlink target"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the refusal must not consume or rewrite the symlink itself"
+        );
+
+        // Once the obstruction is removed, first initialization through the
+        // same configured path works normally.
+        std::fs::remove_file(&link).unwrap();
+        let _eng = open_engine_mem(&cfg).expect("fresh init after the symlink is gone");
+        assert!(!target.exists(), "still nothing at the old symlink target");
+        assert!(
+            link.is_file(),
+            "the database now lives at the configured path"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The placeholder helper must never touch an existing file: the whole
     /// point of `create_new` is that a database another process already
     /// initialized is byte-untouchable.
@@ -720,7 +791,10 @@ mod tests {
                 // after the winner exits.
                 let release = dir.join("release");
                 let mut held = 0u32;
-                while !release.exists() && held < 15_000 {
+                // 30s = 2x the parent's 15s collection deadline plus margin,
+                // so the winner's give-up and the parent's deadline can never
+                // coincide; the parent always releases (or fails) first.
+                while !release.exists() && held < 30_000 {
                     std::thread::sleep(std::time::Duration::from_millis(20));
                     held += 20;
                 }
@@ -767,7 +841,7 @@ mod tests {
                 }
             }
         }
-        let guard = Guard(children);
+        let mut guard = Guard(children);
         // All children are waiting on the start file; release them at once.
         std::fs::write(dir.join("start"), b"go").unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -806,8 +880,26 @@ mod tests {
             N as usize - 1,
             "every loser must see the lock conflict"
         );
-        // All outcomes observed while the winner still holds the lock.
+        // All outcomes were observed while the winner still held the lock.
+        // Only NOW release it, then require every racer to exit normally
+        // within a bounded window: Guard's kill is the failure path, never
+        // the lock-release mechanism.
         std::fs::write(dir.join("release"), b"done").unwrap();
+        let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if guard
+                .0
+                .iter_mut()
+                .all(|c| matches!(c.try_wait(), Ok(Some(_))))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < exit_deadline,
+                "racers must exit normally once the lock is released"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
