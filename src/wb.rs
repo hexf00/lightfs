@@ -1129,8 +1129,9 @@ impl WriteBackEngine {
             self.metrics.wb_packs.fetch_add(1, Ordering::Relaxed);
         }
         if let Err(e) = put {
-            // upload failed: nothing references the pack yet — undo row
-            // + object, then S4.4 classification: transient failures
+            // upload failed: nothing references the pack yet (member
+            // binding and the CAS loop only run after a successful PUT) —
+            // undo the object, then S4.4 classification: transient failures
             // requeue with the retry budget; permanent remote verdicts and
             // unjudgeable outcomes dead-letter their members immediately.
             // The decision and wording are shared with the per-file path
@@ -1138,8 +1139,33 @@ impl WriteBackEngine {
             // member loop, and the pack lifecycle — a batch upload failure
             // is batch-scoped, but it never widens a single-member CAS
             // outcome into a batch failure.
-            let _ = self.objects.delete(&pack_key);
-            let _ = self.meta.drop_pack(&pack_key);
+            //
+            // S4.11 lifecycle: the PUT error is UNCERTAIN — the object may
+            // exist server-side (S4.6 contract: no promise after a failed
+            // put_stream). The building row is the pack's ONLY durable
+            // tracker, so it is dropped only after the inline delete is
+            // CONFIRMED; a failed delete keeps the row and the existing
+            // stale-pack machinery (recover_stale_packs: HEAD three-state,
+            // durable kind='pack' deletion intent, gc executor) converges
+            // it at the next restart or `lightfs gc` pass — potentially
+            // much later under a lasting S3 outage, which is the accepted
+            // safety-first cost of never losing the tracker. A row-drop
+            // failure after a CONFIRMED delete is equally harmless: the
+            // leftover row waits for the same sweep (HEAD 404 → drop).
+            match self.objects.delete(&pack_key) {
+                Ok(()) => {
+                    if let Err(derr) = self.meta.drop_pack(&pack_key) {
+                        eprintln!(
+                            "lightfs wb: pack {pack_key}: object deleted but row drop failed ({derr}); building row kept for the stale-pack sweep"
+                        );
+                    }
+                }
+                Err(derr) => {
+                    eprintln!(
+                        "lightfs wb: pack {pack_key}: upload failed and inline delete failed ({derr}); building row kept as the durable tracker"
+                    );
+                }
+            }
             let d = upload_failure_disposition(&e);
             let mut requeued_any = false;
             for (task, _, _) in &entries {
@@ -4723,6 +4749,596 @@ mod tests {
         assert_eq!(c.metadata().pack_rows_debug().unwrap().len(), 0);
         let (staged, _) = c.metadata().wb_capacity_snapshot().unwrap();
         assert_eq!(staged, 19, "9+10 declared bytes stay accounted");
+    }
+
+    // ---- S4.11: Batch-Pack upload-failure lifecycle. The pack row must
+    // never be dropped while the object's fate is uncertain; the existing
+    // stale-pack machinery (recover_stale_packs + kind='pack' deletion
+    // intents) is the ONLY convergence path — no second state machine.
+
+    /// Object store with INDEPENDENT failure switches: `uncertain` makes
+    /// put_stream write the FULL object through to the real store and THEN
+    /// report failure (exactly the outcome the S4.6 contract refuses to
+    /// promise away), `dead_put` fails without storing, delete/head fail
+    /// one-shot each.
+    struct S411Objects {
+        inner: MemObjectStore,
+        msg: &'static str,
+        uncertain: std::sync::atomic::AtomicBool,
+        dead_put: std::sync::atomic::AtomicBool,
+        fail_delete: std::sync::atomic::AtomicBool,
+        fail_head: std::sync::atomic::AtomicBool,
+    }
+
+    impl S411Objects {
+        fn uncertain(msg: &'static str) -> Self {
+            Self {
+                inner: MemObjectStore::new(),
+                msg,
+                uncertain: std::sync::atomic::AtomicBool::new(true),
+                dead_put: std::sync::atomic::AtomicBool::new(false),
+                fail_delete: std::sync::atomic::AtomicBool::new(false),
+                fail_head: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+        fn dead(msg: &'static str) -> Self {
+            let mut s = Self::uncertain(msg);
+            s.uncertain = std::sync::atomic::AtomicBool::new(false);
+            s.dead_put = std::sync::atomic::AtomicBool::new(true);
+            s
+        }
+    }
+
+    impl crate::object_store::ObjectStore for S411Objects {
+        fn put(
+            &self,
+            key: &str,
+            data: &[u8],
+        ) -> crate::error::Result<crate::object_store::ObjectInfo> {
+            self.inner.put(key, data)
+        }
+        fn put_stream(
+            &self,
+            key: &str,
+            reader: &mut dyn std::io::Read,
+            len: u64,
+        ) -> crate::error::Result<crate::object_store::ObjectInfo> {
+            if self
+                .dead_put
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::error::Error::Storage(self.msg.into()));
+            }
+            if self
+                .uncertain
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                let mut buf = vec![0u8; len as usize];
+                reader
+                    .read_exact(&mut buf)
+                    .map_err(|e| crate::error::Error::Io(e.to_string()))?;
+                self.inner.put(key, &buf)?;
+                return Err(crate::error::Error::Storage(self.msg.into()));
+            }
+            self.inner.put_stream(key, reader, len)
+        }
+        fn get(
+            &self,
+            key: &str,
+            range: Option<crate::object_store::Range>,
+        ) -> crate::error::Result<crate::object_store::ObjectData> {
+            self.inner.get(key, range)
+        }
+        fn get_stream(
+            &self,
+            key: &str,
+            range: Option<crate::object_store::Range>,
+        ) -> crate::error::Result<(Box<dyn std::io::Read + Send>, u64)> {
+            self.inner.get_stream(key, range)
+        }
+        fn head(&self, key: &str) -> crate::error::Result<crate::object_store::ObjectInfo> {
+            if self
+                .fail_head
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::error::Error::Storage(
+                    "injected: head unavailable".into(),
+                ));
+            }
+            self.inner.head(key)
+        }
+        fn delete(&self, key: &str) -> crate::error::Result<()> {
+            if self
+                .fail_delete
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::error::Error::Storage(
+                    "injected: delete failed".into(),
+                ));
+            }
+            self.inner.delete(key)
+        }
+        fn list(
+            &self,
+            prefix: &str,
+            token: Option<&str>,
+            max: usize,
+        ) -> crate::error::Result<crate::object_store::ListPage> {
+            self.inner.list(prefix, token, max)
+        }
+        fn ping(&self) -> crate::error::Result<()> {
+            self.inner.ping()
+        }
+    }
+
+    fn s411_batch_core(
+        tag: &str,
+        meta: StdArc<dyn crate::metadata::MetadataStore>,
+        store: StdArc<dyn crate::object_store::ObjectStore>,
+    ) -> Core {
+        let dir = std::env::temp_dir().join(format!(
+            "lightfs-s411-{tag}-{}-{}",
+            std::process::id(),
+            tmp_unique()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Core::with_options(
+            meta,
+            store,
+            crate::core::DEFAULT_SUPERSEDED_SECS,
+            None,
+            Some(WbOptions {
+                staging_dir: dir.join("staging").to_string_lossy().to_string(),
+                drain_workers: 0,
+                batch_pack_bytes: 8388608,
+                batch_max_wait_ms: 0,
+                queue_max_tasks: 0,
+                staging_budget_bytes: 0,
+                ledger_lock_path: None,
+                probe_fault: false,
+            }),
+        )
+        .unwrap()
+    }
+
+    fn s411_stage_batch(c: &Core, a: &[u8], b: &[u8]) {
+        c.create("/f", 0o644).unwrap();
+        write_via_rpc(c, "/f", a, Some(0));
+        c.create("/g", 0o644).unwrap();
+        write_via_rpc(c, "/g", b, Some(0));
+    }
+
+    fn s411_pack_key(c: &Core) -> String {
+        let rows = c.metadata().pack_rows_debug().unwrap();
+        assert_eq!(rows.len(), 1, "exactly one pack row: {rows:?}");
+        rows[0].0.clone()
+    }
+
+    /// S4.11 scene 1: the PUT never created the object and the inline
+    /// delete is confirmed — object and tracker row both end up gone, no
+    /// deletion intent, members requeued untouched.
+    #[test]
+    fn s411_plain_failure_confirmed_delete_drops_object_and_row() {
+        let objs = StdArc::new(S411Objects::dead("s3 503 on packs/x: SlowDown"));
+        let c = s411_batch_core(
+            "s1",
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            objs.clone(),
+        );
+        s411_stage_batch(&c, b"scene one f", b"scene one g!");
+
+        assert!(c.wb().unwrap().drain_once().unwrap());
+        assert_eq!(
+            c.wb().unwrap().queue_counts(),
+            (2, 0, 0),
+            "transient requeue"
+        );
+        assert_eq!(
+            c.metadata().pack_rows_debug().unwrap().len(),
+            0,
+            "confirmed delete → row dropped"
+        );
+        assert_eq!(
+            c.objects().list("packs/", None, 100).unwrap().items.len(),
+            0,
+            "no object was ever created"
+        );
+        assert!(c.metadata().gc_claim_deletions(10, 1).unwrap().is_empty());
+    }
+
+    /// S4.11 scenes 2→3→4 as one chain: the PUT persisted the object but
+    /// reported failure AND the inline delete failed — the building row
+    /// survives as the tracker with no intent; recover_stale_packs proves
+    /// existence via HEAD and flips the row to `deleting` with a durable
+    /// kind='pack' intent inside one transaction; the existing gc executor
+    /// then deletes the object and converges row + intent. Members stay
+    /// transient-requeued throughout, staging accounting untouched.
+    #[test]
+    fn s411_uncertain_delete_fails_tracker_survives_then_gc_closes() {
+        let objs = StdArc::new(S411Objects::uncertain("s3 503 on packs/x: SlowDown"));
+        objs.fail_delete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let c = s411_batch_core(
+            "s2",
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            objs.clone(),
+        );
+        s411_stage_batch(&c, b"scene two f", b"scene two g!");
+
+        assert!(c.wb().unwrap().drain_once().unwrap());
+        assert_eq!(c.wb().unwrap().queue_counts(), (2, 0, 0));
+        for r in c.metadata().wb_task_rows().unwrap() {
+            assert_eq!(r.1, "queued");
+            assert_eq!(
+                r.3.as_deref(),
+                Some(CLASS_UPLOAD_TRANSIENT),
+                "member disposition is unaffected by the lifecycle arm"
+            );
+        }
+        let key = s411_pack_key(&c);
+        assert_eq!(
+            c.metadata().pack_state(&key).unwrap().unwrap(),
+            ("building".into(), None),
+            "the tracker row survives the uncertain delete"
+        );
+        assert!(objs.head(&key).is_ok(), "the object WAS persisted");
+        assert!(
+            c.metadata().gc_claim_deletions(10, 1).unwrap().is_empty(),
+            "no intent yet — the row is the only tracker"
+        );
+        let (staged, reserved) = c.metadata().wb_capacity_snapshot().unwrap();
+        assert_eq!(
+            (staged, reserved),
+            (23, 0),
+            "11+12 declared bytes stay accounted"
+        );
+        // no node references the pack: the CAS loop never ran
+        assert_ne!(
+            c.lookup("/f").unwrap().object_key.as_deref(),
+            Some(key.as_str())
+        );
+
+        // scene 3: HEAD exists → deleting + durable intent, one transaction
+        let s = c.recover_stale_packs().unwrap();
+        assert_eq!(
+            (s.enrolled_stale, s.dropped_building, s.head_unavailable),
+            (1, 0, 0),
+            "{s:?}"
+        );
+        assert_eq!(
+            c.metadata().pack_state(&key).unwrap().unwrap().0,
+            "deleting"
+        );
+        let intents = c.metadata().gc_claim_deletions(10, 1).unwrap();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].key, key);
+        assert_eq!(intents[0].kind, "pack");
+
+        // scene 4: the existing executor closes the loop
+        let (done, failed, skipped) = c.gc_execute_deletions(10, &HashSet::new()).unwrap();
+        assert_eq!((done, failed, skipped), (1, 0, 0));
+        assert!(objs.head(&key).is_err(), "object deleted");
+        assert!(
+            c.metadata().pack_state(&key).unwrap().is_none(),
+            "pack row goes with the object"
+        );
+        assert!(c.metadata().gc_claim_deletions(10, 1).unwrap().is_empty());
+
+        // idempotent: repeat recover + gc find nothing to do
+        let s2 = c.recover_stale_packs().unwrap();
+        assert_eq!(
+            (
+                s2.enrolled_stale,
+                s2.dropped_building,
+                s2.head_unavailable,
+                s2.finalized_committing
+            ),
+            (0, 0, 0, 0)
+        );
+        let (done2, _, _) = c.gc_execute_deletions(10, &HashSet::new()).unwrap();
+        assert_eq!(done2, 0);
+    }
+
+    /// S4.11 scene 5: after the uncertain upload + failed delete, the FIRST
+    /// head is unavailable — fail-closed keeps the building row; only when
+    /// head works again does the row advance to `deleting` + intent.
+    #[test]
+    fn s411_head_unavailable_keeps_tracker_until_head_recovers() {
+        let objs = StdArc::new(S411Objects::uncertain("s3 503 on packs/x: SlowDown"));
+        objs.fail_delete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let c = s411_batch_core(
+            "s5",
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            objs.clone(),
+        );
+        s411_stage_batch(&c, b"scene five f", b"scene five g!");
+        assert!(c.wb().unwrap().drain_once().unwrap());
+        let key = s411_pack_key(&c);
+
+        objs.fail_head
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let s = c.recover_stale_packs().unwrap();
+        assert_eq!(s.head_unavailable, 1, "{s:?}");
+        assert_eq!(
+            c.metadata().pack_state(&key).unwrap().unwrap(),
+            ("building".into(), None),
+            "cannot tell → the tracker is kept untouched"
+        );
+        assert!(c.metadata().gc_claim_deletions(10, 1).unwrap().is_empty());
+
+        let s2 = c.recover_stale_packs().unwrap();
+        assert_eq!(s2.enrolled_stale, 1, "{s2:?}");
+        assert_eq!(
+            c.metadata().pack_state(&key).unwrap().unwrap().0,
+            "deleting"
+        );
+        let intents = c.metadata().gc_claim_deletions(10, 1).unwrap();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(
+            (intents[0].key.as_str(), intents[0].kind.as_str()),
+            (key.as_str(), "pack")
+        );
+    }
+
+    /// MetadataStore forwarding wrapper whose `drop_pack` can fail ONCE —
+    /// scene 6's injection point (delete confirmed, row drop refused).
+    /// Every method forwards to the real SQLite store so drain, recovery
+    /// and assertions observe genuine behavior.
+    struct FailDropPack {
+        inner: SqliteMetadataStore,
+        fail_drop: std::sync::atomic::AtomicBool,
+    }
+    impl crate::metadata::MetadataStore for FailDropPack {
+        fn create_node(
+            &self,
+            parent_id: i64,
+            name: &str,
+            kind: crate::metadata::NodeKind,
+            mode: u32,
+            object_key: Option<&str>,
+        ) -> crate::error::Result<crate::metadata::Node> {
+            self.inner
+                .create_node(parent_id, name, kind, mode, object_key)
+        }
+        fn create_symlink(
+            &self,
+            parent_id: i64,
+            name: &str,
+            target: &str,
+            mode: u32,
+        ) -> crate::error::Result<crate::metadata::Node> {
+            self.inner.create_symlink(parent_id, name, target, mode)
+        }
+        fn get_node(&self, id: i64) -> crate::error::Result<Option<crate::metadata::Node>> {
+            self.inner.get_node(id)
+        }
+        fn get_child(
+            &self,
+            parent_id: i64,
+            name: &str,
+        ) -> crate::error::Result<Option<crate::metadata::Node>> {
+            self.inner.get_child(parent_id, name)
+        }
+        fn list_children(
+            &self,
+            parent_id: i64,
+        ) -> crate::error::Result<Vec<crate::metadata::Node>> {
+            self.inner.list_children(parent_id)
+        }
+        fn count_children(&self, parent_id: i64) -> crate::error::Result<i64> {
+            self.inner.count_children(parent_id)
+        }
+        fn commit_content_cas(
+            &self,
+            id: i64,
+            expected_version: i64,
+            size: i64,
+            mtime: i64,
+            new_object_key: &str,
+            etag: &str,
+        ) -> crate::error::Result<()> {
+            self.inner
+                .commit_content_cas(id, expected_version, size, mtime, new_object_key, etag)
+        }
+        fn update_attrs(&self, id: i64, mode: u32, mtime: i64) -> crate::error::Result<()> {
+            self.inner.update_attrs(id, mode, mtime)
+        }
+        fn rename_node(
+            &self,
+            id: i64,
+            new_parent_id: i64,
+            new_name: &str,
+        ) -> crate::error::Result<()> {
+            self.inner.rename_node(id, new_parent_id, new_name)
+        }
+        fn rename_node_overwrite(
+            &self,
+            source_id: i64,
+            target_id: i64,
+            new_parent_id: i64,
+            new_name: &str,
+        ) -> crate::error::Result<crate::metadata::Node> {
+            self.inner
+                .rename_node_overwrite(source_id, target_id, new_parent_id, new_name)
+        }
+        fn delete_node(&self, id: i64) -> crate::error::Result<()> {
+            self.inner.delete_node(id)
+        }
+        fn all_nodes(&self) -> crate::error::Result<Vec<crate::metadata::Node>> {
+            self.inner.all_nodes()
+        }
+        fn record_superseded(&self, object_key: &str, at: i64) -> crate::error::Result<()> {
+            self.inner.record_superseded(object_key, at)
+        }
+        fn gc_candidates(&self, cutoff: i64, limit: usize) -> crate::error::Result<Vec<String>> {
+            self.inner.gc_candidates(cutoff, limit)
+        }
+        fn drop_superseded(&self, object_key: &str) -> crate::error::Result<()> {
+            self.inner.drop_superseded(object_key)
+        }
+        fn all_superseded(&self) -> crate::error::Result<Vec<String>> {
+            self.inner.all_superseded()
+        }
+        fn register_pack(&self, key: &str, bytes: i64) -> crate::error::Result<()> {
+            self.inner.register_pack(key, bytes)
+        }
+        fn mark_pack_uploaded(&self, key: &str, at: i64) -> crate::error::Result<()> {
+            self.inner.mark_pack_uploaded(key, at)
+        }
+        fn drop_pack(&self, key: &str) -> crate::error::Result<()> {
+            if self
+                .fail_drop
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::error::Error::Storage(
+                    "injected: drop_pack failed".into(),
+                ));
+            }
+            self.inner.drop_pack(key)
+        }
+        fn all_packs(&self) -> crate::error::Result<Vec<(String, i64, Option<i64>)>> {
+            self.inner.all_packs()
+        }
+        fn pack_state(&self, key: &str) -> crate::error::Result<Option<(String, Option<i64>)>> {
+            self.inner.pack_state(key)
+        }
+        fn committing_packs(&self) -> crate::error::Result<Vec<String>> {
+            self.inner.committing_packs()
+        }
+        fn wb_bind_pack_keys(
+            &self,
+            ids: &[i64],
+            pack_key: Option<&str>,
+            now: i64,
+        ) -> crate::error::Result<()> {
+            self.inner.wb_bind_pack_keys(ids, pack_key, now)
+        }
+        fn wb_finalize_batch_if_terminal(
+            &self,
+            pack_key: &str,
+            now: i64,
+        ) -> crate::error::Result<()> {
+            self.inner.wb_finalize_batch_if_terminal(pack_key, now)
+        }
+        fn gc_register_stale_pack_deletion(
+            &self,
+            key: &str,
+            now: i64,
+        ) -> crate::error::Result<bool> {
+            self.inner.gc_register_stale_pack_deletion(key, now)
+        }
+        fn gc_claim_deletions(
+            &self,
+            limit: usize,
+            now: i64,
+        ) -> crate::error::Result<Vec<crate::metadata::GcDeletion>> {
+            self.inner.gc_claim_deletions(limit, now)
+        }
+        fn wb_enqueue(
+            &self,
+            node_id: i64,
+            staging: &str,
+            size: i64,
+            expected: i64,
+            now: i64,
+        ) -> crate::error::Result<(i64, Option<(String, i64)>)> {
+            self.inner.wb_enqueue(node_id, staging, size, expected, now)
+        }
+        fn wb_claim(&self, now: i64) -> crate::error::Result<Option<crate::metadata::WbTask>> {
+            self.inner.wb_claim(now)
+        }
+        fn wb_claim_fit(
+            &self,
+            max_bytes: i64,
+            now: i64,
+        ) -> crate::error::Result<Option<crate::metadata::WbTask>> {
+            self.inner.wb_claim_fit(max_bytes, now)
+        }
+        fn wb_finish(&self, id: i64) -> crate::error::Result<()> {
+            self.inner.wb_finish(id)
+        }
+        fn wb_retry_or_dead(
+            &self,
+            id: i64,
+            max_attempts: u32,
+            now: i64,
+            class: &str,
+        ) -> crate::error::Result<bool> {
+            self.inner.wb_retry_or_dead(id, max_attempts, now, class)
+        }
+        fn wb_mark_dead(&self, id: i64, class: &str, now: i64) -> crate::error::Result<()> {
+            self.inner.wb_mark_dead(id, class, now)
+        }
+        fn wb_set_state(&self, id: i64, state: &str, now: i64) -> crate::error::Result<()> {
+            self.inner.wb_set_state(id, state, now)
+        }
+        fn wb_projection(&self, node_id: i64) -> crate::error::Result<Option<(i64, i64)>> {
+            self.inner.wb_projection(node_id)
+        }
+        fn wb_capacity_reserve(&self, bytes: i64, budget: i64) -> crate::error::Result<()> {
+            self.inner.wb_capacity_reserve(bytes, budget)
+        }
+        fn wb_reconcile_capacity(
+            &self,
+            on_disk: &[(String, i64)],
+        ) -> crate::error::Result<(i64, i64)> {
+            self.inner.wb_reconcile_capacity(on_disk)
+        }
+        fn wb_capacity_snapshot(&self) -> crate::error::Result<(i64, i64)> {
+            self.inner.wb_capacity_snapshot()
+        }
+        fn wb_counts(&self) -> crate::error::Result<(u64, u64, u64)> {
+            self.inner.wb_counts()
+        }
+        #[cfg(test)]
+        fn wb_task_rows(&self) -> crate::error::Result<Vec<crate::metadata::WbTaskRowDebug>> {
+            self.inner.wb_task_rows()
+        }
+        #[cfg(test)]
+        fn pack_rows_debug(&self) -> crate::error::Result<Vec<(String, String)>> {
+            self.inner.pack_rows_debug()
+        }
+    }
+
+    /// S4.11 scene 6: the inline delete IS confirmed but the row drop is
+    /// refused — the arm must not escalate: members still get their normal
+    /// disposition, the leftover building row carries no reference and no
+    /// terminal state, and a later recover converges it via HEAD 404.
+    #[test]
+    fn s411_delete_confirmed_drop_pack_fails_row_waits_for_sweep() {
+        let objs = StdArc::new(S411Objects::uncertain("s3 503 on packs/x: SlowDown"));
+        let meta = StdArc::new(FailDropPack {
+            inner: SqliteMetadataStore::open_in_memory().unwrap(),
+            fail_drop: std::sync::atomic::AtomicBool::new(true),
+        });
+        let c = s411_batch_core("s6", meta, objs.clone());
+        s411_stage_batch(&c, b"scene six f", b"scene six g!");
+
+        assert!(c.wb().unwrap().drain_once().unwrap());
+        // members got their normal transient disposition despite the
+        // lifecycle failure
+        assert_eq!(c.wb().unwrap().queue_counts(), (2, 0, 0));
+        for r in c.metadata().wb_task_rows().unwrap() {
+            assert_eq!(r.1, "queued");
+            assert_eq!(r.3.as_deref(), Some(CLASS_UPLOAD_TRANSIENT));
+        }
+        // the leftover row: building, object already gone, no intent
+        let key = s411_pack_key(&c);
+        assert_eq!(
+            c.metadata().pack_state(&key).unwrap().unwrap(),
+            ("building".into(), None),
+            "a refused row drop leaves the tracker in its original state"
+        );
+        assert!(objs.head(&key).is_err(), "delete was confirmed");
+        assert!(c.metadata().gc_claim_deletions(10, 1).unwrap().is_empty());
+
+        // later recover: HEAD 404 → the residual row is dropped, no intent
+        let s = c.recover_stale_packs().unwrap();
+        assert_eq!(s.dropped_building, 1, "{s:?}");
+        assert_eq!(s.enrolled_stale, 0);
+        assert!(c.metadata().pack_state(&key).unwrap().is_none());
+        assert!(c.metadata().gc_claim_deletions(10, 1).unwrap().is_empty());
     }
 
     /// P0-d.2 capability gate: a staging directory whose namespace cannot
