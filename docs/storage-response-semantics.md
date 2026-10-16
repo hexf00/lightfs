@@ -148,7 +148,7 @@ caller, keyed by operation — never at the status code alone.
 | 5b | — HTTP 5xx / 429 / 408 | `s3 {status} …` | remote overload/retryable verdict; side effect presence UNKNOWN but class transient | same as 5a | same budget-3 auto-requeue | `wb.rs:229-231` | `p0d47_…decision_table` (statuses swept), `p0d47_batch_upload_transient_budget_exhaustion_dead_letters_with_class` | 5xx/429/408 must classify transient |
 | 5c | — other HTTP verdicts (403, 400, bucket policy…) | `s3 {status} …` | PERMANENT: retrying cannot fix the cause | `error_class='upload-permanent'`, `state='dead'` | dead-letter immediately; future operator retry MAY admit the class (`retry_admissible`), auto-retry never | `wb.rs:232-234` | `p0d_r17_upload_permanent_dead_letters_immediately_with_class` | non-retryable remote verdicts must classify permanent |
 | 5d | — anything unjudgeable (protocol/parse leftovers, non-`Storage` errors) | other | UNKNOWN: never masquerade as retryable | `error_class='unknown'`, `state='dead'` | dead-letter; excluded from `retry_admissible` by construction | `wb.rs:236-238` | `p0d_r17_unknown_error_never_requeues`, `p0d_r17_error_class_origin_and_admission_table` | unparseable outcomes must classify unknown, never transient |
-| 5e | per-file drain (`drain_task`) upload failure — the SAME disposition, different cleanup | any upload error | classification as 5a-5d; the version key is single-file scoped | best-effort inline delete of the version key (`let _`), then requeue/dead-letter. On a dead task whose PUT had SUCCEEDED, `wb_set_uploaded_key` makes `recover()` enroll the orphan candidate | requeue budget 3, shared wording via `log_upload_dead(Task \| BatchMember)` | `wb.rs:950-969` | `p0d_r17_*` series (per-file arms) | see gap G4: an uncertain PUT whose cleanup delete ALSO fails leaves an fsck-visible, untracked orphan — accepted for single-file keys, never for packs |
+| 5e | per-file drain (`drain_task`) upload failure — the SAME disposition, different cleanup | any upload error | classification as 5a-5d; the version key is single-file scoped | S4.16: the version key was REGISTERED as a durable candidate before the PUT; the shared cleanup deletes remotely and drops the row ONLY on a confirmed delete; an uncertain delete keeps the row for the resolution sweep (live-owned / absent / durable intent, `G4` closed) | requeue budget 3, shared wording via `log_upload_dead(Task \| BatchMember)` | `wb.rs drain_task`, `core.rs cleanup_version_candidate_after_failed_put` | `wb.rs s416_w5_*`, `s416_w7_*`, `core.rs s416_c1..c14`, real-subprocess `s416_c12_*` | an uncertain PUT with an uncertain cleanup is TRACKED, never an untracked orphan |
 | 6a | gc executor: claimed deletion intent, remote delete succeeds (2xx or 404-missing-key; `NotFound`/`ObjectMissing` accepted defensively) | `delete_outcome` = Ok | CONFIRMED gone (or already gone) | one tx (`gc_complete_deletion`): kind=`pack` → `DELETE FROM packs`; kind=`object` → `DELETE FROM superseded_objects`; intent → `done` | terminal | `core.rs:382-419`, `sqlite.rs:1245` | `core.rs p0a22_object_missing_from_delete_completes_the_task`, `p0a22_remote_deleted_before_finalize_converges_on_recover`, `p0a_deletion_failure_persists_then_retry_succeeds` | same idempotent-delete contract as 2a/2b |
 | 6b | gc executor: remote delete fails (NoSuchBucket/403 refusal, or 5xx/transport unresolved) | `Storage` | refusal: the deletion did not happen (presence unchanged); unresolved: it may or may not have happened — either way the intent must never be lost and the disposition is identical | `gc_fail_deletion`: intent stays, `state='failed'`, error text persisted | next gc pass re-claims (`gc_claim_deletions` re-queues `pending` AND `failed`; a crash left `deleting` re-enters as `pending` — the idempotent re-delete converges both cases) | `core.rs:411-414`, `sqlite.rs:1211` | `p0a_deletion_failure_persists_then_retry_succeeds` | failures must persist for retry, not abort the pass; the two certainty classes stay distinguishable in persisted error text |
 | 6c | gc executor: key is in the protected set | (before any call) | manifest protection beats reclamation | intent left in `deleting`, `skipped_protected` counted; "a protected intent is never completed"; the next claim re-queues it | passive: protection expires via backup `prune`/expiry, then 6a proceeds | `core.rs:390-394` | `backup/tests.rs p0b_protected_object_survives_gc_until_prune`, `s431_retention_off_gc_keeps_protected_object_and_task`; end-to-end: `scripts/backup-restore-drill.sh` (asserts `skipped-protected 2` / `deleted 1`) | the protection check MUST precede the delete call |
@@ -251,22 +251,29 @@ Answer key, derived from the table:
   reclaimed by no pass, because deleting on the suspicion "no row means
   abandoned" would race external tampering diagnostics and has no
   confirmed-absent probe behind it.
-- **G4 — per-file uncertain orphan (row 5e).** A `drain_task` PUT that
-  uncertainly succeeded AND whose best-effort cleanup delete also failed
-  leaves an untracked `objects/…` key: nothing persistent records it (the
-  task's `uploaded_key` is written only after a successful PUT), so no
-  pass ever reclaims it. fsck still SEES it — as a stale version under
-  the live node id, or as an orphan object once the node is gone — but
-  fsck only reports. Accepted for single-file keys (full audit and the
-  minimal repair design: S4.15.2 evaluation); the pack path must never do
-  this — a pack's tracker row is its only lifecycle owner, and dropping
-  it without a confirmed delete would create exactly the
-  visible-but-ownerless state G3 describes.
+- **G4 — per-file uncertain orphan (row 5e) — CLOSED in S4.16.** The
+  S4.15.2 audit documented the window: a `drain_task` (or strict write)
+  PUT that uncertainly succeeded AND whose best-effort cleanup delete
+  also failed left an untracked `objects/…` key, because nothing
+  persistent recorded it before the PUT. S4.16 closes this with the
+  durable version-candidate lifecycle: every per-file PUT registers a
+  candidate row BEFORE the upload (`version_candidates`, one row per
+  attempt key), a successful CAS consumes the row in the SAME SQLite
+  transaction that makes the key live, a failure arm drops the row only
+  on a CONFIRMED delete, and a shared resolution sweep (engine startup
+  / WB recover / offline maintenance) settles any kept row from HEAD
+  evidence — live-owned (drop, no intent), confirmed absent (drop), or
+  a durable `gc_deletions` intent ensured atomically with the row
+  removal, drained by the unchanged gc pipeline. Strict and WB share
+  the mechanism (formal model: `formal/version-candidate/`; real
+  subprocess crash test: `s416_c12_*`). fsck remains report-only and
+  the pack path is untouched.
 - **G5 — physical durability.** Everything above is process-crash tested
   at best. Power-loss behavior of the local SQLite file and staging
   directory is asserted by construction (fsync gates, S4.4) but never
   experimentally verified.
 
-— S4.15, branch `s31-pack-proto`. Trace it yourself: every symbol in this
+— S4.15, branch `s31-pack-proto`; G4/row-5e revised by S4.16 (durable
+version-candidate lifecycle). Trace it yourself: every symbol in this
 document is `grep`-able in `src/`, `tests/`, and `formal/` at the pinned
 commit.
