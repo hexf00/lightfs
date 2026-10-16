@@ -677,12 +677,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// N processes race the FIRST initialization of one database. Each
-    /// child runs the same two steps the engine entry runs — the race-safe
-    /// placeholder creation, then the engine-lock attempt — released by a
-    /// start file so they overlap for real. At most ONE process can hold
-    /// the lock, and every loser must see the lock conflict, never a
-    /// truncation or a torn file.
+    /// N processes race the FIRST initialization of one database through
+    /// the PRODUCTION entry `open_engine_mem` — the placeholder/lock
+    /// sequence is not re-implemented here — released by a start file so
+    /// they overlap for real. Exactly ONE child may succeed, and it keeps
+    /// the returned Engine (and with it the engine lock) alive until the
+    /// parent has collected every outcome. Every loser must report the
+    /// engine-lock conflict; a SQLite, schema, or any other error is a
+    /// failed race, not a legitimate loser.
     #[test]
     fn s4141_first_open_race_child_helper() {
         let Some(dir) = std::env::var_os("LIGHTFS_S4141_RACE_DIR") else {
@@ -702,38 +704,30 @@ mod tests {
             eprintln!("S4141-RACE: start file never appeared");
             std::process::exit(2);
         }
-        let db = dir.join("m.db");
-        // The exact two steps the engine entry performs on a fresh
-        // database, in the same order. The guard is MOVED OUT of the
-        // closure, so a winner still holds the lock while losers report.
         let mut cfg = Config::default();
-        cfg.metadata.path = db.to_string_lossy().to_string();
-        let lock: std::result::Result<Option<crate::fslock::FileLock>, String> = (|| {
-            ensure_db_file_exists(db.to_str().unwrap()).map_err(|e| format!("create: {e}"))?;
-            let lock_path = engine_lock_path(&cfg).map_err(|e| format!("lockpath: {e}"))?;
-            crate::fslock::FileLock::try_acquire(&lock_path)
-                .map(Some)
-                .map_err(|e| format!("{e}"))
-        })();
+        cfg.metadata.path = dir.join("m.db").to_string_lossy().to_string();
         let result_file = dir.join(format!(
             "result-{}-{}",
             id.to_string_lossy(),
             std::process::id()
         ));
-        match lock {
-            Ok(_held) => {
+        match open_engine_mem(&cfg) {
+            Ok(engine) => {
                 std::fs::write(result_file, b"locked").unwrap();
-                // Hold the lock until the parent has collected every
-                // outcome: a loser must observe the conflict WHILE the
-                // winner holds it, not after the winner exits.
+                // Hold the ENGINE — the lock lives as long as this value —
+                // until the parent has collected every outcome: a loser
+                // must observe the conflict WHILE the winner holds it, not
+                // after the winner exits.
                 let release = dir.join("release");
                 let mut held = 0u32;
                 while !release.exists() && held < 15_000 {
                     std::thread::sleep(std::time::Duration::from_millis(20));
                     held += 20;
                 }
+                drop(engine);
             }
-            Err(msg) => {
+            Err(e) => {
+                let msg = e.to_string();
                 let text = if msg.contains("is locked by") {
                     "refused".to_string()
                 } else {
