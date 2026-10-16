@@ -4170,7 +4170,28 @@ mod tests {
         let c = &eng.core;
         c.create("/f", 0o644).unwrap();
         write_via_rpc(c, "/f", P0D_R16_BODY, Some(0));
-        assert_eq!(c.wb().unwrap().queue_counts(), (1, 0, 0));
+        // The batch claim pins the task in `draining` for the whole seal
+        // window — wait for that state instead of racing the worker. An
+        // enqueue-then-immediately-assert check wins only when the drain
+        // thread loses the wakeup race (binary-layout sensitive, seen
+        // flaky on macOS); once claimed, the task CANNOT leave `draining`
+        // until the 600s window, so the parent's SIGKILL lands in the
+        // deterministic crash window this test exists for. The parent's
+        // visibility poll already accepts queued OR draining.
+        let claimed = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match c.wb().unwrap().queue_counts() {
+                (0, 1, 0) => break,
+                (1, 0, 0) => {
+                    assert!(
+                        std::time::Instant::now() < claimed,
+                        "the drain worker never claimed the enqueued task"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                other => panic!("unexpected queue shape {other:?} after one enqueue"),
+            }
+        }
         std::fs::write(dir.join("child.ready"), b"enqueued").unwrap();
         loop {
             std::thread::sleep(std::time::Duration::from_millis(50));

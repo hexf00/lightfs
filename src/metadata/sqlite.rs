@@ -8,8 +8,11 @@
 //! has already allocated are never re-issued by that same database —
 //! (id, version) identifies content for the database's lifetime. The
 //! property is created WITH the schema: a database written before this
-//! schema cannot satisfy it and is rejected at open (never auto-migrated);
-//! re-initialize the store instead.
+//! schema cannot satisfy it and is rejected at open; re-initialize the
+//! store instead. The ONE exception (S4.16.1): a database conforming to
+//! the exact S4.15.2 schema is upgraded at open by creating the
+//! `version_candidates` table in a single transaction — read-only
+//! verified first, re-verified after, everything else stays fail-closed.
 
 use std::sync::Mutex;
 
@@ -25,6 +28,89 @@ pub struct SqliteMetadataStore {
     db_path: Option<std::path::PathBuf>,
 }
 
+/// The S4.16 addition as its own constant: the one permitted migration
+/// (S4.16.1) runs EXACTLY this DDL, and the full schema is the S4.15.2
+/// base plus this block — the two can never drift.
+const VERSION_CANDIDATES_DDL: &str = "CREATE TABLE IF NOT EXISTS version_candidates (
+    key TEXT PRIMARY KEY,
+    registered_at INTEGER NOT NULL
+);
+";
+
+/// The single schema through S4.15.2 — byte-exact the SCHEMA of every
+/// build from S4.2.1 to S4.15.2. It is (a) what a conforming pre-S4.16
+/// database contains and (b) the precise fixture the upgrade tests
+/// initialize from; it is NOT derived by dropping anything from the
+/// current schema. Test-only: live adjudication keys on
+/// [`REQUIRED_TABLE_COLUMNS_THROUGH_S4152`] (definition-level), never on
+/// stored SQL text — this literal exists so the fixture cannot drift and
+/// so the byte-exact SCHEMA split stays pinned.
+#[cfg(test)]
+const SCHEMA_THROUGH_S4152: &str = r#"
+CREATE TABLE IF NOT EXISTS nodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    parent_id INTEGER,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    size INTEGER NOT NULL DEFAULT 0,
+    mtime INTEGER NOT NULL,
+    mode INTEGER,
+    object_key TEXT,
+    version TEXT,
+    etag TEXT,
+    target TEXT,
+    pack_key TEXT,
+    pack_off INTEGER,
+    pack_len INTEGER,
+    content_hash TEXT,
+    UNIQUE(parent_id, name)
+);
+CREATE TABLE IF NOT EXISTS superseded_objects (
+    object_key TEXT PRIMARY KEY,
+    superseded_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS packs (
+    key TEXT PRIMARY KEY,
+    bytes INTEGER NOT NULL,
+    uploaded_at INTEGER,
+    state TEXT NOT NULL DEFAULT 'building',
+    unref_since INTEGER
+);
+CREATE TABLE IF NOT EXISTS wb_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id INTEGER NOT NULL,
+    staging TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    expected INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'queued',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL,
+    pack_key TEXT,
+    uploaded_key TEXT,
+    error_class TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_wb_tasks_node ON wb_tasks(node_id, state);
+CREATE INDEX IF NOT EXISTS idx_wb_tasks_pack ON wb_tasks(pack_key, state);
+CREATE TABLE IF NOT EXISTS gc_deletions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS wb_capacity (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    staged_bytes INTEGER NOT NULL DEFAULT 0,
+    reserved_bytes INTEGER NOT NULL DEFAULT 0
+);
+"#;
+
+/// The full current schema: the S4.15.2 base plus the S4.16 block. Kept
+/// as one literal; the test `s4161_schema_is_base_plus_candidate_ddl`
+/// pins it byte-exact to [`SCHEMA_THROUGH_S4152`] +
+/// [`VERSION_CANDIDATES_DDL`] (concat! cannot take consts).
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS nodes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,9 +178,10 @@ CREATE TABLE IF NOT EXISTS version_candidates (
 
 /// S4.2.1 single-schema contract: every table and column this build
 /// requires, checked against an EXISTING database file before anything is
-/// written to it. There is deliberately no ALTER/migration/backfill — a
-/// database missing any piece predates this schema and is rejected at open
-/// (re-initialize the store instead); a fresh database simply gets all of
+/// written to it. A database missing any piece is rejected at open —
+/// with exactly ONE exception (S4.16.1): a database conforming to the
+/// S4.15.2 schema ([`REQUIRED_TABLE_COLUMNS_THROUGH_S4152`]) is upgraded
+/// by creating `version_candidates`. A fresh database simply gets all of
 /// it from `SCHEMA`.
 const REQUIRED_TABLE_COLUMNS: [(&str, &[&str]); 7] = [
     (
@@ -152,6 +239,71 @@ const REQUIRED_TABLE_COLUMNS: [(&str, &[&str]); 7] = [
     ),
     ("wb_capacity", &["id", "staged_bytes", "reserved_bytes"]),
     ("version_candidates", &["key", "registered_at"]),
+];
+
+/// S4.16.1 — the ONE permitted upgrade source: the S4.15.2 single schema.
+/// Spelled out as a literal (not derived from the current list at
+/// runtime) so the accepted upgrade boundary is reviewable line by line:
+/// identical to [`REQUIRED_TABLE_COLUMNS`] except that the
+/// `version_candidates` table does not exist yet. Every other difference
+/// — a missing column anywhere, an extra/renamed table, a database older
+/// than S4.15.2 — stays fail-closed, exactly as the S4.2.1 discipline
+/// requires.
+const REQUIRED_TABLE_COLUMNS_THROUGH_S4152: [(&str, &[&str]); 6] = [
+    (
+        "nodes",
+        &[
+            "id",
+            "parent_id",
+            "name",
+            "kind",
+            "size",
+            "mtime",
+            "mode",
+            "object_key",
+            "version",
+            "etag",
+            "target",
+            "pack_key",
+            "pack_off",
+            "pack_len",
+            "content_hash",
+        ],
+    ),
+    ("superseded_objects", &["object_key", "superseded_at"]),
+    (
+        "packs",
+        &["key", "bytes", "uploaded_at", "state", "unref_since"],
+    ),
+    (
+        "wb_tasks",
+        &[
+            "id",
+            "node_id",
+            "staging",
+            "size",
+            "expected",
+            "state",
+            "attempts",
+            "updated_at",
+            "pack_key",
+            "uploaded_key",
+            "error_class",
+        ],
+    ),
+    (
+        "gc_deletions",
+        &[
+            "id",
+            "key",
+            "kind",
+            "state",
+            "attempts",
+            "last_error",
+            "updated_at",
+        ],
+    ),
+    ("wb_capacity", &["id", "staged_bytes", "reserved_bytes"]),
 ];
 
 /// Column names of `table`; empty when the table does not exist.
@@ -344,16 +496,24 @@ const NODE_COLS: &str = "id, parent_id, name, kind, size, mtime, mode, object_ke
 impl SqliteMetadataStore {
     /// Open (creating if needed) the store and ensure schema + root.
     ///
-    /// A database written by an older build of this lineage — a `nodes`
-    /// table predating AUTOINCREMENT id allocation, or any table/column
-    /// missing from the current single schema — is rejected BEFORE anything
-    /// is written (even the journal-mode pragma): no schema change, no
-    /// rows, no pragma side effects, no partial upgrade. There is
-    /// deliberately no migration: the store must be re-initialized
-    /// (stop the service, unmount all clients, discard the metadata
-    /// database and the object namespace). The check keys on what the
-    /// ENGINE recorded (see [`Self::database_matches_current_schema`]),
-    /// not on the stored SQL text.
+    /// Existing databases are adjudicated read-only BEFORE anything is
+    /// written (even the journal-mode pragma), keying on what the ENGINE
+    /// recorded (see [`Self::database_matches_current_schema`]), never on
+    /// the stored SQL text:
+    ///
+    /// - current schema → open as-is;
+    /// - S4.15.2 schema → the ONE permitted incremental upgrade
+    ///   (S4.16.1): create the `version_candidates` table in a single
+    ///   transaction, then re-verify the full current schema. No data is
+    ///   touched and nothing is backfilled (objects uploaded before
+    ///   S4.16 were never registered; fsck keeps reporting them under
+    ///   the existing safety boundary);
+    /// - anything else — a `nodes` table predating AUTOINCREMENT id
+    ///   allocation, any missing table/column, forged or foreign
+    ///   schemas — is rejected with zero writes: no schema change, no
+    ///   rows, no pragma side effects, no partial upgrade. The store
+    ///   must be re-initialized (stop the service, unmount all clients,
+    ///   discard the metadata database and the object namespace).
     pub fn open(path: &str) -> Result<Self> {
         // S4.3.4b.2: open the CANONICAL identity of the database file, so
         // the connection, the -wal/-shm sidecars and the ledger lock
@@ -377,22 +537,45 @@ impl SqliteMetadataStore {
                 })?;
             Some(crate::fslock::canonical_identity(p, "metadata database")?)
         };
-        let conn = match &db_identity {
+        let mut conn = match &db_identity {
             None => Connection::open(path)?,
             Some(canonical) => Connection::open(canonical)?,
         };
         if any_known_table(&conn)? && !Self::database_matches_current_schema(&conn)? {
-            return Err(Error::Storage(
-                "database schema predates the current schema (AUTOINCREMENT id \
-                 allocation and/or the S4 pack-lifecycle tables: packs.state, \
-                 wb_tasks.pack_key/uploaded_key, gc_deletions). Stable identity \
-                 and the lifecycle invariants are not satisfiable on this \
-                 database. Re-initialize the store (stop the service, unmount \
-                 all clients, discard the metadata database and the test \
-                 object namespace, then start fresh); automatic migration is \
-                 intentionally not supported"
-                    .into(),
-            ));
+            // Not current. Read-only adjudication continues: the ONLY
+            // accepted alternative is the exact S4.15.2 schema, which is
+            // upgraded below. Everything else keeps the S4.2.1 fail-closed
+            // contract — zero writes happened on this connection so far.
+            if !Self::database_matches_s4152_schema(&conn)? {
+                return Err(Error::Storage(
+                    "database schema predates the S4.15.2 schema (AUTOINCREMENT id \
+                     allocation and/or the S4 pack-lifecycle tables: packs.state, \
+                     wb_tasks.pack_key/uploaded_key, gc_deletions) or is otherwise \
+                     malformed. Stable identity and the lifecycle invariants are \
+                     not satisfiable on this database. The ONLY supported upgrade \
+                     is S4.15.2 → current (adding version_candidates); anything \
+                     older: Re-initialize the store (stop the service, unmount \
+                     all clients, discard the metadata database and the test \
+                     object namespace, then start fresh)"
+                        .into(),
+                ));
+            }
+            // Engine-lock ordering: every production open entry acquires
+            // the engine lock BEFORE SQLite is opened (S4.14.1), so this
+            // runs under an established single-writer title. The
+            // migration itself is one idempotent transaction, so even an
+            // unsynchronized second construction serializes on the write
+            // lock and converges.
+            Self::migrate_s416_add_version_candidates(&mut conn)?;
+            // The migration's whole job is to make the CURRENT
+            // verification pass; if it still does not, stop loudly —
+            // never serve a database whose schema this code cannot vouch
+            // for.
+            if !Self::database_matches_current_schema(&conn)? {
+                return Err(Error::Storage(
+                    "post-migration schema verification failed; refusing to open".into(),
+                ));
+            }
         }
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -447,7 +630,21 @@ impl SqliteMetadataStore {
     ///   sqlite_sequence row is out-of-model tampering, the same class as
     ///   external tools writing the table directly.
     fn database_matches_current_schema(conn: &Connection) -> Result<bool> {
-        for (table, required) in REQUIRED_TABLE_COLUMNS {
+        Self::database_matches_required(conn, &REQUIRED_TABLE_COLUMNS)
+    }
+
+    /// The S4.15.2 upgrade-source check (S4.16.1): the same
+    /// definition-level contract (engine-recorded tables/columns + the
+    /// AUTOINCREMENT engine marker) against the previous required list.
+    fn database_matches_s4152_schema(conn: &Connection) -> Result<bool> {
+        Self::database_matches_required(conn, &REQUIRED_TABLE_COLUMNS_THROUGH_S4152)
+    }
+
+    fn database_matches_required(
+        conn: &Connection,
+        required_tables: &[(&str, &[&str])],
+    ) -> Result<bool> {
+        for (table, required) in required_tables {
             let present = table_columns(conn, table)?;
             if required.iter().any(|col| !present.iter().any(|c| c == col)) {
                 return Ok(false);
@@ -464,6 +661,24 @@ impl SqliteMetadataStore {
             )
             .unwrap_or(0);
         Ok(marker > 0)
+    }
+
+    /// S4.16.1 — the ONE permitted incremental migration: S4.15.2 →
+    /// current. Creates the `version_candidates` table inside ONE
+    /// transaction with the exact DDL the current schema declares
+    /// ([`VERSION_CANDIDATES_DDL`], shared with `SCHEMA`, so the two can
+    /// never drift). It touches nothing else: no backfill (objects
+    /// uploaded before S4.16 were never registered — they remain
+    /// fsck-reported under the existing safety boundary), no column
+    /// changes, no rewrite of nodes/packs/wb_tasks/gc_deletions/
+    /// superseded_objects/capacity data. Transactional DDL makes the
+    /// failure shape all-or-nothing: a rolled-back attempt leaves the
+    /// database byte-for-byte S4.15.2, and the next open retries.
+    fn migrate_s416_add_version_candidates(conn: &mut Connection) -> Result<()> {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch(VERSION_CANDIDATES_DDL)?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// In-memory store for tests.
@@ -3045,5 +3260,344 @@ mod tests {
         let m = SqliteMetadataStore::open_in_memory().unwrap();
         assert_eq!(m.synchronous_mode().unwrap(), 2, "in-memory: same policy");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- S4.16.1: the ONE permitted schema upgrade (S4.15.2 → current) ----
+    //
+    // The fixture is SCHEMA_THROUGH_S4152 — the byte-exact DDL of the
+    // S4.15.2-era SCHEMA constant — never "the current schema minus a
+    // piece", so what the upgrade accepts is pinned to the real
+    // historical schema. All tests are pure rusqlite + std::fs: they run
+    // unchanged on Linux and Windows (Windows CI executes them).
+
+    /// Build a REALISTIC S4.15.2 database: the historical schema plus a
+    /// root node, a file node with committed content state, an active
+    /// pack, a queued wb task, a pending deletion intent, a superseded
+    /// object and a capacity ledger row. Returns the file path.
+    fn s4161_build_s4152_db(tag: &str) -> String {
+        let path = temp_path(tag);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_THROUGH_S4152).unwrap();
+        conn.execute_batch(
+            "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, mode, object_key, version, etag)
+             VALUES (1, NULL, '', 'dir', 0, 1, 493, NULL, NULL, NULL),
+                    (42, 1, 'f', 'file', 3, 5, 420, 'objects/42/w-1.data', '7', 'etag-42');
+             INSERT INTO packs (key, bytes, uploaded_at, state, unref_since)
+             VALUES ('packs/p1.data', 100, 9, 'active', NULL);
+             INSERT INTO wb_tasks (id, node_id, staging, size, expected, state, attempts, updated_at, pack_key, uploaded_key, error_class)
+             VALUES (7, 42, '/staging/t7', 3, 6, 'queued', 1, 11, NULL, NULL, NULL);
+             INSERT INTO gc_deletions (id, key, kind, state, attempts, last_error, updated_at)
+             VALUES (3, 'objects/42/w-0.data', 'object', 'pending', 0, NULL, 11);
+             INSERT INTO superseded_objects (object_key, superseded_at)
+             VALUES ('objects/42/w-0.data', 8);
+             INSERT INTO wb_capacity (id, staged_bytes, reserved_bytes) VALUES (1, 3, 0);",
+        )
+        .unwrap();
+        conn.close().unwrap();
+        path
+    }
+
+    /// Everything an observer can see: schema definition text plus every
+    /// row of every table, canonicalized. The "rejection leaves no trace"
+    /// assertion compares this before and after a failed open.
+    fn s4161_snapshot(path: &str) -> String {
+        use rusqlite::types::ValueRef;
+        let conn = Connection::open(path).unwrap();
+        let mut out = String::new();
+        let mut stmt = conn
+            .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+            .unwrap();
+        let rows: Vec<(String, String, Option<String>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for (t, n, s) in rows {
+            out.push_str(&format!("{t}|{n}|{}\n", s.unwrap_or_default()));
+        }
+        for table in [
+            "nodes",
+            "packs",
+            "wb_tasks",
+            "gc_deletions",
+            "superseded_objects",
+            "wb_capacity",
+        ] {
+            out.push_str(table);
+            out.push(':');
+            let mut stmt = conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))
+                .unwrap();
+            let ncols = stmt.column_count();
+            let mut rows = stmt.query([]).unwrap();
+            while let Some(r) = rows.next().unwrap() {
+                for i in 0..ncols {
+                    match r.get_ref(i).unwrap() {
+                        ValueRef::Null => out.push_str("∅|"),
+                        ValueRef::Integer(v) => out.push_str(&format!("{v}|")),
+                        ValueRef::Real(v) => out.push_str(&format!("{v}|")),
+                        ValueRef::Text(v) => {
+                            out.push_str(&String::from_utf8_lossy(v));
+                            out.push('|');
+                        }
+                        ValueRef::Blob(v) => out.push_str(&format!("{:x?}|", v)),
+                    }
+                }
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// §4.1: an S4.15.2 database with real metadata opens on the new
+    /// build; every pre-existing record survives verbatim, the
+    /// candidate table exists (empty — nothing is backfilled), and id
+    /// allocation continues from where the old database left off.
+    #[test]
+    fn s4161_upgrade_from_s4152_preserves_every_row() {
+        let path = s4161_build_s4152_db("s4161-upg");
+        let store = SqliteMetadataStore::open(&path).unwrap();
+        use crate::metadata::MetadataStore as _;
+        // every table's pre-existing rows, read back through the store
+        let node = store.get_node(42).unwrap().unwrap();
+        assert_eq!(node.name, "f");
+        assert_eq!(node.size, 3);
+        assert_eq!(node.version, 7);
+        assert_eq!(node.etag, "etag-42");
+        assert_eq!(node.object_key.as_deref(), Some("objects/42/w-1.data"));
+        let packs = store.all_packs().unwrap();
+        assert_eq!(packs, vec![("packs/p1.data".into(), 100, Some(9))]);
+        let tasks = store.wb_task_rows().unwrap();
+        assert_eq!(
+            tasks,
+            vec![(7i64, "queued".to_string(), 1i64, None::<String>)]
+        );
+        let dels = store.gc_deletion_rows().unwrap();
+        assert_eq!(
+            dels,
+            vec![(
+                "objects/42/w-0.data".to_string(),
+                "object".to_string(),
+                "pending".to_string()
+            )]
+        );
+        assert_eq!(store.all_superseded().unwrap(), vec!["objects/42/w-0.data"]);
+        // the candidate table exists but is EMPTY: history is never
+        // backfilled with invented registrations
+        assert!(store.version_candidate_rows().unwrap().is_empty());
+        // id allocation continues: the old database already issued 42
+        let n = store
+            .create_node(1, "new", crate::metadata::NodeKind::File, 0o644, None)
+            .unwrap();
+        assert_eq!(n.id, 43, "AUTOINCREMENT continues from the old sequence");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// §4.2: on the upgraded database the full S4.16 candidate lifecycle
+    /// works — registration, CAS consumption in the commit transaction,
+    /// the LiveOwned and IntentEnsured retirements.
+    #[test]
+    fn s4161_upgraded_store_runs_full_candidate_lifecycle() {
+        let path = s4161_build_s4152_db("s4161-life");
+        let store = SqliteMetadataStore::open(&path).unwrap();
+        use crate::metadata::{CandidateRetire, MetadataStore as _};
+        // CAS consumption
+        let key = "objects/42/w-2.data";
+        store.register_version_candidate(key, 100).unwrap();
+        assert_eq!(store.version_candidate_rows().unwrap().len(), 1);
+        let n = store
+            .create_node(1, "g", crate::metadata::NodeKind::File, 0o644, None)
+            .unwrap();
+        store
+            .commit_content_cas(n.id, 0, 3, 100, key, "etag")
+            .unwrap();
+        assert!(store.version_candidate_rows().unwrap().is_empty());
+        // LiveOwned: a row for a key a node already references is dropped
+        // WITHOUT an intent
+        let live_key = "objects/42/w-live.data";
+        store
+            .create_node(
+                1,
+                "h",
+                crate::metadata::NodeKind::File,
+                0o644,
+                Some(live_key),
+            )
+            .unwrap();
+        store.register_version_candidate(live_key, 101).unwrap();
+        assert_eq!(
+            store.retire_version_candidate_to_gc(live_key, 102).unwrap(),
+            CandidateRetire::LiveOwned
+        );
+        // no NEW intent appeared (the fixture's own pending intent for
+        // w-0.data is pre-existing and untouched)
+        let dels = store.gc_deletion_rows().unwrap();
+        assert_eq!(dels.len(), 1);
+        assert_eq!(dels[0].0, "objects/42/w-0.data");
+        // IntentEnsured: an unreferenced key gets exactly one durable intent
+        let dead_key = "objects/42/w-dead.data";
+        store.register_version_candidate(dead_key, 103).unwrap();
+        assert_eq!(
+            store.retire_version_candidate_to_gc(dead_key, 104).unwrap(),
+            CandidateRetire::IntentEnsured
+        );
+        let dels = store.gc_deletion_rows().unwrap();
+        assert_eq!(dels.len(), 2, "fixture intent + exactly one new intent");
+        assert!(dels.contains(&(
+            dead_key.to_string(),
+            "object".to_string(),
+            "pending".to_string()
+        )));
+        assert!(store.version_candidate_rows().unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// §4.3: a database that misses ANY required column is still
+    /// rejected, and the rejection leaves zero traces — schema text and
+    /// every row are identical before and after the failed open. A
+    /// forged database (tables present, engine marker deleted) is
+    /// rejected the same way.
+    #[test]
+    fn s4161_malformed_databases_rejected_without_partial_changes() {
+        // case 1: wb_tasks missing the error_class column
+        let path = temp_path("s4161-bad");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_THROUGH_S4152).unwrap();
+            conn.execute("ALTER TABLE wb_tasks DROP COLUMN error_class", [])
+                .unwrap();
+            conn.execute_batch(
+                "INSERT INTO nodes (id, parent_id, name, kind, size, mtime, mode) VALUES (1, NULL, '', 'dir', 0, 1, 493);
+                 INSERT INTO wb_tasks (id, node_id, staging, size, expected, state, attempts, updated_at)
+                 VALUES (7, 1, '/staging/t7', 3, 6, 'queued', 1, 11);",
+            )
+            .unwrap();
+            conn.close().unwrap();
+        }
+        let before = s4161_snapshot(&path);
+        let err = match SqliteMetadataStore::open(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("a wb_tasks database missing error_class must be rejected"),
+        };
+        assert!(
+            err.to_string().contains("predates the S4.15.2 schema"),
+            "wrong rejection: {err}"
+        );
+        assert_eq!(before, s4161_snapshot(&path), "rejection must not write");
+        let _ = std::fs::remove_file(&path);
+
+        // case 2: schema-shaped but the AUTOINCREMENT engine marker is gone
+        let path = s4161_build_s4152_db("s4161-forged");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute("DELETE FROM sqlite_sequence WHERE name = 'nodes'", [])
+                .unwrap();
+            conn.close().unwrap();
+        }
+        assert!(SqliteMetadataStore::open(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// §4.4: a database already on the current schema reopens cleanly —
+    /// the migration is not re-run, the table exists exactly once, and
+    /// nothing is duplicated.
+    #[test]
+    fn s4161_current_schema_reopen_is_idempotent() {
+        let path = temp_path("s4161-idem");
+        {
+            let store = SqliteMetadataStore::open(&path).unwrap();
+            use crate::metadata::MetadataStore as _;
+            store
+                .create_node(1, "a", crate::metadata::NodeKind::File, 0o644, None)
+                .unwrap();
+        }
+        {
+            let store = SqliteMetadataStore::open(&path).unwrap();
+            use crate::metadata::MetadataStore as _;
+            // reopen works; the candidate table is present and empty
+            assert!(store.version_candidate_rows().unwrap().is_empty());
+            // the root seed did not duplicate
+            let root = store.get_node(1).unwrap().unwrap();
+            assert_eq!(root.name, "");
+            // and the lifecycle still works end to end
+            let key = "objects/5/w-1.data";
+            store.register_version_candidate(key, 1).unwrap();
+            let n = store
+                .create_node(1, "b", crate::metadata::NodeKind::File, 0o644, None)
+                .unwrap();
+            store.commit_content_cas(n.id, 0, 1, 2, key, "e").unwrap();
+            assert!(store.version_candidate_rows().unwrap().is_empty());
+        }
+        // exactly ONE version_candidates table definition exists
+        let conn = Connection::open(&path).unwrap();
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'version_candidates'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// §4.5: a migration that fails mid-transaction leaves NO half-migrated
+    /// state — the database stays byte-for-byte S4.15.2 (schema text and
+    /// rows identical), and the retry completes the upgrade cleanly.
+    /// Failure is injected the way production actually fails: a second
+    /// connection holds an EXCLUSIVE lock, so the migration's
+    /// BEGIN IMMEDIATE cannot take the write lock (fresh connections have
+    /// no busy timeout — it fails immediately, connection-local, no
+    /// timing, no platform permissions).
+    #[test]
+    fn s4161_migration_failure_is_atomic_and_retry_converges() {
+        let path = s4161_build_s4152_db("s4161-fail");
+        {
+            let blocker = Connection::open(&path).unwrap();
+            blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+            {
+                let mut conn = Connection::open(&path).unwrap();
+                // the migration fails as a WHOLE (write lock unavailable)
+                assert!(
+                    SqliteMetadataStore::migrate_s416_add_version_candidates(&mut conn).is_err()
+                );
+            }
+            // release the lock before inspecting: an EXCLUSIVE holder also
+            // blocks other connections' reads in rollback-journal mode
+            blocker.execute_batch("ROLLBACK").unwrap();
+            blocker.close().unwrap();
+            let conn = Connection::open(&path).unwrap();
+            // no half state: no table, pre-existing rows untouched
+            let present: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'version_candidates'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 0, "a failed migration must leave no table");
+            let data: i64 = conn
+                .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(data, 2, "pre-existing rows untouched");
+            conn.close().unwrap();
+        }
+        let store = SqliteMetadataStore::open(&path).unwrap();
+        use crate::metadata::MetadataStore as _;
+        assert!(store.get_node(42).unwrap().is_some());
+        assert!(store.version_candidate_rows().unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The current SCHEMA is byte-exact the S4.15.2 base plus the S4.16
+    /// DDL — the constant cannot drift from what the one permitted
+    /// migration creates.
+    #[test]
+    fn s4161_schema_is_base_plus_candidate_ddl() {
+        assert_eq!(
+            SCHEMA,
+            format!("{SCHEMA_THROUGH_S4152}{VERSION_CANDIDATES_DDL}")
+        );
     }
 }
