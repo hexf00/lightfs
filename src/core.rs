@@ -1051,7 +1051,10 @@ impl Core {
         // without a tracking row. Registration failure aborts the write
         // (nothing was uploaded yet), with the create-if-missing phantom
         // cleanup the PUT-failure arm would have done.
-        if let Err(e) = self.meta.register_version_candidate(&version_key, self.now()) {
+        if let Err(e) = self
+            .meta
+            .register_version_candidate(&version_key, self.now())
+        {
             if drop_created_node {
                 let _ = self.meta.delete_node(node.id);
             }

@@ -27,7 +27,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use lightfs::core::Core;
 use lightfs::error::{Error, Result};
-use lightfs::metadata::{CandidateRetire, MetadataStore, Node, NodeKind, sqlite::SqliteMetadataStore};
+use lightfs::metadata::{
+    CandidateRetire, MetadataStore, Node, NodeKind, sqlite::SqliteMetadataStore,
+};
 use lightfs::object_store::{
     ListPage, ObjectData, ObjectInfo, ObjectStore, Range, mem::MemObjectStore,
 };
