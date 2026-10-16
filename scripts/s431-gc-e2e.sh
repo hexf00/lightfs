@@ -32,7 +32,15 @@ BODY_C="superseded content C for real gc"
 
 s3() { # s3 METHOD KEY|BUCKET-URL [body]
   local method="$1" url="$2" body="${3-}"
-  if [ -n "$body" ]; then
+  # HEAD must go through `curl -I` (real HEAD mode): `curl -X HEAD` still
+  # speaks the with-body request shape (Content-Length: 0 on the wire) and
+  # MinIO then stalls that request for its full 30s body timeout — seen
+  # live as ~30s per HEAD with every other verb sub-2ms. -I is equivalent
+  # and instant.
+  if [ "$method" = "HEAD" ]; then
+    curl -s -I -o /dev/null -w "%{http_code}" --aws-sigv4 "aws:amz:$REGION:s3" \
+      --user "$AK:$SK" "$ENDPOINT/$url"
+  elif [ -n "$body" ]; then
     curl -s -o /dev/null -w "%{http_code}" -X "$method" --aws-sigv4 "aws:amz:$REGION:s3" \
       --user "$AK:$SK" --data-binary "$body" -H "Content-Type: application/octet-stream" \
       "$ENDPOINT/$url"
