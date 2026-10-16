@@ -257,6 +257,25 @@ pub trait MetadataStore: Send + Sync {
         let _ = (key, now);
         Ok(false)
     }
+    /// Register deletion intent for a STALE-UPLOAD pack: a `building` row
+    /// whose seal died (upload failed with the object possibly persisted
+    /// server-side, or a crash between the PUT and `mark_pack_uploaded`).
+    /// One transaction re-checks the full predicate — row still `building`
+    /// AND no live node references the key — flips the row to `deleting`
+    /// (from which `ref_new` refuses new references, mirroring the normal
+    /// pack path), and records the durable `kind='pack'` intent. False =
+    /// not eligible (already transitioned, referenced, or no row).
+    ///
+    /// A `building` pack can never be referenced (ref_new refuses every
+    /// state except committing/active), so the object behind a stale row is
+    /// unreferenced garbage by construction; the caller must still prove
+    /// single-writer ownership (engine lock) before calling — a row that is
+    /// merely YOUNG may belong to a live seal, and only ownership rules that
+    /// out.
+    fn gc_register_stale_pack_deletion(&self, key: &str, now: i64) -> Result<bool> {
+        let _ = (key, now);
+        Ok(false)
+    }
     /// Register deletion intent for a superseded per-file object: re-checks
     /// the superseded row exists AND no live node references the key.
     fn gc_register_superseded_deletion(&self, key: &str, now: i64) -> Result<bool> {

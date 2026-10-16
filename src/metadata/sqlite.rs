@@ -1129,6 +1129,38 @@ impl MetadataStore for SqliteMetadataStore {
         Ok(true)
     }
 
+    fn gc_register_stale_pack_deletion(&self, key: &str, now: i64) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Same shape as gc_register_pack_deletion, keyed on `building`
+        // instead of `unreferenced`: the stale-upload arm of the lifecycle.
+        // Predicate re-checked INSIDE the transaction, flip and intent
+        // commit atomically — a row is never left referenced-then-deleting.
+        let ok: bool = tx
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM packs WHERE key = ?1 AND state = 'building') \
+                 AND NOT EXISTS (SELECT 1 FROM nodes WHERE object_key = ?1)",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !ok {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE packs SET state = 'deleting' WHERE key = ?1 AND state = 'building'",
+            params![key],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO gc_deletions (key, kind, state, updated_at) \
+             VALUES (?1, 'pack', 'pending', ?2)",
+            params![key, now],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     fn gc_register_superseded_deletion(&self, key: &str, now: i64) -> Result<bool> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;

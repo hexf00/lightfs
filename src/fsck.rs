@@ -37,7 +37,11 @@ pub struct FsckReport {
     /// S3.1: distinct pack objects still referenced by live nodes.
     pub live_packs: usize,
     /// S3.1: registered packs never uploaded (pending rows = dead-server
-    /// mid-upload leftovers; visible, gc ignores them).
+    /// mid-upload leftovers; visible, gc ignores them). S4.10: rows are
+    /// enumerated directly, so a row WITHOUT its object is reported too —
+    /// a crash between `register_pack` and the PUT, or a stale row whose
+    /// object the sweep already reclaimed. Startup recovery and the gc
+    /// stale-pack sweep resolve these; fsck only reports.
     pub pending_packs: Vec<String>,
 }
 
@@ -189,9 +193,11 @@ pub fn fsck(core: &Core) -> Result<FsckReport> {
         .map(|(k, _, up)| (k, up))
         .collect();
     let mut token = None;
+    let mut bucket_packs: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
         let page = core.objects().list("packs/", token.as_deref(), 1000)?;
         for item in &page.items {
+            bucket_packs.insert(item.key.clone());
             if live_keys.contains(&item.key) {
                 continue;
             }
@@ -199,9 +205,10 @@ pub fn fsck(core: &Core) -> Result<FsckReport> {
                 Some(Some(_)) => report
                     .unreferenced_packs
                     .push(format!("{} ({}B)", item.key, item.size)),
-                Some(None) => report
-                    .pending_packs
-                    .push(format!("{} (registered, never uploaded)", item.key)),
+                Some(None) => report.pending_packs.push(format!(
+                    "{} ({}B, pending row, object present — sweep adjudicates)",
+                    item.key, item.size
+                )),
                 None => report
                     .orphan_objects
                     .push(format!("{} ({}B, pack without row)", item.key, item.size)),
@@ -210,6 +217,22 @@ pub fn fsck(core: &Core) -> Result<FsckReport> {
         match page.next_token {
             Some(t) => token = Some(t),
             None => break,
+        }
+    }
+    // S4.10: rows the bucket listing cannot show — a row without its object
+    // (crash between register_pack and the PUT; a stale row the sweep has
+    // not dropped yet). The old bucket-driven walk was blind to these.
+    for (key, _bytes, uploaded_at) in core.metadata().all_packs()? {
+        if bucket_packs.contains(&key) || live_keys.contains(&key) {
+            continue;
+        }
+        match uploaded_at {
+            None => report
+                .pending_packs
+                .push(format!("{key} (registered, object absent)")),
+            Some(_) => report
+                .pending_packs
+                .push(format!("{key} (row only, object absent)")),
         }
     }
     let mut token = None;
@@ -397,5 +420,42 @@ mod tests {
         assert_eq!(r2.missing_objects.len(), 1);
         assert_eq!(r2.orphan_objects.len(), 1);
         assert_eq!(r2.stale_versions.len(), 1);
+    }
+
+    /// S4.10: fsck enumerates pack ROWS, not just bucket objects — a row
+    /// without its object (crash between register_pack and the PUT) was
+    /// invisible before. The pending labels distinguish what the sweep
+    /// will find: object absent (row drop) vs object present (HEAD + intent).
+    #[test]
+    fn s410_fsck_reports_pack_rows_and_pending_labels() {
+        let c = core();
+        c.metadata().register_pack("packs/absent.data", 5).unwrap();
+        c.metadata().register_pack("packs/pending.data", 5).unwrap();
+        c.objects().put("packs/pending.data", b"xyz").unwrap();
+        // rowless bucket pack stays the fsck-visible orphan it always was
+        c.objects().put("packs/rowless.data", b"zzz").unwrap();
+
+        let r = fsck(&c).unwrap();
+        assert!(
+            r.pending_packs
+                .iter()
+                .any(|s| s.starts_with("packs/absent.data") && s.contains("object absent")),
+            "{:?}",
+            r.pending_packs
+        );
+        assert!(
+            r.pending_packs
+                .iter()
+                .any(|s| s.starts_with("packs/pending.data") && s.contains("object present")),
+            "{:?}",
+            r.pending_packs
+        );
+        assert!(
+            r.orphan_objects
+                .iter()
+                .any(|s| s.starts_with("packs/rowless.data")),
+            "{:?}",
+            r.orphan_objects
+        );
     }
 }

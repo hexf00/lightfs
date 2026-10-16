@@ -327,7 +327,15 @@ impl PackEngine {
                 }
             }
             Err(err) => {
-                let _ = self.meta.drop_pack(&key);
+                // S4.10: the pack row SURVIVES a failed upload. A PUT error
+                // is uncertain — the object may or may not exist server-side
+                // — so dropping the row here would orphan a possibly-existing
+                // packs/ object with no tracking record at all (fsck's
+                // "pack without row" dead end). The building row is the
+                // durable tracker; startup recovery and `lightfs gc`'s
+                // stale-pack sweep adjudicate it via the HEAD three-state
+                // contract (absent → row dropped; exists → durable deletion
+                // intent; cannot tell → row kept for the next pass).
                 let err = Arc::new(err);
                 for e in entries {
                     e.slot.resolve(Err(clone_error(&err)));
@@ -736,5 +744,320 @@ mod tests {
         assert_eq!(c.read("/f", 0, 100).unwrap(), b"second generation content");
         // old pack object still exists (retention), old key intact
         assert!(c.objects().head(&old_key).is_ok());
+    }
+
+    // ---- S4.10: strict pack orphan lifecycle. Fault injection over the
+    // ObjectStore: an "uncertain" PUT stores the bytes and THEN reports
+    // failure (the server may have persisted them), a "dead" PUT fails
+    // without storing, a "dead" HEAD makes the three-state adjudication
+    // fail closed.
+
+    struct FlakyObjects {
+        inner: MemObjectStore,
+        uncertain_put: std::sync::atomic::AtomicBool,
+        dead_put: std::sync::atomic::AtomicBool,
+        dead_head: std::sync::atomic::AtomicBool,
+    }
+
+    impl FlakyObjects {
+        fn new() -> Self {
+            Self {
+                inner: MemObjectStore::new(),
+                uncertain_put: std::sync::atomic::AtomicBool::new(false),
+                dead_put: std::sync::atomic::AtomicBool::new(false),
+                dead_head: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl ObjectStore for FlakyObjects {
+        fn put(&self, key: &str, data: &[u8]) -> Result<crate::object_store::ObjectInfo> {
+            if self.dead_put.swap(false, Ordering::SeqCst) {
+                return Err(Error::Storage(
+                    "injected: put failed, nothing stored".into(),
+                ));
+            }
+            let info = self.inner.put(key, data)?;
+            if self.uncertain_put.swap(false, Ordering::SeqCst) {
+                return Err(Error::Storage(
+                    "injected: timeout after the server persisted".into(),
+                ));
+            }
+            Ok(info)
+        }
+        fn put_stream(
+            &self,
+            key: &str,
+            reader: &mut dyn std::io::Read,
+            len: u64,
+        ) -> Result<crate::object_store::ObjectInfo> {
+            self.inner.put_stream(key, reader, len)
+        }
+        fn get(
+            &self,
+            key: &str,
+            range: Option<crate::object_store::Range>,
+        ) -> Result<crate::object_store::ObjectData> {
+            self.inner.get(key, range)
+        }
+        fn get_stream(
+            &self,
+            key: &str,
+            range: Option<crate::object_store::Range>,
+        ) -> Result<(Box<dyn std::io::Read + Send>, u64)> {
+            self.inner.get_stream(key, range)
+        }
+        fn head(&self, key: &str) -> Result<crate::object_store::ObjectInfo> {
+            if self.dead_head.swap(false, Ordering::SeqCst) {
+                return Err(Error::Storage("injected: head unavailable".into()));
+            }
+            self.inner.head(key)
+        }
+        fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key)
+        }
+        fn list(
+            &self,
+            prefix: &str,
+            token: Option<&str>,
+            max: usize,
+        ) -> Result<crate::object_store::ListPage> {
+            self.inner.list(prefix, token, max)
+        }
+        fn ping(&self) -> Result<()> {
+            self.inner.ping()
+        }
+    }
+
+    fn flaky_core(flaky: &StdArc<FlakyObjects>) -> Core {
+        let cfg = PackSection {
+            enabled: true,
+            max_bytes: 1024 * 1024,
+            max_age_ms: 0,
+            ..PackSection::default()
+        };
+        Core::with_options(
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            flaky.clone(),
+            crate::core::DEFAULT_SUPERSEDED_SECS,
+            Some(cfg),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn commit_err(c: &Core, path: &str, data: &[u8]) -> Error {
+        c.create(path, 0o644).unwrap();
+        let v = c.lookup(path).unwrap().version;
+        let h = c.open_write(path, Some(v)).unwrap();
+        c.write(&h, 0, data).unwrap();
+        c.commit_write(&h).unwrap_err()
+    }
+
+    /// S4.10 scenario 3/4: the PUT "fails" AFTER the server persisted the
+    /// bytes. The pack row must survive as the durable tracker (the old
+    /// drop_pack left a rowless object fsck could only mourn), the sweep
+    /// proves existence via HEAD and enrolls the durable deletion intent,
+    /// and the gated executor reclaims object + row. Idempotent afterwards.
+    #[test]
+    fn s410_uncertain_put_keeps_tracker_row_sweep_reclaims() {
+        let flaky = StdArc::new(FlakyObjects::new());
+        flaky.uncertain_put.store(true, Ordering::SeqCst);
+        let c = flaky_core(&flaky);
+        let err = commit_err(&c, "/f", b"abc");
+        assert!(format!("{err}").contains("timeout"), "{err}");
+
+        let packs = c.metadata().all_packs().unwrap();
+        assert_eq!(packs.len(), 1, "the row survives as the tracker");
+        let key = packs[0].0.clone();
+        assert!(packs[0].2.is_none(), "row still building (never marked)");
+        assert!(
+            flaky.head(&key).is_ok(),
+            "the object was persisted despite the reported failure"
+        );
+
+        let s = c.recover_stale_packs().unwrap();
+        assert_eq!(s.enrolled_stale, 1, "{s:?}");
+        assert_eq!(
+            c.metadata().pack_state(&key).unwrap().unwrap().0,
+            "deleting",
+            "the flip refuses new references from now on"
+        );
+        // this sweep pass also HEADs the row again — now `deleting`, not
+        // `building` (uploaded_at still NULL but the state arm no longer
+        // matches; enrollment is guarded, not repeated). The intent is the
+        // single durable record.
+        let (done, failed, _) = c.gc_execute_deletions(10, &HashSet::new()).unwrap();
+        assert_eq!((done, failed), (1, 0));
+        assert!(
+            c.metadata().pack_state(&key).unwrap().is_none(),
+            "row goes with the object"
+        );
+        assert!(flaky.head(&key).is_err(), "object reclaimed");
+        // idempotent: nothing left to adjudicate
+        let s2 = c.recover_stale_packs().unwrap();
+        assert_eq!(
+            (s2.enrolled_stale, s2.dropped_building, s2.head_unavailable),
+            (0, 0, 0)
+        );
+    }
+
+    use std::collections::HashSet;
+
+    /// S4.10 scenario 1/2: the PUT failed and nothing was persisted. The
+    /// sweep drops the tracker row after a definitive 404 — no deletion
+    /// intent is recorded, because there is nothing to delete.
+    #[test]
+    fn s410_absent_object_row_dropped_without_intent() {
+        let flaky = StdArc::new(FlakyObjects::new());
+        flaky.dead_put.store(true, Ordering::SeqCst);
+        let c = flaky_core(&flaky);
+        commit_err(&c, "/f", b"abc");
+
+        let packs = c.metadata().all_packs().unwrap();
+        assert_eq!(packs.len(), 1, "row survives the failed upload");
+        let key = packs[0].0.clone();
+
+        let s = c.recover_stale_packs().unwrap();
+        assert_eq!(s.dropped_building, 1, "{s:?}");
+        assert_eq!(s.enrolled_stale, 0, "nothing exists → no deletion intent");
+        assert!(c.metadata().pack_state(&key).unwrap().is_none());
+        assert!(c.metadata().gc_claim_deletions(10, 1).unwrap().is_empty());
+    }
+
+    /// HEAD "cannot tell" is fail-closed: the row and the chance to enroll
+    /// survive for the next pass; once HEAD works again the same row
+    /// converges. Never a delete-on-uncertain.
+    #[test]
+    fn s410_head_unavailable_keeps_row_next_pass_converges() {
+        let flaky = StdArc::new(FlakyObjects::new());
+        let c = flaky_core(&flaky);
+        // A stale upload left behind WITHOUT injection on the live path:
+        // register + put (object exists) and no mark — exactly what a crash
+        // between the PUT and mark_pack_uploaded leaves.
+        let key = "packs/p-s410-head.data";
+        c.metadata().register_pack(key, 3).unwrap();
+        flaky.put(key, b"abc").unwrap();
+
+        flaky.dead_head.store(true, Ordering::SeqCst);
+        let s = c.recover_stale_packs().unwrap();
+        assert_eq!(s.head_unavailable, 1, "{s:?}");
+        assert_eq!(
+            c.metadata().pack_state(key).unwrap().unwrap().0,
+            "building",
+            "fail-closed: the row is kept"
+        );
+
+        let s2 = c.recover_stale_packs().unwrap();
+        assert_eq!(s2.enrolled_stale, 1, "{s2:?}");
+        assert_eq!(c.metadata().pack_state(key).unwrap().unwrap().0, "deleting");
+    }
+
+    /// S4.10 scenario 7: a crash after SOME member CASes applied. The
+    /// synchronous finalize makes this window structurally empty in strict
+    /// mode — the FIRST successful CAS resolves the batch to `active`
+    /// (pack_ref_new_tx → finalize, refs>0) inside its own transaction —
+    /// so the restart sweep finds nothing to finalize and nothing to
+    /// reclaim: object and live node intact, never gc-eligible.
+    #[test]
+    fn s410_partial_cas_crash_finalizes_to_active() {
+        let dir = std::env::temp_dir().join(format!(
+            "lightfs-s410-partial-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("meta.db");
+        let store: StdArc<dyn ObjectStore> = StdArc::new(MemObjectStore::new());
+        let cfg = PackSection {
+            enabled: true,
+            max_bytes: 1024 * 1024,
+            max_age_ms: 0,
+            ..PackSection::default()
+        };
+
+        let meta1 = StdArc::new(SqliteMetadataStore::open(db.to_str().unwrap()).unwrap());
+        let c1 = Core::with_options(
+            meta1,
+            store.clone(),
+            crate::core::DEFAULT_SUPERSEDED_SECS,
+            Some(cfg.clone()),
+            None,
+        )
+        .unwrap();
+        c1.create("/f", 0o644).unwrap();
+        let node = c1.lookup("/f").unwrap();
+        let key = "packs/p-s410-partial.pack";
+        // The seal, frozen mid-flight: uploaded + marked (committing), the
+        // first member's CAS applied, the process "dies" before the rest.
+        c1.metadata().register_pack(key, 3).unwrap();
+        store.put(key, b"abc").unwrap();
+        c1.metadata().mark_pack_uploaded(key, 1).unwrap();
+        c1.metadata()
+            .commit_content_cas_pack(node.id, node.version, 3, 1, key, 0, 3, "h")
+            .unwrap();
+        drop(c1);
+
+        // Restart: the sweep finalizes the abandoned batch.
+        let meta2 = StdArc::new(SqliteMetadataStore::open(db.to_str().unwrap()).unwrap());
+        let c2 = Core::with_options(
+            meta2,
+            store.clone(),
+            crate::core::DEFAULT_SUPERSEDED_SECS,
+            Some(cfg),
+            None,
+        )
+        .unwrap();
+        let s = c2.recover_stale_packs().unwrap();
+        assert_eq!(s.finalized_committing, 0, "the CAS already finalized it");
+        assert_eq!(
+            c2.metadata().pack_state(key).unwrap().unwrap().0,
+            "active",
+            "live reference survives → active, never gc-eligible"
+        );
+        assert_eq!(c2.read("/f", 0, 3).unwrap(), b"abc");
+        assert!(
+            c2.metadata()
+                .gc_pack_candidates(i64::MAX, 10)
+                .unwrap()
+                .is_empty(),
+            "a referenced pack is never a candidate"
+        );
+        let s2 = c2.recover_stale_packs().unwrap();
+        assert_eq!(s2.finalized_committing, 0, "idempotent");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S4.10 scenario 6, zero-references variant: the crash happened before
+    /// ANY member CAS. The finalize makes the pack `unreferenced`, and the
+    /// normal retention-gated gc pipeline reclaims object + row.
+    #[test]
+    fn s410_committing_zero_refs_flows_through_gc() {
+        let c = pack_core(1024 * 1024, 3_000, 0);
+        let key = "packs/p-s410-zero.pack";
+        c.metadata().register_pack(key, 3).unwrap();
+        c.objects().put(key, b"abc").unwrap();
+        c.metadata().mark_pack_uploaded(key, 1).unwrap();
+
+        let s = c.recover_stale_packs().unwrap();
+        assert_eq!(s.finalized_committing, 1);
+        let (state, unref) = c.metadata().pack_state(key).unwrap().unwrap();
+        assert_eq!(state, "unreferenced");
+        assert!(unref.is_some(), "retention window starts at the sweep");
+
+        let cands = c.metadata().gc_pack_candidates(i64::MAX, 10).unwrap();
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].0, key);
+        assert_eq!(
+            c.gc_enroll_candidates(i64::MAX, &HashSet::new()).unwrap(),
+            (1, 0)
+        );
+        let (done, failed, _) = c.gc_execute_deletions(10, &HashSet::new()).unwrap();
+        assert_eq!((done, failed), (1, 0));
+        assert!(c.metadata().pack_state(key).unwrap().is_none());
+        assert!(c.objects().head(key).is_err());
     }
 }

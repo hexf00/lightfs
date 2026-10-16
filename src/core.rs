@@ -77,6 +77,10 @@ pub struct Core {
     pack: Option<Arc<PackEngine>>,
     pack_cache: Option<Arc<PackReadCache>>,
     wb: Option<Arc<WriteBackEngine>>,
+    /// S4.10: single-writer engine lock for non-write-back engines (strict
+    /// mode). Write-back engines hold their own lock inside the engine.
+    /// Holding the struct holds the kernel lock; process death releases it.
+    _engine_lock: Option<crate::fslock::FileLock>,
 }
 
 /// Default retention window for superseded objects: 7 days.
@@ -181,6 +185,7 @@ impl Core {
             pack: None,
             pack_cache: None,
             wb: None,
+            _engine_lock: None,
         }
     }
 
@@ -229,6 +234,7 @@ impl Core {
             pack: pack_engine.as_ref().map(|(e, _)| e.clone()),
             pack_cache: pack_engine.and_then(|(_, c)| c),
             wb: wb_engine,
+            _engine_lock: None,
         })
     }
 
@@ -410,6 +416,34 @@ impl Core {
             }
         }
         Ok((done, failed, skipped_protected))
+    }
+
+    /// Execute the stale-pack lifecycle sweep: finalize `committing` rows a
+    /// crash left behind and adjudicate `building` rows (registered but
+    /// never marked uploaded) via the HEAD three-state contract.
+    ///
+    /// SAFETY CONTRACT (S4.10): the caller must hold the engine lock —
+    /// single-writer ownership of the metadata store. Under ownership a
+    /// `building`/`committing` row cannot belong to an in-flight seal: the
+    /// only two producers are the strict seal and the batch drain, and both
+    /// run inside the lock-holding engine. Production callers:
+    /// `WriteBackEngine::recover` (startup; the engine has held
+    /// `<db>.engine-lock` since construction) and `lightfs gc`'s stale-pack
+    /// phase (non-blocking acquire; skipped while a live engine holds it).
+    ///
+    /// Per-row outcomes are fail-closed: HEAD "cannot tell" keeps the row
+    /// and the intent for the next pass; only a definitive 404 drops a
+    /// building row (no object was ever persisted), and only a definitive
+    /// existence proof enrolls the durable `kind='pack'` deletion intent.
+    pub(crate) fn recover_stale_packs(&self) -> Result<StalePackSweep> {
+        recover_stale_packs(&self.meta, &self.objects)
+    }
+
+    /// Take over the single-writer engine lock for a non-write-back engine
+    /// (strict mode). Held for the Core's lifetime; a second engine on the
+    /// same database is refused at startup instead of silently sharing it.
+    pub(crate) fn hold_engine_lock(&mut self, lock: crate::fslock::FileLock) {
+        self._engine_lock = Some(lock);
     }
 
     pub fn objects(&self) -> &Arc<dyn ObjectStore> {
@@ -1400,6 +1434,81 @@ impl Core {
         node.mtime = mtime;
         Ok(node)
     }
+}
+
+/// Outcome counters of one stale-pack lifecycle sweep (S4.10).
+#[derive(Debug, Default, Clone)]
+pub struct StalePackSweep {
+    /// `committing` rows finalized to active/unreferenced (crash leftovers).
+    pub finalized_committing: usize,
+    /// `building` rows dropped after HEAD confirmed the object absent.
+    pub dropped_building: usize,
+    /// Stale uploads enrolled as durable `kind='pack'` deletion intents
+    /// (HEAD confirmed the object exists).
+    pub enrolled_stale: usize,
+    /// Rows left untouched because HEAD could not tell (fail-closed).
+    pub head_unavailable: usize,
+}
+
+/// Shared implementation of [`Core::recover_stale_packs`] — free so the
+/// write-back engine's startup recovery can run the identical sweep against
+/// its own meta/objects handles. See the Core method for the ownership
+/// contract every caller must satisfy.
+pub(crate) fn recover_stale_packs(
+    meta: &Arc<dyn MetadataStore>,
+    objects: &Arc<dyn ObjectStore>,
+) -> Result<StalePackSweep> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let mut s = StalePackSweep::default();
+    // 1. Batches a crash left in `committing` finalize through the same
+    // verify-references-then-decide transaction the drain uses (P0-a
+    // recovery sweep, now also on strict engines).
+    for pk in meta.committing_packs()? {
+        meta.wb_finalize_batch_if_terminal(&pk, now)?;
+        s.finalized_committing += 1;
+    }
+    // 2. `building` rows (registered, never marked uploaded): the durable
+    // tracker of an upload that failed uncertainly or crashed mid-flight.
+    // uploaded_at IS NULL exactly when the row is still `building` (the
+    // mark flips both in one UPDATE), so all_packs() is the row source.
+    for (key, _bytes, uploaded_at) in meta.all_packs()? {
+        if uploaded_at.is_some() {
+            continue;
+        }
+        match objects.head(&key) {
+            Ok(_) => match meta.gc_register_stale_pack_deletion(&key, now) {
+                Ok(true) => {
+                    eprintln!(
+                        "lightfs: stale pack upload {key}: object exists, enrolled for deletion"
+                    );
+                    s.enrolled_stale += 1;
+                }
+                Ok(false) => {}
+                Err(e) => eprintln!(
+                    "lightfs: stale pack upload {key}: could not record deletion intent: {e} (row kept)"
+                ),
+            },
+            Err(Error::ObjectMissing(_)) => match meta.drop_pack(&key) {
+                Ok(()) => {
+                    eprintln!("lightfs: stale pack row {key} dropped (object confirmed absent)");
+                    s.dropped_building += 1;
+                }
+                Err(e) => eprintln!(
+                    "lightfs: stale pack row {key}: could not drop: {e} (kept for next pass)"
+                ),
+            },
+            Err(e) => {
+                eprintln!(
+                    "lightfs: stale pack upload {key}: head unavailable ({e}); row kept for next pass"
+                );
+                s.head_unavailable += 1;
+            }
+        }
+    }
+    Ok(s)
 }
 
 #[cfg(test)]

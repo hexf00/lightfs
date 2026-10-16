@@ -104,6 +104,20 @@ pub fn gc(cfg: &Config) -> Result<()> {
     // and drains nothing and must run while the live server owns the
     // staging directory and the capacity ledger.
     let eng = engine::open_embedded_maintenance(cfg)?;
+    match gc_stale_pack_phase(&eng.core, cfg)? {
+        Some(sweep) => println!(
+            "gc: stale packs: {} committing finalized, {} building row(s) dropped, \
+             {} stale upload(s) enrolled, {} head unavailable (kept)",
+            sweep.finalized_committing,
+            sweep.dropped_building,
+            sweep.enrolled_stale,
+            sweep.head_unavailable,
+        ),
+        None => println!(
+            "gc: stale packs: sweep skipped — a live engine holds the engine lock; \
+             its own startup recovery and the next gc pass cover the rows"
+        ),
+    }
     let summary = gc_run(
         &eng.core,
         cfg.backup.root.as_deref(),
@@ -123,6 +137,22 @@ pub fn gc(cfg: &Config) -> Result<()> {
         summary.skipped_protected,
     );
     Ok(())
+}
+
+/// S4.10 stale-pack phase of `lightfs gc`: adjudicate `building`/`committing`
+/// pack rows left by failed uploads or crashes, BEFORE the enroll/execute
+/// pass so intents recorded here are drained by THIS gc run. Safety requires
+/// single-writer ownership, which is only provable while NO engine holds the
+/// engine lock (i.e. the owning server is stopped): a live server keeps its
+/// lock, the phase is skipped and `None` is returned.
+pub(crate) fn gc_stale_pack_phase(
+    core: &crate::core::Core,
+    cfg: &Config,
+) -> Result<Option<crate::core::StalePackSweep>> {
+    match crate::fslock::FileLock::try_acquire(&engine::engine_lock_path(cfg)?) {
+        Ok(_lock) => Ok(Some(core.recover_stale_packs()?)),
+        Err(_) => Ok(None),
+    }
 }
 
 fn now_secs() -> i64 {

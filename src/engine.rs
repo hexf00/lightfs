@@ -60,6 +60,20 @@ fn resolve_wb_workers(configured: usize, env: Option<&str>) -> Result<usize> {
     Ok(workers)
 }
 
+/// The single-writer engine lock path for a config — the same derivation
+/// the write-back engine uses (`<canonical db path>.engine-lock`), shared so
+/// strict-mode engines (S4.10) and write-back engines contend on ONE lock.
+pub(crate) fn engine_lock_path(cfg: &Config) -> Result<std::path::PathBuf> {
+    let db_identity = crate::fslock::canonical_identity(
+        std::path::Path::new(&cfg.metadata.path),
+        "metadata database",
+    )?;
+    Ok(std::path::PathBuf::from(format!(
+        "{}.engine-lock",
+        db_identity.display()
+    )))
+}
+
 /// Build the Core from config, wiring the S3.1 prototype engines (pack /
 /// write-back) when enabled. Shared by embedded and server startup.
 /// `enable_wb = false` (maintenance commands) never constructs the
@@ -100,7 +114,7 @@ fn build_core(
     } else {
         None
     };
-    let core = Core::with_options(meta, objects, cfg.retention.superseded_secs, pack, wb)?;
+    let mut core = Core::with_options(meta, objects, cfg.retention.superseded_secs, pack, wb)?;
     if core.wb().is_some() {
         core.wb().unwrap().recover()?;
         let workers = resolve_wb_workers(
@@ -108,6 +122,30 @@ fn build_core(
             std::env::var("LIGHTFS_WB_WORKERS").ok().as_deref(),
         )?;
         core.start_wb_workers(workers);
+    } else if enable_wb {
+        // S4.10: strict-mode engines take the single-writer engine lock too
+        // (write-back engines acquire it inside their constructor; maintenance
+        // commands never construct an engine and stay lock-free). Two engines
+        // on one database now fail loudly at startup instead of silently
+        // corrupting each other's packs. Holding the lock is also what makes
+        // the startup stale-pack sweep safe: a building/committing row cannot
+        // belong to an in-flight seal of a dead writer once we own the lock.
+        let lock = crate::fslock::FileLock::try_acquire(&engine_lock_path(cfg)?)?;
+        let sweep = core.recover_stale_packs()?;
+        if sweep.finalized_committing > 0
+            || sweep.dropped_building > 0
+            || sweep.enrolled_stale > 0
+            || sweep.head_unavailable > 0
+        {
+            eprintln!(
+                "lightfs: startup stale-pack sweep: {} committing finalized, {} building rows dropped, {} stale uploads enrolled, {} head unavailable (kept)",
+                sweep.finalized_committing,
+                sweep.dropped_building,
+                sweep.enrolled_stale,
+                sweep.head_unavailable
+            );
+        }
+        core.hold_engine_lock(lock);
     }
     Ok(core)
 }
@@ -201,6 +239,92 @@ mod tests {
         assert!(
             msg.contains("disabled") && msg.contains("2"),
             "startup must name the refusal explicitly, got: {msg}"
+        );
+    }
+
+    /// S4.10: a strict-mode engine holds the single-writer engine lock for
+    /// its whole lifetime — a second engine on the same database is refused
+    /// loudly (previously two strict engines silently shared the store).
+    /// After the holder goes away, the restart runs the stale-pack sweep:
+    /// a `building` row whose object never materialized is dropped without
+    /// any manual step.
+    #[test]
+    fn s410_strict_engine_lock_and_startup_sweep() {
+        let mut cfg = Config::default();
+        cfg.metadata.path = std::env::temp_dir()
+            .join(format!(
+                "lightfs-s410-eng-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+            .to_string_lossy()
+            .to_string();
+        let eng = open_embedded_mem(&cfg).unwrap();
+        // Simulate a crash leftover: a registered pack whose upload never
+        // happened (this engine's in-memory object store holds nothing).
+        eng.core
+            .metadata()
+            .register_pack("packs/s410-lost.pack", 5)
+            .unwrap();
+
+        let msg = match open_embedded_mem(&cfg) {
+            Err(e) => format!("{e}"),
+            Ok(_) => panic!("second strict engine on one db must be refused"),
+        };
+        assert!(msg.contains("locked"), "got: {msg}");
+
+        drop(eng);
+        let eng2 = open_embedded_mem(&cfg).unwrap();
+        assert!(
+            eng2.core
+                .metadata()
+                .pack_state("packs/s410-lost.pack")
+                .unwrap()
+                .is_none(),
+            "startup sweep drops the building row whose object is confirmed absent"
+        );
+    }
+
+    /// S4.10: the gc stale-pack phase is gated on single-writer ownership.
+    /// With the lock free it runs; while any engine holds the lock it is
+    /// skipped (`None`) — never guessed around.
+    #[test]
+    fn s410_gc_stale_phase_respects_engine_lock() {
+        let mut cfg = Config::default();
+        cfg.metadata.path = std::env::temp_dir()
+            .join(format!(
+                "lightfs-s410-gc-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+            .to_string_lossy()
+            .to_string();
+        let core = crate::core::Core::new(
+            std::sync::Arc::new(
+                crate::metadata::sqlite::SqliteMetadataStore::open_in_memory().unwrap(),
+            ),
+            std::sync::Arc::new(crate::object_store::mem::MemObjectStore::new()),
+        );
+        // canonical_identity refuses a nonexistent database path, so the
+        // lock derivation target must exist — as it always does for a real
+        // engine (the store is opened before any lock is taken).
+        std::fs::write(&cfg.metadata.path, b"").unwrap();
+        assert!(
+            super::super::cmd::gc_stale_pack_phase(&core, &cfg)
+                .unwrap()
+                .is_some()
+        );
+        let _live = crate::fslock::FileLock::try_acquire(&engine_lock_path(&cfg).unwrap()).unwrap();
+        assert!(
+            super::super::cmd::gc_stale_pack_phase(&core, &cfg)
+                .unwrap()
+                .is_none()
         );
     }
 }

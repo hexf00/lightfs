@@ -418,7 +418,10 @@ fn symlinks_with_minio_fsck_and_reopen() {
     assert_eq!(report.problems(), 0, "{}", report.render());
 
     // reopen the SAME database: targets survive (persistence of the
-    // metadata that backup snapshots would carry)
+    // metadata that backup snapshots would carry). The old engine is
+    // dropped first — S4.10 engines hold the single-writer lock, so a
+    // "reopen" models a real restart where the previous holder is gone.
+    drop(eng);
     let eng2 = lightfs::engine::open_embedded(&cfg).expect("reopen");
     assert_eq!(eng2.core.readlink("/app/run").unwrap(), "cli.js");
     assert_eq!(eng2.core.readlink("/shortcut").unwrap(), "../app/cli.js");

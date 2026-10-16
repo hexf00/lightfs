@@ -467,12 +467,26 @@ impl WriteBackEngine {
                 "lightfs wb: swept {swept} orphaned staging file(s) and released their bytes"
             );
         }
-        // P0-a recovery sweep 1: batches a crash left in `committing`
-        // finalize here when no non-terminal task remains for them —
-        // the same verify-references-then-decide transaction the drain
-        // uses, never a state guessed from stale rows.
-        for pk in self.meta.committing_packs()? {
-            self.meta.wb_finalize_batch_if_terminal(&pk, self.now())?;
+        // P0-a recovery sweep 1 + S4.10: finalize batches a crash left in
+        // `committing`, then adjudicate `building` rows (failed/uncertain
+        // uploads) via the HEAD three-state contract. This engine holds the
+        // engine lock since construction, which is what makes the sweep
+        // safe: no in-flight seal can own these rows. Previously strict-mode
+        // engines had no recovery at all and building rows were never
+        // resolved anywhere.
+        let sweep = crate::core::recover_stale_packs(&self.meta, &self.objects)?;
+        if sweep.finalized_committing > 0
+            || sweep.dropped_building > 0
+            || sweep.enrolled_stale > 0
+            || sweep.head_unavailable > 0
+        {
+            eprintln!(
+                "lightfs wb: stale-pack sweep: {} committing finalized, {} building rows dropped, {} stale uploads enrolled, {} head unavailable (kept)",
+                sweep.finalized_committing,
+                sweep.dropped_building,
+                sweep.enrolled_stale,
+                sweep.head_unavailable
+            );
         }
         // P0-a recovery sweep 2: dead tasks that had already uploaded bytes
         // leave orphan candidates. Enrollment re-checks "no live reference"
