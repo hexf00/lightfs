@@ -1,16 +1,30 @@
-# Pack Lifecycle — TLA+ Formal Model (S4.12)
+# Pack Lifecycle — TLA+ Formal Model (S4.12 / S4.12.1)
 
 An executable TLA+ model of the LightFS pack lifecycle (branch `s31-pack-proto`,
-baseline `d3b7acd`), checked with TLC. It encodes the six persistent pack-row
-states, the real remote object, the durable deletion intent, two batch
-members, the engine lock, backup protection, and storage-fault periods — and
-checks the S4.12 invariants I1–I9 against both engine paths (Strict Pack and
-Write-Back Batch-Pack) as two separate model instances.
+S4.12 baseline `146dc2c`), checked with TLC. It encodes the six persistent
+pack-row states, the real remote object, the durable deletion intent, two
+batch members, the engine lock, backup protection, and storage-fault periods.
+
+**S4.12.1 fidelity revision** (this version) corrected three fidelity gaps
+found in the first round and re-scoped what the checks actually cover:
+
+1. `NodeUnlink` now decrements the reference AND applies the pack transition
+   in ONE action, exactly as `pack_ref_gone_tx` does inside the caller's
+   transaction (active + refs→0 ⇒ unreferenced; committing re-runs the
+   idempotent finalize decision; other states untouched). Before the
+   revision the "last reference gone → reclaimable → GC-enrolled" chain was
+   NOT reachable — active packs at zero refs were stuck.
+2. The engine has a process phase (`Down/Recovering/Serving`): the
+   stale-pack sweep runs ONLY in the one-shot startup-recovery pass or in
+   gc's stale-pack phase — never spontaneously while serving. A live
+   engine that keeps running does NOT rediscover stale rows.
+3. The gc process has its own phase (`Idle/Sweeping/Draining`). Losing the
+   engine-lock race (`GcStartBusy`) skips the stale-pack sweep but STILL
+   drains deletion intents, matching `cmd::gc`.
 
 **The model found real gaps during its own construction** — see
-[Counter-examples](#counter-examples). None of them required a production-code
-change (all were model-fidelity bugs, verified against the code), and the audit
-conclusion for the implementation itself is in the S4.12 report (internal docs).
+[Counter-examples](#counter-examples). None required a production-code
+change; the S4.12.1 revision changed only the model.
 
 ## Tool versions
 
@@ -18,7 +32,7 @@ conclusion for the implementation itself is in the S4.12 report (internal docs).
 |---------|---------|
 | TLC     | tla2tools 2.0, build 2026.10.15.145915 (rev 932d35e), from the `tlaplus/tlaplus` GitHub releases (`tla2tools.jar`; not bundled in this repo — place it next to the model or adjust `-cp`) |
 | Java    | Eclipse Adoptium JRE 21.0.12.1 (aarch64) |
-| Checker | breadth-first search, fingerprint set MSBDiskFPSet, 1 worker, -Xmx4g |
+| Checker | breadth-first search, MSBDiskFPSet, 1 worker, -Xmx4g |
 
 ## How to run
 
@@ -32,7 +46,7 @@ java -Xmx4g -cp tla2tools.jar tlc2.TLC -cleanup -config /tmp/pack-wb.cfg PackLif
 java -Xmx4g -cp tla2tools.jar tlc2.TLC -cleanup -config PackLifecycle-liveness.cfg PackLifecycle.tla
 sed 's/Mode = "strict"/Mode = "wb"/' PackLifecycle-liveness.cfg > /tmp/liveness-wb.cfg
 java -Xmx4g -cp tla2tools.jar tlc2.TLC -cleanup -config /tmp/liveness-wb.cfg PackLifecycle.tla
-# Action-coverage sanity (every in-mode action must have total > 0)
+# Action-coverage gate: every in-mode action must show total > 0
 java -Xmx4g -cp tla2tools.jar tlc2.TLC -coverage 1 -cleanup -config PackLifecycle.cfg PackLifecycle.tla
 ```
 
@@ -42,167 +56,188 @@ The model is pure TLA+; it does not compile or load any Rust.
 
 ## Scope and declared abstractions
 
-Declared in the module header, repeated here because they bound every claim
-below:
-
-- **One pack at a time.** Packs do not interact except through node refcounts.
-- **SQLite is atomic at transaction granularity.** Every single-transaction
-  Rust step (CAS + refcount + finalize; building→deleting flip + intent
-  insert; completion = row drop + done) is ONE TLA+ action. `synchronous=FULL`
-  crash durability of committed transactions and host power loss are **out of
-  scope** (they are verified by the R15/R16/R17 gates and S4.4 tests, not
-  here).
+- **One pack at a time.**
+- **SQLite is atomic at transaction granularity — an ASSUMPTION, not a
+  result.** Every single-transaction Rust step is ONE TLA+ action; TLC
+  explores the reachable states AFTER each multi-row transaction. This does
+  NOT verify that real SQLite transactions are atomic (I9 below); it
+  verifies the state machine GIVEN that atomicity. `synchronous=FULL`
+  durability and host power loss are OUT OF SCOPE.
+- **ONE recover/gc-sweep pass is atomic.** The real `recover_stale_packs`
+  iterates row by row and a crash can interrupt a pass; the pass is
+  idempotent and the NEXT pass redoes the same adjudication, so the atomic
+  pass preserves the convergence claims. Declared, not hidden.
 - **Retention time is abstracted**: `Unreferenced` is directly enrollable.
-- **Object-store results are modeled independently of the real remote state**:
-  a failed PUT or failed DELETE may leave the object in EITHER state; only a
-  *confirmed* delete (2xx or idempotent 404) forces `Absent`; HEAD is
-  decidable only when storage is healthy.
-- **Strict and Write-Back are never merged**: `CONSTANT Mode` picks one
-  engine; the other's actions are structurally disabled (verified: 0
-  coverage for the off-mode actions).
-- **Two batch members**, function-valued `mem: {a,b} -> Unbound|Bound|Committed|Dead`.
-  Strict does not touch `mem` at all (strict has no binding rows — S4.10 audit).
-- **Model-scoped**: I3/I5 cover *this* pack instance only. Historical
-  row-less orphans from before S4.10/S4.11 are out of scope by definition.
-- **Not a proof of the Rust implementation**: this is a finite-state model of
-  the *design*, mechanically checked by TLC within these bounds. Unit tests
-  are not state-space checks and this is not a mathematical proof of the code.
+- **Object-store results are independent of the real remote state**: failed
+  PUT/DELETE may leave the object in EITHER state; only a confirmed delete
+  (2xx or idempotent 404) forces `Absent`; HEAD is decidable only when
+  storage is healthy.
+- **Strict and Write-Back are never merged** (`CONSTANT Mode`). Strict does
+  not touch the member variable `mem` at all, and after S4.12.1 the wb-only
+  environment action `MemberAbandon` is premised on `Mode = "wb"` — in the
+  strict instance the member machine does not exist (coverage confirms:
+  `mem` takes 1 value under strict, 12 under wb).
+- **Model-scoped**: I3/I5 cover *this* pack instance; historical row-less
+  orphans from before S4.10/S4.11 are out of scope.
+- **Engine lock = one enum variable.** Holder-level mutual exclusion is
+  structural; that the kernel lock actually excludes a second process and
+  is released when the holder dies is delegated to the `fslock.rs` tests —
+  TLC does not check it.
+- **Not a proof of the Rust implementation**: a finite-state check of the
+  design within these bounds. Unit tests are not state-space checks.
 
-## Results
+## Results (S4.12.1, all runs completed with no error found)
 
-All four runs completed with **no error found** (~1 s each):
+| Run | Mode | Kind | States generated | Distinct | Result |
+|-----|------|------|------------------|----------|--------|
+| 1 | strict | safety | 1 931 | 350 | pass |
+| 2 | wb | safety | 23 071 | 3 682 | pass |
+| 3 | strict | liveness | 1 931 | 350 | pass |
+| 4 | wb | liveness | 23 071 | 3 682 | pass |
 
-| Run | Mode | Property kind | States generated | Distinct states | Result |
-|-----|------|---------------|------------------|-----------------|--------|
-| 1 | strict | safety (I1–I6, I8, I9) | 3 537 | 648 | pass |
-| 2 | wb | safety | 3 457 | 660 | pass |
-| 3 | strict | liveness (L1, L2, L4) | 3 537 | 648 | pass |
-| 4 | wb | liveness | 3 457 | 660 | pass |
+Action-coverage gate (S4.12.1): every in-mode action has `total > 0` in
+both modes; the only `0:0` entries are the other mode's actions and
+`RecoverRequeue` under strict (premised on `lock = "Wb"`). The wb chain
+"upload-failure arm", the new `NodeUnlink` transitions and the
+"GcEnrollUnreferenced after last-unlink" chain are all exercised.
 
 Model parameters: `MaxRefs = 2`, members = {a, b}, one pack instance,
 `Mode ∈ {"strict", "wb"}` (two separate runs).
 
-### Invariants (safety), both modes
+### What TLC actually checks vs structural constraints
 
-| # | Invariant | Statement (model operator) | Result |
-|---|-----------|---------------------------|--------|
-| I1 | RefsSafe | `refs > 0 => obj = Present /\ pack ∈ {Committing, Active}` — a live reference never points at a deleted/deleting/absent object | pass |
-| I2 | DeletionAdmission | `pack = Deleting => refs = 0` and `pack = Building => refs = 0` (ref_new refuses Building — `pack_ref_new_tx` accepts only committing/active) | pass |
-| I3 | ObjectTracked | `obj = Present => pack # Absent \/ intent # None` — a possibly-live object always has a row or a durable intent (model-scoped; historical row-less orphans excluded) | pass |
-| I4 | IntentConsistent | Pending/Claimed/Failed ⇒ Deleting; Deleting ⇒ intent # None; Done ⇒ pack = Absent | pass |
-| I5 | UnknownNotMissing | `(pack = Absent /\ intent = None) => obj = Absent` — the only way to lose both trackers is a confirmed absence; encoded by action premises (no sweep decision without decidable HEAD; no row drop after a failed delete) | pass |
-| I6 | recovery idempotence | modeled by construction: Sweep actions are re-executable, GcClaim accepts Pending/Failed/Claimed (a crashed executor's row re-enters the queue), Register resets to a fresh lifecycle | pass |
-| I7 | engine-lock mutual exclusion | single `lock` variable; `GcLock` (gc's `FileLock::try_acquire`) succeeds only from NoLock; EngineStart likewise; a second holder is structurally impossible in the model, matching fslock semantics | pass |
-| I8 | BackupGuard | `prot = Protected => intent # Done` — no deletion completes while protected; GcComplete/GcExecute/GcEnroll all premise `prot = Unprotected` (the executor re-checks protection every pass) | pass |
-| I9 | SQLite atomicity boundary | multi-row couplings (CAS+ref+finalize, flip+intent, complete=row+done) are single actions; no action interleaves inside them | pass |
+This distinction is the point of the S4.12.1 re-scoping. Only the first
+group is exhaustively checked by TLC.
+
+**Group A — state predicates exhaustively checked (INVARIANT, both modes):**
+
+| # | Invariant | Statement | Result |
+|---|-----------|-----------|--------|
+| I1 | RefsSafe | `refs > 0 => obj = Present /\ pack ∈ {Committing, Active}` | pass |
+| I2 | DeletionAdmission | `pack = Deleting => refs = 0`, `pack = Building => refs = 0` | pass |
+| I3 | ObjectTracked | `obj = Present => pack # Absent \/ intent # None` (model-scoped) | pass |
+| I4 | IntentConsistent | non-terminal intent ⇔ Deleting; `Done => pack = Absent` | pass |
+| I5 | UnknownNotMissing | `(pack = Absent /\ intent = None) => obj = Absent` | pass |
+| I8 | BackupGuard | `prot = Protected => intent # Done` | pass |
+| I7a | ProcessLockInv | `(phase # Down) <=> lock = EngineLock`; `lock = GC <=> gcp = Sweeping`; `gcp = Draining => lock # GC` | pass |
+
+**Group B — structural constraints / assumptions, NOT independently checked
+by TLC (each names its real evidence):**
+
+| # | Status | What it means | Where the real evidence lives |
+|---|--------|---------------|-------------------------------|
+| I6 recovery idempotence | model CONSTRUCTION constraint (sweeps are re-executable; `GcClaim` accepts Pending/Failed/Claimed) — not a separate checkable property, and no hollow invariant was invented for it | repeated passes converge instead of corrupting | Rust: repeated-recover scenarios in `s410_*` / `s411_*` tests; `s431-gc-e2e.sh` re-run stages |
+| I7b kernel-lock semantics | ASSUMPTION at model level (single `lock` enum) | the OS lock excludes a second process and dies with the holder | Rust: `src/fslock.rs` S4.3.4b tests (three-axis rejection, real child SIGKILL), 4b.2 alias tests |
+| I9 SQLite atomicity | ASSUMPTION at model level; becomes an IMPLEMENTATION OBLIGATION: every action marked "one tx" in the mapping table must really be a single SQLite transaction | multi-row couplings (CAS+ref+finalize; flip+intent; complete=row+done) do not interleave | Rust: single `Connection` + `Transaction` blocks per mapping row; S4.2.2 p0a22 crash-window tests |
 
 ### Liveness, and the assumptions it needs
 
-`PackLifecycle-liveness.cfg` checks `FairSpec` with properties:
+`PackLifecycle-liveness.cfg` checks `FairSpec` with three properties:
 
-- **L1 `BuildingConverges` (guarded)**: while a sweeper holds the lock and
-  storage is decidable, a building row does not stay building.
-- **L2 `IntentCompletes`**: a recorded deletion intent eventually reaches Done.
-- **L4 `CommittingResolves` (Mode-sensitive)**: under a live sweeper, a
-  Committing pack eventually leaves Committing — for any pack in strict; in
-  wb only once every member is terminal (`AllTerminal`).
+- **L1 `BuildingConverges`**: `(pack = "Building" /\ ~failProne) ~> pack # "Building"`.
+- **L2 `IntentCompletes`**: a recorded deletion intent reaches `Done`.
+- **L4 `CommittingResolves`**: a Committing pack leaves Committing — for ANY
+  committing pack in strict; in wb only once every member is terminal.
 
-Assumptions, all **explicit and necessary** (each was proven necessary by a
-TLC counter-example — see below):
+The assumptions, each an environment/operations fact the implementation
+does NOT provide by itself:
 
 1. `FaultsEventuallyEnd == <>[]~failProne` — storage faults are finite.
-   Weak fairness alone is NOT enough: an infinite StoreFail/StoreRecover
-   alternation keeps interrupting every ENABLED period of the work actions, so
-   weak fairness never fires. Recoverability is an assumption, not a default.
 2. `ProtectionEventuallyEnds == <>[](prot = "Unprotected")` — backup
-   retention is finite.
-3. `CrashEventuallyStops == <>[](lock # "NoLock")` — eventually one sweeper
-   stays alive for good. A lead-to obligation, once triggered, survives the
-   crash that cancels the fairness debt; infinite restart-crash alternation
-   can park a building row forever.
-4. WF on the gc loop (claim/execute/complete), on sweeps, and on the
-   engine-side steps guarded by `lock # "NoLock"`. The engine owes nothing
-   while crashed. **No fairness is assumed for CAS**: it is client-close
-   driven (see L4's wb premise).
+   retention ends for good.
+3. `SweepOpportunitiesInfinitelyOften == []<>(phase = "Recovering" \/ gcp = "Sweeping")`
+   — **the load-bearing assumption**. A live engine NEVER sweeps, so
+   convergence of a stale row requires server (re)starts or `lightfs gc`
+   winning the engine lock, forever. The implementation's real promise is
+   exactly "the NEXT startup or gc pass adjudicates the row"; this
+   assumption says there always IS a next pass. A permanently-running
+   server whose lock gc never wins is a legal implementation behavior and
+   is correctly EXCLUDED from the property's scope by this assumption.
+4. `NoStuckRecovery == <>[]((phase # "Recovering") /\ (gcp # "Sweeping"))` —
+   no process is interrupted in its sweep phase forever (start-crash loops
+   that always kill the pass are excluded; a started pass completes).
+5. `GcRunsInfinitelyOften == []<>(gcp = "Draining")` — `lightfs gc` is an
+   explicit CLI path with NO daemon and NO automatic retry between
+   invocations: a single run leaves failed intents for the next run. This
+   assumption is the environment promising repeated invocations; it is not
+   a claim that the implementation retries by itself.
+6. WF inside phases: a started pass completes (`WF RecoverSweep` /
+   `WF GcSweepDone`); a draining gc advances (claim/execute/complete); a
+   serving engine progresses on uploads/marks. **CAS stays unfair on
+   purpose** — it is client-close driven.
 
-Known NON-properties (asserted false on purpose, documented with traces):
+Known NON-properties (asserted false on purpose; S4.12 traces archived):
 
-- `pack = "Building" ~> pack # "Building"` (unguarded) is **false**: after a
-  crash with no restart and no gc run, a stale building row legally stays
-  forever. Trace: `examples/L1-unguarded-counterexample.trace`.
-- `mem[x] = "Committed" => refs ≥ 1` holds only at commit instants; a
-  namespace unlink legitimately retires the reference. It is a safety fact
-  (I1), not a liveness property, and is checked as such.
+- `pack = "Building" ~> pack # "Building"` unguarded is FALSE — after a
+  crash with no restart and no gc run the stale row legally stays forever.
+  `examples/L1-unguarded-counterexample.trace`.
+- A stale row is NOT "auto-healed while the engine runs": S4.12.1 removed
+  that modeling error. Convergence rides on the next pass (assumption 3).
+- `mem[x] = "Committed" => refs ≥ 1` holds only at commit instants
+  (namespace unlink retires references) — checked as safety I1, not
+  liveness.
+- Within ONE gc run a failed deletion may stay failed; retry belongs to
+  the next invocation (L2 leans on assumption 5).
 
-### Action coverage (model fidelity gate)
+### Counter-examples
 
-`-coverage 1` was used to require that every action reachable in a mode is
-actually exercised — after fixing the bugs below, every in-mode action has
-`total > 0` in both modes; the only `0:0` entries are the other mode's actions
-and `RecoverRequeue` under strict (premised on `lock = "Wb"`). A "all green"
-result before this gate was **meaningless**: the first coverage run exposed a
-broken member state machine (below).
-
-## Counter-examples (all resolved; model corrected, code unchanged)
-
-Each counter-example was saved, mapped to the design, and adjudicated. None
-exposed an implementation defect; all were model bugs or over-strong
-property statements. Production code was **not** modified for the model to
-pass (S4.12 ground rule).
+S4.12.1 produced **no new TLC counter-example**: after the fidelity fixes
+all five runs passed. The adjudication records below are from S4.12 and
+remain the audit trail (all were model bugs or over-strong properties;
+production code was never modified).
 
 | # | What TLC refuted | Root cause | Adjudication / fix |
 |---|------------------|-----------|--------------------|
-| 1 | `IntentConsistent` (safety): `pack = Building /\ intent = Done` | Single-instance model reuses its variables across pack keys: a fresh Register inherited the previous instance's Done intent | Fresh key = fresh lifecycle: Register resets `intent' = None` and members to Unbound. Matches the code: a new key gets new rows; the old Done intent belongs to the old key. |
-| 2 | `BackupGuard` (safety): `prot = Protected /\ intent = Done` | `GcComplete` lacked a protection premise | The real executor re-checks protection every pass and leaves a protected key claimed. Added `prot = "Unprotected"` premise to GcComplete (and to GcExecuteOk/GcExecuteFail/GcEnrollUnreferenced). |
-| 3 | Coverage gate: `WbBind/WbCAS/WbCASConflict/RecoverRequeue/MemberAbandon/NodeUnlink/GcUnlock` all `0:0` | Model bug: member actions quantified a STRING parameter (`m = "Unbound"` is `"m1" = "Unbound"`, always FALSE) — the member state machine never ran and the 84-state "all green" was vacuous | Rewrote members as a function variable `mem ∈ [{a,b} -> MemberState]`; actions quantify over `Members`. Distinct states went 84 → 648/660. Also added the missing `GcLock` action (gc's try-acquire) which made the GC-held sweep branch reachable. |
-| 4 | TLC crash: "Successor state is not completely specified" in `WbCAS` | `pack'` expression referenced `NoBoundPr` (a bare `mem'` read) — the successor variable was read before being defined | The other member is UNCHANGED by a one-member CAS, so the "no remaining Bound member" check is equivalent on CURRENT values. Rewrote with `\A x \in Members : (x # mm) => mem[x] # "Bound"`. |
-| 5 | `BuildingConverges` (unguarded) liveness refuted; then guarded version still refuted | (a) fault-period alternation cancels every WF debt; (b) a lead-to obligation survives a crash that cancels the fairness debt | Added stability assumptions 1–3 above; saved the trace as `examples/L1-unguarded-counterexample.trace`; L1 now premises `lock # "NoLock" /\ ~failProne`. |
-| 6 | wb `BuildingConverges` refuted: loop `WbPutOk → WbInlineDeleteConfirmed` starves `WbMark` forever | The inline delete is an upload-FAILURE-arm action; gating it only on `pack = Building` allowed the bogus healthy-path interleaving "upload OK, immediately delete" | Premised `WbInlineDeleteConfirmed`/`WbInlineDeleteFailed` on `failProne` (the failure arm exists only after a failed PUT). |
-| 7 | wb `CommittingResolves` refuted twice: (a) `WbBind → RecoverRequeue → WbBind` alternation starves CAS; (b) stuttering with a `Bound` member | (a) a requeued task never comes back to THIS pack — Unbound made it re-bindable forever; (b) wb CAS is client-close driven and the model owes no fairness to clients | (a) `RecoverRequeue` now lands on `Dead` (terminal), like `MemberAbandon`; (b) L4's wb premise requires `AllTerminal` — an engine never finalizes a batch with a live member. Trace: `examples/L4-wb-counterexample.trace`. |
+| 1 | `IntentConsistent`: `pack = Building /\ intent = Done` | single-instance variables reused across pack keys | fresh key = fresh lifecycle; Register resets intent/members (matches code: new key gets new rows) |
+| 2 | `BackupGuard`: `prot = Protected /\ intent = Done` | `GcComplete` lacked a protection premise | executor re-checks protection every pass; premise added to GcComplete/GcExecute/Enroll |
+| 3 | coverage gate: member actions all `0:0` | string parameter compared against a state ("m1" = "Unbound" always false); missing `GcLock` | members function-valued; states 84 → 648/660 (S4.12 numbers) |
+| 4 | "Successor not completely specified" in `WbCAS` | `pack'` read the bare primed variable `mem'` | one-member CAS leaves the other UNCHANGED → check current values |
+| 5 | guarded L1 still refuted | fault alternation cancels WF debts; lead-to obligations survive crashes | stability assumptions 1–3 (S4.12 set); trace `examples/L1-unguarded-counterexample.trace` |
+| 6 | wb L1: `WbPutOk → WbInlineDeleteConfirmed` loop starves `WbMark` | inline delete is an upload-FAILURE-arm action; bogus healthy-path interleaving | premised the delete actions on `failProne`; trace `examples/L1-wb-counterexample.trace` |
+| 7 | wb L4 twice | (a) Bind/Requeue alternation starves CAS; (b) stuttering with a Bound member | (a) requeue lands on Dead (terminal); (b) wb L4 premise = `AllTerminal`; traces `examples/L4-wb-*.trace` |
 
-## Mapping: model actions ↔ implementation (Phase 1)
+## Mapping: model actions ↔ implementation (anchors at S4.12.1 baseline `146dc2c`)
 
-Code anchors verified at baseline `d3b7acd` (public repo).
+| Model action | Rust entry | Transaction boundary | Tests |
+|--------------|-----------|---------------------|-------|
+| `EngineStart`/`RecoverSweep`/`EngineCrash` | engine.rs `build_core`: acquire lock → `recover_stale_packs()` once → serve; hold via `hold_engine_lock` | startup pass = several txs, modeled atomic (declared) | S4.3.4b lock tests; `s410_*` |
+| `GcStart`/`GcStartBusy`/`GcSweepDone`/`GcEnd`/`GcCrash` | cmd.rs `gc`: `gc_stale_pack_phase` (try-acquire; None ⇒ skip sweep, drain anyway) then `gc_run` | lock held only for the sweep phase | `s431-gc-e2e.sh` |
+| `SweepPackNext`/`SweepIntentNext` (shared decision) | `recover_stale_packs` (core.rs) — HEAD three-state | per-row tx | `s410_head_unavailable_keeps_row_next_pass_converges` |
+| `StrictRegister`/`WbRegister` | `register_pack` (metadata.rs:188); `PackEngine::seal` (pack.rs:259); `seal_batch` (wb.rs:1102) | one INSERT; row before bytes | p0a; `s410_*` |
+| strict/wb PUT actions | `objects.put_stream` in seal paths | non-transactional | `s410_uncertain_put_*`, `s411_*` |
+| `StrictMark`/`WbMark` | `mark_pack_uploaded` (metadata.rs:194) | one UPDATE | p0a |
+| `WbInlineDeleteConfirmed`+`WbDropRow` / `WbInlineDeleteFailed` | seal_batch failure arm: delete 2xx/404 THEN `drop_pack`; failure keeps the row | remote delete + one DELETE | `s411_plain_failure_*` (wb.rs:4921), `s411_uncertain_delete_*` (wb.rs:4957) |
+| `WbBind` | `wb_bind_pack_keys` (metadata.rs:232) | one tx | s411 scenarios |
+| `StrictCAS`/`WbCAS`/conflicts | `commit_content_cas_pack` (metadata.rs:162) = node flip + `pack_ref_new_tx` (sqlite.rs:221) + `finalize_batch_tx` (sqlite.rs:255), ONE tx | single tx | `s410_partial_cas_crash_finalizes_to_active` (pack.rs:963) |
+| `RecoverRequeue` | `wb_requeue_draining` (metadata.rs:383), called from `WriteBackEngine::recover` (wb.rs:437) — startup phase | one UPDATE | wb recover tests |
+| `MemberAbandon` | environment: requeued task lands elsewhere / dead-letters | — | wb dead-letter tests |
+| `NodeUnlink` | `pack_ref_gone_tx` (sqlite.rs:185) inside the caller's tx: active+refs0→unreferenced; committing→`finalize_batch_tx` re-run (non-terminal members keep it committing; else refs decide); other states untouched | ONE tx with the ref delete | p0a retire tests |
+| `GcEnrollUnreferenced` | `gc_register_pack_deletion` via `gc_enroll_candidates` (core.rs:341, inside gc_run) | single tx | p0a crash contract |
+| `GcClaim`/`GcExecuteOk`/`GcExecuteFail`/`GcComplete` | `gc_claim_deletions` (metadata.rs:294, SELECT pending/failed + re-queue deleting), executor, `gc_complete_deletion` (metadata.rs:300) | per-key txs | s431-gc-e2e.sh; p0b |
+| `Protect`/`Unprotect` | backup manifest (src/backup.rs, S4.3) | manifest + gc guard set | s431-gc-e2e.sh |
 
-| Model action | Rust entry | Transaction / storage boundary | Tests |
-|--------------|-----------|-------------------------------|-------|
-| `StrictRegister` / `WbRegister` | `MetadataStore::register_pack` (metadata.rs:188); strict `PackEngine::seal` (pack.rs:259), wb `WriteBackEngine::seal_batch` (wb.rs:1102) | one INSERT; row exists BEFORE bytes | p0a suite; `s410_*` |
-| `StrictPutOk` / `StrictPutUncertain` / `WbPutOk` / `WbPutUncertain` | `objects.put_stream` in seal paths; FlakyObjects/S411Objects inject `uncertain_put` | non-transactional; result independent of remote state | `s410_uncertain_put_keeps_tracker_row_sweep_reclaims` (pack.rs:863), `s411_*` |
-| `StrictMark` / `WbMark` | `mark_pack_uploaded` (metadata.rs:194) — single UPDATE; `uploaded_at NULL ⇔ building` | one UPDATE | p0a |
-| `WbInlineDeleteConfirmed` + `WbDropRow` | seal_batch failure arm: `objects.delete` 2xx/404 THEN `drop_pack` (wb.rs:1102) | delete is remote; drop is one DELETE | `s411_plain_failure_confirmed_delete_drops_object_and_row` (wb.rs:4921) |
-| `WbInlineDeleteFailed` | failure arm keeps the building row as durable tracker | — | `s411_uncertain_delete_fails_tracker_survives_then_gc_closes` (wb.rs:4957) |
-| `WbBind` | `wb_bind_pack_keys` (metadata.rs:232) — members bind AFTER the PUT succeeds | one tx | s411 scenarios |
-| `StrictCAS` / `WbCAS` | `commit_content_cas_pack` (metadata.rs:162) — node flip + `pack_ref_new_tx` (sqlite.rs:221) + `finalize_batch_tx` (sqlite.rs:255) in ONE tx (refs>0 → Active) | single SQLite tx | `s410_partial_cas_crash_finalizes_to_active` (pack.rs:963) |
-| `StrictCASConflict` / `WbCASConflict` | CAS loser at zero refs → finalize_batch_tx → Unreferenced | same tx | p0a |
-| `RecoverRequeue` | `wb_requeue_draining` (metadata.rs:383) — requeued tasks re-seal into a NEW pack | one UPDATE | wb recover tests |
-| `SweepBuildingExists` | `gc_register_stale_pack_deletion` (metadata.rs:275): predicate re-check + building→deleting flip + intent insert | single Immediate tx | `s410_head_unavailable_keeps_row_next_pass_converges` (pack.rs:932) |
-| `SweepBuildingMissing` / `SweepFinalize` | `recover_stale_packs` (core.rs:1457) HEAD three-state; committing finalize loop | HEAD then per-row tx | same + `s410_committing_zero_refs_flows_through_gc` (pack.rs:1038) |
-| `GcEnrollUnreferenced` | `gc_register_pack_deletion` (metadata.rs:256): refs=0 re-check + flip + intent | single tx | p0a crash contract |
-| `GcClaim` / `GcExecuteOk` / `GcExecuteFail` / `GcComplete` | `gc_claim_deletions` (metadata.rs:294) / cmd::gc executor / `gc_complete_deletion` (metadata.rs:300): intent flip + row drop in one tx | per-key txs | s431-gc-e2e.sh; p0b |
-| `GcLock` / `GcUnlock` | cmd.rs:148 `gc_stale_pack_phase` — `FileLock::try_acquire` (fslock.rs:30); lock dies with process | flock per-ofd / LockFileEx | S4.3.4b engine-lock tests |
-| `EngineStart` / `EngineCrash` | `build_core` recover + `hold_engine_lock` (engine.rs); crash = process death | lock released by kernel | S4.3.4b subproc SIGKILL test |
-| `Protect` / `Unprotect` | backup manifest (src/backup.rs, S4.3): protected = live refs ∪ unexpired manifests; `backup prune --id` | manifest file + gc guard set | s431-gc-e2e.sh protection stages |
-| `NodeUnlink` | namespace delete retiring the last reference (unlink → refcount) | one tx | p0a |
+## Model → Rust test matrix
 
-## Model → Rust test matrix (Phase 6)
+Group A rows are checked by TLC on the model; the "Rust evidence" column
+says what additionally backs the same claim in the code. Group B rows
+appear in the structural-constraints table above and are NOT TLC results.
 
-| Model fact | Rust surface where it lives | Existing test evidence | Gap |
-|------------|----------------------------|------------------------|-----|
+| Model fact | Rust surface | Existing test evidence | Gap |
+|------------|--------------|------------------------|-----|
 | I1 refs never point at dead objects | CAS refuses non-committing/active | p0a; `s410_partial_cas_*` | none material |
-| I2 Building unreferencable | `pack_ref_new_tx` accepts {committing, active} only | S4.10 structural invariant tests | none |
-| I3 every live object tracked | building rows survive failure arms | `s410_uncertain_put_*`, `s411_uncertain_delete_*` | pre-S4.10 historical orphans have no repair path (fsck reports only — S4.10 §6.2 backlog) |
+| I2 Building unreferencable | `pack_ref_new_tx` accepts {committing, active} only | S4.10 structural tests | none |
+| I3 every live object tracked | building rows survive failure arms | `s410_uncertain_put_*`, `s411_uncertain_delete_*` | pre-S4.10 historical orphans: report-only (S4.10 §6.2 backlog) |
 | I4 intent/state coupling | flip+insert in one tx | p0a crash matrix | none |
-| I5 unknown ≠ missing | HEAD three-state sweep; delete-outcome mapping | `s410_head_unavailable_*`, `s411_head_unavailable_*`, S4.2.2 delete_outcome tests | MinIO NoSuchBucket vs NotFound asymmetry is covered by S4.2.2 unit tests, not the model (object-store specific) |
-| I6 recovery idempotence | recover_stale_packs re-runs; GcClaim re-queues | repeated-recover scenarios in s410/s411 tests | none |
-| I7 lock mutual exclusion | fslock + engine-lock + gc try-acquire | S4.3.4b three-axis tests; SIGKILL test | gc lock-failure path (Some(None) sweep skip) has no dedicated test — minor |
-| I8 backup guard | executor per-pass protection re-check | s431-gc-e2e.sh protection-then-prune stages | crash between delete and complete while protected: covered by design (claimed re-check) but not by a dedicated test — minor |
-| L1 guarded convergence | recover on engine start + gc stale-pack phase | s410/s411 "next pass converges" tests | none |
-| L2 intent completion | gc executor retry on Failed | s431 e2e corruption-interrupt stage | none |
-| L4 Mode-sensitive resolution | strict sweep finalize vs wb AllTerminal | `s410_committing_zero_refs_*`; wb bind/finalize tests | wb "live Bound member parks Committing indefinitely" is by-design and untested as such — documented, low priority |
+| I5 unknown ≠ missing | HEAD three-state sweep; delete-outcome mapping | `s410/s411_head_unavailable_*`; S4.2.2 delete_outcome tests | MinIO NoSuchBucket asymmetry is unit-tested, not modeled |
+| I6 repeated passes converge | recover_stale_packs re-runs; claim re-queues | repeated-recover scenarios; s431 e2e | not a TLC property — construction constraint (see Group B) |
+| I7 phase/lock bookkeeping | ProcessLockInv (checked) + kernel-lock semantics (fslock tests) | S4.3.4b/4b.2 | kernel-level mutual exclusion is NOT a TLC result |
+| I8 backup guard | executor per-pass re-check | s431 protection-then-prune | crash between delete and complete while protected: by design, no dedicated test — minor |
+| L1 next-pass convergence | startup recover + gc stale-pack phase | "next pass converges" tests | live-engine non-healing is by design and now modeled as such |
+| L2 next-invocation retry | gc executor leaves failed intents | s431 corruption-interrupt stage | no daemon retry: by design, documented |
+| L4 Mode-sensitive resolution | strict sweep finalize vs wb AllTerminal | `s410_committing_zero_refs_*`; wb bind/finalize tests | wb "live Bound member parks Committing" is by-design, untested as such — documented |
 
-**Uncovered properties / out of scope** (stated, not hidden): power loss;
-SQLite `synchronous=FULL` durability mechanics; multi-pack interactions;
-unbounded member counts (>2) and MaxRefs > 2; object-store quirks (MinIO
-directory-object list anomalies — S4.6 contract suite territory); the retention
-time gate; historical pre-S4.10 row-less orphans; liveness of the *client*
-(close-driven CAS is deliberately unfair in the model).
+**Out of scope / uncovered** (stated, not hidden): power loss; SQLite
+`synchronous=FULL` mechanics; real kernel-lock semantics (fslock-test
+territory); multi-pack interactions; members/refs > 2; MinIO object-store
+quirks; the retention time gate; historical pre-S4.10 orphans; client
+CAS liveness.

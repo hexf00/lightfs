@@ -1,1 +1,6 @@
 tla2tools.jar
+*_TTrace_*.tla
+*_TTrace_*.bin
+ReachCheck.tla
+_ReachCheck.tla
+states/
