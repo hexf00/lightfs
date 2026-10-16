@@ -1,0 +1,120 @@
+TLC2 Version 2026.10.15.145915 (rev: 932d35e)
+Warning: Please run the Java VM, which executes TLC with a throughput optimized garbage collector, by passing the "-XX:+UseParallelGC" property.
+(Use the -nowarning option to disable this warning.)
+Running breadth-first search Model-Checking with fp 116 and seed 2284853063249042448 with 1 worker on 8 cores with 4096MB heap and 64MB offheap memory [pid: 16110] (Mac OS X 14.3.1 aarch64, Eclipse Adoptium 21.0.12.1 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /Users/momoou/code/lightfs-public/formal/pack-lifecycle/PackLifecycle.tla
+Parsing file /private/var/folders/rs/0bjfyxvj7y184dgjtvqgmcxm0000gn/T/tlc-8850029139122849649/Integers.tla (jar:file:/Users/momoou/code/lightfs-public/formal/pack-lifecycle/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Parsing file /private/var/folders/rs/0bjfyxvj7y184dgjtvqgmcxm0000gn/T/tlc-8850029139122849649/Naturals.tla (jar:file:/Users/momoou/code/lightfs-public/formal/pack-lifecycle/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /private/var/folders/rs/0bjfyxvj7y184dgjtvqgmcxm0000gn/T/tlc-8850029139122849649/_TLCTrace.tla (jar:file:/Users/momoou/code/lightfs-public/formal/pack-lifecycle/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /private/var/folders/rs/0bjfyxvj7y184dgjtvqgmcxm0000gn/T/tlc-8850029139122849649/TLC.tla (jar:file:/Users/momoou/code/lightfs-public/formal/pack-lifecycle/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /private/var/folders/rs/0bjfyxvj7y184dgjtvqgmcxm0000gn/T/tlc-8850029139122849649/TLCExt.tla (jar:file:/Users/momoou/code/lightfs-public/formal/pack-lifecycle/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Parsing file /private/var/folders/rs/0bjfyxvj7y184dgjtvqgmcxm0000gn/T/tlc-8850029139122849649/Sequences.tla (jar:file:/Users/momoou/code/lightfs-public/formal/pack-lifecycle/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /private/var/folders/rs/0bjfyxvj7y184dgjtvqgmcxm0000gn/T/tlc-8850029139122849649/FiniteSets.tla (jar:file:/Users/momoou/code/lightfs-public/formal/pack-lifecycle/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module TLCExt
+Semantic processing of module _TLCTrace
+Semantic processing of module PackLifecycle
+Linting of module TLCExt
+Linting of module _TLCTrace
+Linting of module PackLifecycle
+Starting... (2026-10-16 14:09:20)
+Implied-temporal checking--satisfiability problem has 3 branches.
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-10-16 14:09:20.
+Progress(14) at 2026-10-16 14:09:20: 3,457 states generated, 660 distinct states found, 0 states left on queue.
+Checking 3 branches of temporal properties for the complete state space with 1980 total distinct states at (2026-10-16 14:09:20)
+Error: Temporal property CommittingResolves was violated.
+
+Error: The following behavior constitutes a counter-example:
+
+State 1: <Initial predicate>
+/\ prot = "Unprotected"
+/\ refs = 0
+/\ lock = "NoLock"
+/\ pack = "Absent"
+/\ intent = "None"
+/\ failProne = FALSE
+/\ obj = "Absent"
+/\ mem = [a |-> "Unbound", b |-> "Unbound"]
+
+State 2: <EngineStart line 77, col 16 to line 79, col 77 of module PackLifecycle>
+/\ prot = "Unprotected"
+/\ refs = 0
+/\ lock = "Wb"
+/\ pack = "Absent"
+/\ intent = "None"
+/\ failProne = FALSE
+/\ obj = "Absent"
+/\ mem = [a |-> "Unbound", b |-> "Unbound"]
+
+State 3: <WbRegister line 154, col 15 to line 159, col 63 of module PackLifecycle>
+/\ prot = "Unprotected"
+/\ refs = 0
+/\ lock = "Wb"
+/\ pack = "Building"
+/\ intent = "None"
+/\ failProne = FALSE
+/\ obj = "Absent"
+/\ mem = [a |-> "Unbound", b |-> "Unbound"]
+
+State 4: <MemberAbandon line 252, col 18 to line 258, col 83 of module PackLifecycle>
+/\ prot = "Unprotected"
+/\ refs = 0
+/\ lock = "Wb"
+/\ pack = "Building"
+/\ intent = "None"
+/\ failProne = FALSE
+/\ obj = "Absent"
+/\ mem = [a |-> "Dead", b |-> "Unbound"]
+
+State 5: <WbPutOk line 161, col 12 to line 163, col 74 of module PackLifecycle>
+/\ prot = "Unprotected"
+/\ refs = 0
+/\ lock = "Wb"
+/\ pack = "Building"
+/\ intent = "None"
+/\ failProne = FALSE
+/\ obj = "Present"
+/\ mem = [a |-> "Dead", b |-> "Unbound"]
+
+State 6: <WbMark line 194, col 11 to line 196, col 72 of module PackLifecycle>
+/\ prot = "Unprotected"
+/\ refs = 0
+/\ lock = "Wb"
+/\ pack = "Committing"
+/\ intent = "None"
+/\ failProne = FALSE
+/\ obj = "Present"
+/\ mem = [a |-> "Dead", b |-> "Unbound"]
+
+State 7: <WbBind line 198, col 11 to line 203, col 76 of module PackLifecycle>
+/\ prot = "Unprotected"
+/\ refs = 0
+/\ lock = "Wb"
+/\ pack = "Committing"
+/\ intent = "None"
+/\ failProne = FALSE
+/\ obj = "Present"
+/\ mem = [a |-> "Dead", b |-> "Bound"]
+
+State 8: <RecoverRequeue line 243, col 19 to line 250, col 84 of module PackLifecycle>
+/\ prot = "Unprotected"
+/\ refs = 0
+/\ lock = "Wb"
+/\ pack = "Committing"
+/\ intent = "None"
+/\ failProne = FALSE
+/\ obj = "Present"
+/\ mem = [a |-> "Dead", b |-> "Unbound"]
+
+Back to state 7: <WbBind line 198, col 11 to line 203, col 76 of module PackLifecycle>
+
+Finished checking temporal properties in 00s at 2026-10-16 14:09:20
+3457 states generated, 660 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 14.
+Finished in 00s at (2026-10-16 14:09:20)
+Trace exploration spec path: ./PackLifecycle_TTrace_1792130960.tla
