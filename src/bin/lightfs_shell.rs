@@ -1,8 +1,10 @@
-//! `lightfs-shell` — the shell adapter binary.
+//! `lightfs-shell` — the shell adapter over the NETWORK CLIENT.
 //!
-//! lightfs-shell [--config PATH] [--embedded] [--mem] script tests/basic.lfs
-//! lightfs-shell [--embedded|--mem] ls /docs
-//! lightfs-shell [--server URL] ...   (Phase 7: network client backend)
+//! lightfs-shell [--config PATH] --server URL script tests/basic.lfs
+//! lightfs-shell [--config PATH] --server URL ls /docs
+//!
+//! There is no local-engine mode (S4.14.1): the metadata authority is
+//! always a `lightfs server` process, and this binary is only a client.
 
 use std::sync::Arc;
 
@@ -19,8 +21,6 @@ fn main() {
 
 fn run(args: Vec<String>) -> Result<(), lightfs::error::Error> {
     let mut config_path: Option<String> = None;
-    let mut embedded = false;
-    let mut mem = false;
     let mut server: Option<String> = None;
     let mut rest = Vec::new();
     let mut it = args.into_iter();
@@ -29,8 +29,6 @@ fn run(args: Vec<String>) -> Result<(), lightfs::error::Error> {
             "--config" | "-c" => {
                 config_path = Some(it.next().unwrap_or_else(|| die_usage()));
             }
-            "--embedded" => embedded = true,
-            "--mem" => mem = true,
             "--server" => {
                 server = Some(it.next().unwrap_or_else(|| die_usage()));
             }
@@ -38,44 +36,27 @@ fn run(args: Vec<String>) -> Result<(), lightfs::error::Error> {
         }
     }
 
-    if rest.is_empty() {
+    if rest.is_empty() || server.is_none() {
         die_usage();
     }
+    let url = server.unwrap();
 
-    let cfg_for_warn = Config::load_or_defaults(config_path.as_deref()).ok();
-    if let Some(c) = &cfg_for_warn {
-        lightfs::client::Client::warn_if_data_cache_enabled(c);
-    }
-
-    let fs: Arc<dyn FsApi> = if let Some(url) = server {
-        let cfg = Config::load_or_defaults(config_path.as_deref())?;
-        let ttl = if cfg.cache.metadata.enabled {
-            Some(std::time::Duration::from_secs(
-                cfg.cache.metadata.ttl_seconds,
-            ))
-        } else {
-            None
-        };
-        Arc::new(lightfs::client::Client::new(
-            lightfs::client::ClientConfig {
-                url,
-                metadata_ttl: ttl,
-            },
+    let cfg = Config::load_or_defaults(config_path.as_deref())?;
+    lightfs::client::Client::warn_if_data_cache_enabled(&cfg);
+    let ttl = if cfg.cache.metadata.enabled {
+        Some(std::time::Duration::from_secs(
+            cfg.cache.metadata.ttl_seconds,
         ))
     } else {
-        // Test-driver default: a local engine in THIS process (`--mem` for
-        // the network-free object store). lightfs-shell is not a production
-        // entry point — the metadata authority is always `lightfs server`.
-        let cfg = Config::load_or_defaults(config_path.as_deref())?;
-        let engine = if mem {
-            lightfs::engine::open_engine_mem(&cfg)?
-        } else {
-            lightfs::engine::open_engine(&cfg)?
-        };
-        engine.core as Arc<dyn FsApi>
+        None
     };
+    let fs: Arc<dyn FsApi> = Arc::new(lightfs::client::Client::new(
+        lightfs::client::ClientConfig {
+            url,
+            metadata_ttl: ttl,
+        },
+    ));
 
-    let _ = embedded;
     let shell = lightfs::shell::Shell::new(fs);
 
     if rest[0] == "script" {
@@ -96,8 +77,8 @@ fn run(args: Vec<String>) -> Result<(), lightfs::error::Error> {
 
 fn die_usage() -> ! {
     eprintln!(
-        "usage: lightfs-shell [--config PATH] [--embedded] [--mem] <ls|stat|mkdir|touch|cat|write|mv|rm|tree> ARGS...\n\
-         usage: lightfs-shell [--config PATH] script tests/basic.lfs"
+        "usage: lightfs-shell [--config PATH] --server URL <ls|stat|mkdir|touch|cat|write|mv|rm|tree> ARGS...\n\
+         usage: lightfs-shell [--config PATH] --server URL script tests/basic.lfs"
     );
     std::process::exit(2);
 }

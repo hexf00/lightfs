@@ -25,6 +25,25 @@ fn ensure_parent_dir(path: &str) {
     }
 }
 
+/// Create the zero-byte database placeholder RACE-SAFELY (S4.14.1): the
+/// check and the creation are one atomic `create_new` syscall, so a
+/// concurrent first-open can never truncate a database another process has
+/// already initialized — `create_new` fails with AlreadyExists if the path
+/// exists (including as a dangling symlink, which is reported, not
+/// followed). Callers then resolve the canonical identity of a file that
+/// is guaranteed to exist.
+fn ensure_db_file_exists(path: &str) -> Result<()> {
+    match std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Resolve the effective write-back drain worker count. The config value
 /// is the base; `LIGHTFS_WB_WORKERS` is an explicit override. This is the
 /// SINGLE wiring path (S3.5.1): the old code read the env inside
@@ -76,12 +95,14 @@ pub(crate) fn engine_lock_path(cfg: &Config) -> Result<std::path::PathBuf> {
 
 /// Build the Core from config, wiring the S3.1 prototype engines (pack /
 /// write-back) when enabled. Shared by the server and maintenance startup.
+/// OWNERSHIP IS NOT TAKEN HERE (S4.14.1): the `open_*` entry acquires the
+/// engine lock BEFORE SQLite is opened and hands it to the Core afterwards,
+/// so every branch below runs under an already-established single-writer
+/// title and there is exactly ONE lock-acquisition point per engine.
 /// `enable_wb = false` (maintenance commands) never constructs the
 /// write-back engine: `gc`/`fsck` stage and drain nothing, and they must
 /// stay usable on a write-back deployment while the live server owns the
-/// staging directory and the capacity ledger. Ownership of the engine lock
-/// is NOT taken here for that branch — `open_maintenance` acquires it
-/// before SQLite is opened and hands it to the Core afterwards.
+/// staging directory and the capacity ledger.
 fn build_core(
     cfg: &Config,
     meta: Arc<dyn MetadataStore>,
@@ -94,14 +115,10 @@ fn build_core(
         None
     };
     let wb = if enable_wb && cfg.commit.mode == "writeback" {
-        // The ledger lock keys on the DATABASE FILE's canonical identity
-        // (S4.3.4b.2): the store was opened above, so the file exists and
-        // its symlink-free absolute path is resolvable. Two configs sharing
-        // one DB — through any spelling — derive the same lock.
-        let db_identity = crate::fslock::canonical_identity(
-            std::path::Path::new(&cfg.metadata.path),
-            "metadata database",
-        )?;
+        // The DATABASE engine lock is NOT taken here (S4.14.1): the open_*
+        // entry already holds it before SQLite was ever opened, and holds
+        // it for the engine's lifetime. The write-back engine keeps only
+        // its own staging-directory lock.
         Some(crate::wb::WbOptions {
             staging_dir: cfg.writeback.staging_dir.clone(),
             drain_workers: cfg.writeback.drain_workers,
@@ -109,14 +126,13 @@ fn build_core(
             batch_max_wait_ms: cfg.writeback.batch_max_wait_ms,
             queue_max_tasks: cfg.writeback.queue_max_tasks,
             staging_budget_bytes: cfg.writeback.staging_budget_bytes,
-            ledger_lock_path: Some(format!("{}.engine-lock", db_identity.display())),
             #[cfg(test)]
             probe_fault: false,
         })
     } else {
         None
     };
-    let mut core = Core::with_options(meta, objects, cfg.retention.superseded_secs, pack, wb)?;
+    let core = Core::with_options(meta, objects, cfg.retention.superseded_secs, pack, wb)?;
     if core.wb().is_some() {
         core.wb().unwrap().recover()?;
         let workers = resolve_wb_workers(
@@ -125,16 +141,13 @@ fn build_core(
         )?;
         core.start_wb_workers(workers);
     } else if enable_wb {
-        // S4.10: strict-mode engines take the single-writer engine lock too
-        // (write-back engines acquire it inside their constructor; the
-        // maintenance entry acquires it in `open_maintenance` BEFORE SQLite
-        // is opened and never builds an engine branch of its own). Two
-        // engines on one database now fail loudly at startup instead of
-        // silently corrupting each other's packs. Holding the lock is also
-        // what makes the startup stale-pack sweep safe: a building/committing
-        // row cannot belong to an in-flight seal of a dead writer once we
-        // own the lock.
-        let lock = crate::fslock::FileLock::try_acquire(&engine_lock_path(cfg)?)?;
+        // S4.10/S4.14.1: the single-writer engine lock is already HELD —
+        // the open_* entry took it before SQLite was opened and hands it
+        // to the Core below. Two engines on one database fail loudly at
+        // that entry instead of silently corrupting each other's packs.
+        // Holding the lock is also what makes the startup stale-pack sweep
+        // safe: a building/committing row cannot belong to an in-flight
+        // seal of a dead writer once we own the lock.
         let sweep = core.recover_stale_packs()?;
         if sweep.finalized_committing > 0
             || sweep.dropped_building > 0
@@ -149,7 +162,6 @@ fn build_core(
                 sweep.head_unavailable
             );
         }
-        core.hold_engine_lock(lock);
     }
     Ok(core)
 }
@@ -157,26 +169,42 @@ fn build_core(
 /// The engine entry point: Core + SQLite + S3 in one process. `lightfs
 /// server` runs this; integration tests use it to exercise the exact
 /// production wiring.
+///
+/// Ownership order (S4.14.1) — config/parent-dir prep, then the engine
+/// lock taken from the database's canonical identity WITHOUT opening or
+/// initializing SQLite, then everything else (SQLite, ObjectStore, ping,
+/// Core, WB ledger recovery, workers, startup recovery) under that lock.
+/// A held lock is a loud refusal BEFORE any data store is touched, and the
+/// lock is handed to the Core and kept for the engine's lifetime.
 pub fn open_engine(cfg: &Config) -> Result<Engine> {
     ensure_parent_dir(&cfg.metadata.path);
+    ensure_db_file_exists(&cfg.metadata.path)?;
+    let lock = crate::fslock::FileLock::try_acquire(&engine_lock_path(cfg)?)?;
     let meta: Arc<dyn MetadataStore> = Arc::new(SqliteMetadataStore::open(&cfg.metadata.path)?);
     let objects: Arc<dyn ObjectStore> = Arc::new(S3ObjectStore::new(cfg.s3_config())?);
     objects.ping()?;
+    let mut core = build_core(cfg, meta, objects, true)?;
+    core.hold_engine_lock(lock);
     Ok(Engine {
-        core: Arc::new(build_core(cfg, meta, objects, true)?),
+        core: Arc::new(core),
     })
 }
 
 /// Engine over the in-memory object store: network-free loop for tests and
 /// throwaway exploration. The SQLite file still persists. This is a test
 /// facility, NOT a deployment mode — production code must go through
-/// [`open_engine`] or [`open_maintenance`].
+/// [`open_engine`] or [`open_maintenance`]. Ownership order is identical
+/// to [`open_engine`].
 pub fn open_engine_mem(cfg: &Config) -> Result<Engine> {
     ensure_parent_dir(&cfg.metadata.path);
+    ensure_db_file_exists(&cfg.metadata.path)?;
+    let lock = crate::fslock::FileLock::try_acquire(&engine_lock_path(cfg)?)?;
     let meta: Arc<dyn MetadataStore> = Arc::new(SqliteMetadataStore::open(&cfg.metadata.path)?);
     let objects: Arc<dyn ObjectStore> = Arc::new(crate::object_store::mem::MemObjectStore::new());
+    let mut core = build_core(cfg, meta, objects, true)?;
+    core.hold_engine_lock(lock);
     Ok(Engine {
-        core: Arc::new(build_core(cfg, meta, objects, true)?),
+        core: Arc::new(core),
     })
 }
 
@@ -191,11 +219,11 @@ pub fn open_engine_mem(cfg: &Config) -> Result<Engine> {
 pub fn open_maintenance(cfg: &Config) -> Result<Engine> {
     ensure_parent_dir(&cfg.metadata.path);
     // The lock derivation (canonical_identity) needs the target file to
-    // exist. Creating an EMPTY file does not open or initialize SQLite —
-    // a real open writes the header page — so lock-before-SQLite holds.
-    if !std::path::Path::new(&cfg.metadata.path).exists() {
-        std::fs::write(&cfg.metadata.path, b"")?;
-    }
+    // exist. The placeholder is created race-safely (S4.14.1): create_new
+    // never truncates an existing database, and an empty placeholder is
+    // not an initialized SQLite file — a real open writes the header page
+    // — so lock-before-SQLite holds.
+    ensure_db_file_exists(&cfg.metadata.path)?;
     let lock = crate::fslock::FileLock::try_acquire(&engine_lock_path(cfg)?)?;
     let meta: Arc<dyn MetadataStore> = Arc::new(SqliteMetadataStore::open(&cfg.metadata.path)?);
     let objects: Arc<dyn ObjectStore> = Arc::new(S3ObjectStore::new(cfg.s3_config())?);
@@ -485,10 +513,21 @@ mod tests {
         // again. (The granted branch itself — full gc/fsck to completion —
         // is exercised end-to-end with a real object store by
         // scripts/s431-gc-e2e.sh; this layer stays network-free.)
-        assert!(
-            crate::fslock::FileLock::try_acquire(&engine_lock_path(&cfg).unwrap()).is_ok(),
-            "the engine lock must be re-acquirable once the holder is gone"
-        );
+        // Bounded retry: Darwin shows a close->flock visibility window of
+        // tens of microseconds under parallel load (S4.3.4b.2), so the
+        // re-acquire is retried, not assumed instantaneous.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match crate::fslock::FileLock::try_acquire(&engine_lock_path(&cfg).unwrap()) {
+                Ok(_) => break,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
+                }
+                Err(e) => {
+                    panic!("the engine lock must be re-acquirable once the holder is gone: {e}")
+                }
+            }
+        }
         let _ = std::fs::remove_file(&cfg.metadata.path);
     }
 
@@ -524,6 +563,10 @@ mod tests {
         };
         let mut cfg = Config::default();
         cfg.metadata.path = db.to_string_lossy().to_string();
+        if let Some(ep) = std::env::var_os("LIGHTFS_S414_GC_ENDPOINT") {
+            cfg.s3.endpoint = ep.to_string_lossy().to_string();
+            cfg.s3.path_style = true;
+        }
         match crate::cmd::gc(&cfg) {
             Ok(()) => {
                 eprintln!("S414-GC-UNEXPECTED-OK");
@@ -575,6 +618,11 @@ mod tests {
         let out = std::process::Command::new(&exe)
             .args(["s414_gc_refused_child_helper", "--nocapture"])
             .env("LIGHTFS_S414_GC_DB", &db)
+            // S4.14.1 direction A hardening: the endpoint is UNREACHABLE,
+            // so if a regression ever moved the lock behind the object
+            // store ping, the child would die with a transport error and
+            // the lock-refusal assertions below would fail.
+            .env("LIGHTFS_S414_GC_ENDPOINT", "http://127.0.0.1:1")
             .output()
             .unwrap();
         let stderr_txt = String::from_utf8_lossy(&out.stderr);
@@ -591,6 +639,333 @@ mod tests {
             !stderr_txt.contains("backup"),
             "the lock gate sits BEFORE every other gc gate, got: {stderr_txt}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- S4.14.1: race-safe initialization + direction B ------------------
+
+    /// The placeholder helper must never touch an existing file: the whole
+    /// point of `create_new` is that a database another process already
+    /// initialized is byte-untouchable.
+    #[test]
+    fn s4141_placeholder_never_truncates_existing_file() {
+        let dir = std::env::temp_dir().join(format!("lightfs-s4141-trunc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.db");
+        let body = b"PRE-EXISTING DATABASE BYTES - not a placeholder, must survive";
+        std::fs::write(&path, body).unwrap();
+        ensure_db_file_exists(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            body,
+            "an existing database must survive the initialization helper byte-exact"
+        );
+        // End to end: with the lock free, the engine entry refuses a
+        // garbage non-empty database at SQLite open — and the bytes are
+        // STILL intact (nothing truncated or rewritten it first).
+        let mut cfg = Config::default();
+        cfg.metadata.path = path.to_string_lossy().to_string();
+        assert!(
+            open_engine_mem(&cfg).is_err(),
+            "garbage db must fail to open"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            body,
+            "the engine startup path must not truncate or rewrite an existing database"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// N processes race the FIRST initialization of one database. Each
+    /// child runs the same two steps the engine entry runs — the race-safe
+    /// placeholder creation, then the engine-lock attempt — released by a
+    /// start file so they overlap for real. At most ONE process can hold
+    /// the lock, and every loser must see the lock conflict, never a
+    /// truncation or a torn file.
+    #[test]
+    fn s4141_first_open_race_child_helper() {
+        let Some(dir) = std::env::var_os("LIGHTFS_S4141_RACE_DIR") else {
+            return;
+        };
+        let Some(id) = std::env::var_os("LIGHTFS_S4141_RACE_ID") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let start = dir.join("start");
+        let mut waited = 0u32;
+        while !start.exists() && waited < 10_000 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        if !start.exists() {
+            eprintln!("S4141-RACE: start file never appeared");
+            std::process::exit(2);
+        }
+        let db = dir.join("m.db");
+        // The exact two steps the engine entry performs on a fresh
+        // database, in the same order. The guard is MOVED OUT of the
+        // closure, so a winner still holds the lock while losers report.
+        let mut cfg = Config::default();
+        cfg.metadata.path = db.to_string_lossy().to_string();
+        let lock: std::result::Result<Option<crate::fslock::FileLock>, String> = (|| {
+            ensure_db_file_exists(db.to_str().unwrap()).map_err(|e| format!("create: {e}"))?;
+            let lock_path = engine_lock_path(&cfg).map_err(|e| format!("lockpath: {e}"))?;
+            crate::fslock::FileLock::try_acquire(&lock_path)
+                .map(Some)
+                .map_err(|e| format!("{e}"))
+        })();
+        let result_file = dir.join(format!(
+            "result-{}-{}",
+            id.to_string_lossy(),
+            std::process::id()
+        ));
+        match lock {
+            Ok(_held) => {
+                std::fs::write(result_file, b"locked").unwrap();
+                // Hold the lock until the parent has collected every
+                // outcome: a loser must observe the conflict WHILE the
+                // winner holds it, not after the winner exits.
+                let release = dir.join("release");
+                let mut held = 0u32;
+                while !release.exists() && held < 15_000 {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    held += 20;
+                }
+            }
+            Err(msg) => {
+                let text = if msg.contains("is locked by") {
+                    "refused".to_string()
+                } else {
+                    format!("UNEXPECTED:{msg}")
+                };
+                std::fs::write(result_file, text.as_bytes()).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn s4141_concurrent_first_open_yields_exactly_one_lock_holder() {
+        let dir = std::env::temp_dir().join(format!("lightfs-s4141-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        const N: u32 = 4;
+        let mut children = Vec::new();
+        for i in 0..N {
+            children.push(
+                std::process::Command::new(&exe)
+                    .args(["s4141_first_open_race_child_helper", "--nocapture"])
+                    .env("LIGHTFS_S4141_RACE_DIR", &dir)
+                    .env("LIGHTFS_S4141_RACE_ID", i.to_string())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        struct Guard(Vec<std::process::Child>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                for c in &mut self.0 {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+            }
+        }
+        let guard = Guard(children);
+        // All children are waiting on the start file; release them at once.
+        std::fs::write(dir.join("start"), b"go").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut outcomes: Vec<String> = Vec::new();
+        while outcomes.len() < N as usize && std::time::Instant::now() < deadline {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("result-") {
+                    let text = std::fs::read_to_string(entry.path()).unwrap();
+                    std::fs::remove_file(entry.path()).unwrap();
+                    assert!(
+                        text == "locked" || text == "refused",
+                        "unexpected race outcome: {text}"
+                    );
+                    outcomes.push(text);
+                }
+            }
+            if outcomes.len() < N as usize {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert_eq!(
+            outcomes.len(),
+            N as usize,
+            "all racers must report; got {outcomes:?}"
+        );
+        let _ = &guard;
+        // Exactly one winner; every other racer saw the SAME lock conflict.
+        assert_eq!(
+            outcomes.iter().filter(|o| o.as_str() == "locked").count(),
+            1,
+            "exactly one first-opener may hold the lock; outcomes: {outcomes:?}"
+        );
+        assert_eq!(
+            outcomes.iter().filter(|o| o.as_str() == "refused").count(),
+            N as usize - 1,
+            "every loser must see the lock conflict"
+        );
+        // All outcomes observed while the winner still holds the lock.
+        std::fs::write(dir.join("release"), b"done").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Direction B (S4.14.1): the maintenance side holds the engine lock
+    /// over a NOT-YET-INITIALIZED database (zero-byte placeholder, SQLite
+    /// never opened), and a REAL server start — the production
+    /// `open_engine` entry, spawned as its own process — must be refused
+    /// at that lock BEFORE SQLite is opened and BEFORE the object store is
+    /// touched. Evidence: exit code + lock-conflict text (not a transport
+    /// error, despite an unreachable endpoint) + the database file is
+    /// still zero bytes.
+    #[test]
+    fn s414_server_hold_child_helper() {
+        let Some(db) = std::env::var_os("LIGHTFS_S414_MNT_DB") else {
+            return;
+        };
+        let db = std::path::PathBuf::from(db);
+        // The maintenance owner's exact contract state: placeholder exists,
+        // lock held, SQLite not opened. (`open_maintenance` itself would
+        // initialize the database, which would erase the zero-byte
+        // evidence the server child is assertable against — the lock is
+        // the same kernel lock either way.)
+        ensure_db_file_exists(db.to_str().unwrap()).unwrap();
+        let mut cfg = Config::default();
+        cfg.metadata.path = db.to_string_lossy().to_string();
+        let _held = crate::fslock::FileLock::try_acquire(&engine_lock_path(&cfg).unwrap())
+            .expect("maintenance child takes the engine lock");
+        let ready = db.parent().unwrap().join("mnt.ready");
+        std::fs::write(ready, b"held").unwrap();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn s414_server_refused_child_helper() {
+        let Some(db) = std::env::var_os("LIGHTFS_S414_SRV_DB") else {
+            return;
+        };
+        let mut cfg = Config::default();
+        cfg.metadata.path = db.to_string_lossy().to_string();
+        // Unreachable endpoint: if a regression ever pings the object store
+        // before taking the lock, this child fails with a transport error
+        // instead of the lock conflict — and the assertions below fail.
+        cfg.s3.endpoint = "http://127.0.0.1:1".into();
+        cfg.s3.path_style = true;
+        match open_engine(&cfg) {
+            Ok(_) => {
+                eprintln!("S414-SRV-UNEXPECTED-OK");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("S414-SRV-ERR:{e}");
+                std::process::exit(3);
+            }
+        }
+    }
+
+    #[test]
+    fn s414_server_refused_while_maintenance_holds_engine_lock() {
+        let dir = std::env::temp_dir().join(format!("lightfs-s414-dirb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("meta.db");
+        let exe = std::env::current_exe().unwrap();
+        let holder = std::process::Command::new(&exe)
+            .args(["s414_server_hold_child_helper", "--nocapture"])
+            .env("LIGHTFS_S414_MNT_DB", &db)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        struct Guard(std::process::Child);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let guard = Guard(holder);
+        let ready = dir.join("mnt.ready");
+        let mut waited = 0u32;
+        while !ready.exists() && waited < 10_000 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        assert!(
+            ready.exists(),
+            "maintenance child never took the engine lock"
+        );
+
+        let out = std::process::Command::new(&exe)
+            .args(["s414_server_refused_child_helper", "--nocapture"])
+            .env("LIGHTFS_S414_SRV_DB", &db)
+            .output()
+            .unwrap();
+        let stderr_txt = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "the server start must be REFUSED by the held lock; stderr: {stderr_txt}"
+        );
+        assert!(
+            stderr_txt.contains("is locked by"),
+            "the refusal must be the engine lock itself, got: {stderr_txt}"
+        );
+        assert!(
+            !stderr_txt.contains("transport") && !stderr_txt.contains("Connection refused"),
+            "the lock gate must sit BEFORE the object store ping (unreachable endpoint must never be hit), got: {stderr_txt}"
+        );
+        assert_eq!(
+            std::fs::metadata(&db).unwrap().len(),
+            0,
+            "the refused server start must not have opened or initialized SQLite"
+        );
+        let _ = &guard;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Alias regression (S4.14.1 §2): two spellings of one database derive
+    /// the SAME engine lock, so whichever entry takes it first wins and the
+    /// other is refused. Unix exercises the symlink alias; every platform
+    /// exercises the dot-path alias.
+    #[test]
+    fn s4141_alias_leads_to_one_engine_lock() {
+        let dir = std::env::temp_dir().join(format!("lightfs-s4141-alias-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("m.db");
+        ensure_db_file_exists(db.to_str().unwrap()).unwrap();
+        #[cfg(unix)]
+        let alias = {
+            let l = dir.join("alias.db");
+            std::os::unix::fs::symlink(&db, &l).unwrap();
+            l
+        };
+        #[cfg(not(unix))]
+        let alias = dir.join(".").join("m.db");
+        let cfg_for = |p: &std::path::Path| {
+            let mut c = Config::default();
+            c.metadata.path = p.to_string_lossy().to_string();
+            c
+        };
+        assert_eq!(
+            engine_lock_path(&cfg_for(&db)).unwrap(),
+            engine_lock_path(&cfg_for(&alias)).unwrap(),
+            "both spellings must resolve to one lock file"
+        );
+        let _eng = open_engine_mem(&cfg_for(&db)).unwrap();
+        let err = match open_maintenance(&cfg_for(&alias)) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("the alias must reach the SAME engine lock and be refused"),
+        };
+        assert!(err.contains("is locked by"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

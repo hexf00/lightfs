@@ -18,7 +18,13 @@ found in the first round and re-scoped what the checks actually cover:
    stale-pack sweep runs ONLY in the one-shot startup-recovery pass or in
    gc's stale-pack phase — never spontaneously while serving. A live
    engine that keeps running does NOT rediscover stale rows.
-3. The gc process is OFFLINE maintenance (S4.14): `open_maintenance` takes
+3. The gc process is OFFLINE maintenance (S4.14; S4.14.1 moved the SAME
+   lock acquisition from the engine constructors to the `open_*` entries so
+   it precedes SQLite in every branch — the model's abstraction (one
+   ownership lock, taken before ANY data operation, held for the process
+   lifetime) is unchanged, so no TLC re-run was required: `EngineStart`
+   already premises `lock = "NoLock"` and everything an engine does after
+   start already happens under the lock): `open_maintenance` takes
    the engine lock BEFORE SQLite is opened and holds it until the process
    exits, so gc runs only on a free lock (its phase `Idle/Sweeping/Draining`
    coincides with holding the lock) and a live server makes the whole
@@ -241,7 +247,7 @@ production code was never modified).
 
 | Model action | Rust entry | Transaction boundary | Tests |
 |--------------|-----------|---------------------|-------|
-| `EngineStart`/`RecoverSweep`/`EngineCrash` | engine.rs `build_core`: acquire lock → `recover_stale_packs()` once → serve; hold via `hold_engine_lock` | startup pass = several txs, modeled atomic (declared) | S4.3.4b lock tests; `s410_*` |
+| `EngineStart`/`RecoverSweep`/`EngineCrash` | engine.rs `open_engine`/`open_engine_mem`/`open_maintenance` (S4.14.1): engine lock FIRST, before SQLite is opened → `build_core`: `recover_stale_packs()` once → serve; held via `hold_engine_lock` for the engine lifetime | startup pass = several txs, modeled atomic (declared) | S4.3.4b lock tests; `s410_*`; `s4141_*` race/alias, `s414_*` both refusal directions |
 | `GcStart`/`GcSweepDone`/`GcEnd`/`GcCrash` | cmd.rs `gc`: `open_maintenance` (engine lock BEFORE SQLite, held for the whole process) → `recover_stale_packs()` → `gc_run` | lock held start-to-exit (S4.14) | `s414_gc_refused_while_server_holds_engine_lock` (subprocess), `s413_gc_state_machine_*`, `s431-gc-e2e.sh` |
 | `SweepPackNext`/`SweepIntentNext` (shared decision) | `recover_stale_packs` (core.rs) — HEAD three-state | per-row tx | `s410_head_unavailable_keeps_row_next_pass_converges` |
 | `StrictRegister`/`WbRegister` | `register_pack` (metadata.rs:188); `PackEngine::seal` (pack.rs:259); `seal_batch` (wb.rs:1102) | one INSERT; row before bytes | p0a; `s410_*` |

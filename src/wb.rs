@@ -77,11 +77,6 @@ pub struct WbOptions {
     /// (dead bytes never drain, waiting cannot help) and never an eviction.
     pub staging_budget_bytes: u64,
     /// P0-c acceptance supplement: path of the ledger lock, `<db>.engine-lock`
-    /// next to the SQLite file, taken by the engine alongside the staging-dir
-    /// lock so a capacity ledger admits exactly one live writer even across
-    /// configs that share the DB but not the staging dir. `None` for
-    /// in-memory test ledgers (nothing on disk to exclude).
-    pub ledger_lock_path: Option<String>,
     /// Test-only: force the startup dir-sync capability probe to fail so
     /// the refusal path is exercisable on every platform (a global fault
     /// flag would race parallel engine constructions).
@@ -106,7 +101,6 @@ pub struct WriteBackEngine {
     /// other engine's reservations). Kernel-released on process death.
     /// Held, never read — keeping the fields alive keeps the OS locks.
     _staging_lock: crate::fslock::FileLock,
-    _ledger_lock: Option<crate::fslock::FileLock>,
     /// Signalled whenever a task is enqueued so idle workers wake.
     wake: Condvar,
     idle: Mutex<usize>,
@@ -358,17 +352,10 @@ impl WriteBackEngine {
                     ))
                 },
             )?;
-        let ledger_lock = match &opts.ledger_lock_path {
-            Some(p) => Some(
-                crate::fslock::FileLock::try_acquire(Path::new(p)).map_err(|e| {
-                    Error::Config(format!(
-                        "capacity ledger {p} is already owned by a live engine \
-                     (only one engine may write one ledger): {e}"
-                    ))
-                })?,
-            ),
-            None => None,
-        };
+        // The DATABASE engine lock is NOT taken here (S4.14.1): the open_*
+        // entry holds it before SQLite was ever opened, and hands it to the
+        // Core for the engine's lifetime — the ledger is protected by that
+        // established ownership, not by a second race on the same lock.
         // P0-d.2 capability gate: the write-back ack depends on the
         // staging DIRECTORY sync (R15 order: file-sync -> dir-sync ->
         // enqueue). A platform or filesystem where that cannot be done
@@ -400,7 +387,6 @@ impl WriteBackEngine {
             metrics,
             staging_dir: PathBuf::from(&opts.staging_dir),
             _staging_lock: staging_lock,
-            _ledger_lock: ledger_lock,
             retention_supersede,
             batch_pack_bytes: opts.batch_pack_bytes,
             batch_max_wait_ms: opts.batch_max_wait_ms,
@@ -1564,7 +1550,6 @@ mod tests {
                 queue_max_tasks: 0,
                 staging_budget_bytes: 0,
 
-                ledger_lock_path: None,
                 probe_fault: false,
             }),
         )
@@ -1733,7 +1718,6 @@ mod tests {
                 queue_max_tasks: queue_max,
                 staging_budget_bytes: 0,
 
-                ledger_lock_path: None,
                 probe_fault: false,
             }),
         )
@@ -1950,7 +1934,6 @@ mod tests {
                 queue_max_tasks: 0,
                 staging_budget_bytes: 0,
 
-                ledger_lock_path: None,
                 probe_fault: false,
             }),
         )
@@ -2166,7 +2149,6 @@ mod tests {
             queue_max_tasks: 0,
             staging_budget_bytes: 0,
 
-            ledger_lock_path: None,
             probe_fault: false,
         };
         let body = b"survives a crash";
@@ -2325,7 +2307,6 @@ mod tests {
                 queue_max_tasks: 0,
                 staging_budget_bytes: 0,
 
-                ledger_lock_path: None,
                 probe_fault: false,
             }),
         )
@@ -2408,7 +2389,6 @@ mod tests {
                 queue_max_tasks: 0,
                 staging_budget_bytes: 0,
 
-                ledger_lock_path: None,
                 probe_fault: false,
             }),
         )
@@ -2511,7 +2491,6 @@ mod tests {
             queue_max_tasks: 0,
             staging_budget_bytes: 0,
 
-            ledger_lock_path: None,
             probe_fault: false,
         };
         let eng = WriteBackEngine::new(
@@ -2578,7 +2557,6 @@ mod tests {
             queue_max_tasks: 0,
             staging_budget_bytes: 0,
 
-            ledger_lock_path: None,
             probe_fault: false,
         };
         let eng = WriteBackEngine::new(
@@ -2711,7 +2689,6 @@ mod tests {
                 batch_max_wait_ms: 0,
                 queue_max_tasks: 0,
                 staging_budget_bytes: budget,
-                ledger_lock_path: None,
                 probe_fault: false,
             }),
         )
@@ -2832,7 +2809,6 @@ mod tests {
                     queue_max_tasks: 0,
                     staging_budget_bytes: 0,
 
-                    ledger_lock_path: None,
                     probe_fault: false,
                 }),
             )
@@ -2864,7 +2840,6 @@ mod tests {
                 queue_max_tasks: 0,
                 staging_budget_bytes: 0,
 
-                ledger_lock_path: None,
                 probe_fault: false,
             }),
         )
@@ -2894,7 +2869,6 @@ mod tests {
                 queue_max_tasks: 0,
                 staging_budget_bytes: 100,
 
-                ledger_lock_path: None,
                 probe_fault: false,
             }),
         )
@@ -2934,7 +2908,6 @@ mod tests {
                 queue_max_tasks: 0,
                 staging_budget_bytes: 0,
 
-                ledger_lock_path: None,
                 probe_fault: false,
             }),
         )
@@ -3085,7 +3058,6 @@ mod tests {
                 queue_max_tasks: 0,
                 staging_budget_bytes: 0,
 
-                ledger_lock_path: None,
                 probe_fault: false,
             }),
         )
@@ -3141,7 +3113,6 @@ mod tests {
                 queue_max_tasks: 0,
                 staging_budget_bytes: 0,
 
-                ledger_lock_path: None,
                 probe_fault: false,
             }),
         )
@@ -3163,7 +3134,7 @@ mod tests {
 
     // ---- P0-c acceptance supplement: single-writer enforcement ------------
 
-    fn p0c2_opts(staging: &Path, ledger: Option<String>) -> WbOptions {
+    fn p0c2_opts(staging: &Path) -> WbOptions {
         WbOptions {
             staging_dir: staging.to_string_lossy().to_string(),
             drain_workers: 0,
@@ -3171,9 +3142,17 @@ mod tests {
             batch_max_wait_ms: 0,
             queue_max_tasks: 0,
             staging_budget_bytes: 1000,
-            ledger_lock_path: ledger,
             probe_fault: false,
         }
+    }
+
+    /// A writeback config over one DB file and one staging dir.
+    fn p0c2_cfg(db: &Path, staging: &Path) -> crate::config::Config {
+        let mut cfg = crate::config::Config::load_or_defaults(None).unwrap();
+        cfg.metadata.path = db.to_string_lossy().to_string();
+        cfg.commit.mode = "writeback".into();
+        cfg.writeback.staging_dir = staging.to_string_lossy().to_string();
+        cfg
     }
 
     /// `.unwrap_err()` needs the Ok type to be Debug (the engine is not);
@@ -3207,7 +3186,59 @@ mod tests {
     fn p0c2_second_engine_refused_while_first_is_active() {
         let dir = p0c2_dir("dual");
         let db = dir.join("m.db");
-        let ledger = format!("{}.engine-lock", db.display());
+        let staging = dir.join("staging");
+        // S4.14.1: engines are built through the production entry, which
+        // holds the DB engine lock from before SQLite was opened. The bare
+        // WriteBackEngine constructor keeps only the staging axis.
+        let eng = crate::engine::open_engine_mem(&p0c2_cfg(&db, &staging)).unwrap();
+        // Same staging dir: refused at the staging axis — this is the
+        // orphan-sweep hazard (the second engine's recover would delete the
+        // first engine's staging files). Verified on the bare constructor,
+        // which owns this lock.
+        let r = WriteBackEngine::new(
+            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            StdArc::new(MemObjectStore::new()),
+            StdArc::new(Metrics::default()),
+            &p0c2_opts(&staging),
+            false,
+        );
+        let e = p0c2_expect_refused(r);
+        assert!(format!("{e}").contains("staging directory"), "{e}");
+
+        // Different staging dir, same DB: refused at the production entry —
+        // the DB engine lock (taken there, before SQLite) is the ledger's
+        // single-writer protection now.
+        let staging2 = dir.join("staging2");
+        std::fs::create_dir_all(&staging2).unwrap();
+        let e = p0c2_expect_refused(crate::engine::open_engine_mem(&p0c2_cfg(&db, &staging2)));
+        assert!(format!("{e}").contains("is locked by"), "{e}");
+
+        // First engine exits: the second starts cleanly through the same
+        // production entry and owns both locks.
+        eng.core.wb().unwrap().stop();
+        drop(eng);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let _eng2 = loop {
+            match crate::engine::open_engine_mem(&p0c2_cfg(&db, &staging)) {
+                Ok(e) => break e,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                Err(e) => panic!("second engine never started after the first exited: {e}"),
+            }
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Takeover RECONCILE semantics (ledger logic, exercised on the bare
+    /// constructor so no drain worker races the fixture): the dead engine's
+    /// in-flight reservation is voided while its live staged bytes are
+    /// kept. The DB engine lock is irrelevant here by construction — this
+    /// is the ledger's own contract, not the single-writer gate.
+    #[test]
+    fn p0c2_takeover_reconcile_keeps_live_staged_bytes() {
+        let dir = p0c2_dir("takeover");
+        let db = dir.join("m.db");
         let staging = dir.join("staging");
         let meta = StdArc::new(SqliteMetadataStore::open(&db.to_string_lossy()).unwrap());
         let objects = StdArc::new(MemObjectStore::new());
@@ -3215,12 +3246,10 @@ mod tests {
             meta.clone(),
             objects.clone(),
             StdArc::new(Metrics::default()),
-            &p0c2_opts(&staging, Some(ledger.clone())),
+            &p0c2_opts(&staging),
             false,
         )
         .unwrap();
-        // Live state the second engine's reconcile would corrupt: one
-        // staged file plus one reservation still in flight.
         let n = meta
             .create_node(1, "f", crate::metadata::NodeKind::File, 0o644, None)
             .unwrap();
@@ -3233,41 +3262,12 @@ mod tests {
             "first engine holds staged bytes and an in-flight reservation"
         );
 
-        // Same staging dir (fresh ledger even): refused — this is the
-        // orphan-sweep hazard (the second engine's recover would delete the
-        // first engine's staging files).
-        let r = WriteBackEngine::new(
-            StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
-            objects.clone(),
-            StdArc::new(Metrics::default()),
-            &p0c2_opts(&staging, None),
-            false,
-        );
-        let e = p0c2_expect_refused(r);
-        assert!(format!("{e}").contains("staging directory"), "{e}");
-
-        // Different staging dir, same ledger: refused — reconcile there
-        // would void this engine's reservations.
-        let staging2 = dir.join("staging2");
-        std::fs::create_dir_all(&staging2).unwrap();
-        let r = WriteBackEngine::new(
-            meta.clone(),
-            objects.clone(),
-            StdArc::new(Metrics::default()),
-            &p0c2_opts(&staging2, Some(ledger.clone())),
-            false,
-        );
-        let e = p0c2_expect_refused(r);
-        assert!(format!("{e}").contains("capacity ledger"), "{e}");
-
-        // First engine exits: the second starts cleanly, reconciles, and
-        // takes over both locks.
         drop(eng);
         let eng2 = WriteBackEngine::new(
             meta.clone(),
-            objects.clone(),
+            objects,
             StdArc::new(Metrics::default()),
-            &p0c2_opts(&staging, Some(ledger)),
+            &p0c2_opts(&staging),
             false,
         )
         .unwrap();
@@ -3320,7 +3320,7 @@ mod tests {
             meta.clone(),
             objects,
             StdArc::new(Metrics::default()),
-            &p0c2_opts(&staging_dir, None),
+            &p0c2_opts(&staging_dir),
             false,
         )
         .unwrap();
@@ -3384,7 +3384,7 @@ mod tests {
             StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
             StdArc::new(MemObjectStore::new()),
             StdArc::new(Metrics::default()),
-            &p0c2_opts(&staging, None),
+            &p0c2_opts(&staging),
             false,
         );
         let e = p0c2_expect_refused(r);
@@ -3403,7 +3403,7 @@ mod tests {
                 StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
                 StdArc::new(MemObjectStore::new()),
                 StdArc::new(Metrics::default()),
-                &p0c2_opts(&staging, None),
+                &p0c2_opts(&staging),
                 false,
             ) {
                 Ok(eng) => break eng,
@@ -3437,7 +3437,7 @@ mod tests {
             StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
             StdArc::new(MemObjectStore::new()),
             StdArc::new(Metrics::default()),
-            &p0c2_opts(&staging, None),
+            &p0c2_opts(&staging),
             false,
         )
         .expect("child takes the fresh staging lock");
@@ -3467,7 +3467,7 @@ mod tests {
             StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
             StdArc::new(MemObjectStore::new()),
             StdArc::new(Metrics::default()),
-            &p0c2_opts(&real, None),
+            &p0c2_opts(&real),
             false,
         )
         .unwrap();
@@ -3475,7 +3475,7 @@ mod tests {
             StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
             StdArc::new(MemObjectStore::new()),
             StdArc::new(Metrics::default()),
-            &p0c2_opts(&link, None),
+            &p0c2_opts(&link),
             false,
         ));
         assert!(format!("{e}").contains("staging directory"), "{e}");
@@ -3488,7 +3488,7 @@ mod tests {
                 StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
                 StdArc::new(MemObjectStore::new()),
                 StdArc::new(Metrics::default()),
-                &p0c2_opts(&link, None),
+                &p0c2_opts(&link),
                 false,
             ) {
                 Ok(eng) => break eng,
@@ -3550,7 +3550,7 @@ mod tests {
             StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
             StdArc::new(MemObjectStore::new()),
             StdArc::new(Metrics::default()),
-            &p0c2_opts(&link, None),
+            &p0c2_opts(&link),
             false,
         ));
         assert!(format!("{e}").contains("staging directory"), "{e}");
@@ -3564,7 +3564,7 @@ mod tests {
                 StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
                 StdArc::new(MemObjectStore::new()),
                 StdArc::new(Metrics::default()),
-                &p0c2_opts(&link, None),
+                &p0c2_opts(&link),
                 false,
             ) {
                 Ok(eng) => break eng,
@@ -3598,7 +3598,7 @@ mod tests {
             StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
             StdArc::new(MemObjectStore::new()),
             StdArc::new(Metrics::default()),
-            &p0c2_opts(Path::new("staging-real"), None),
+            &p0c2_opts(Path::new("staging-real")),
             false,
         )
         .expect("child takes the lock via the relative spelling");
@@ -3680,11 +3680,14 @@ mod tests {
                 dot
             }
         };
+        // S4.14.1: the DB lock is taken at the production entry from the
+        // canonical identity — the alias spelling reaches the SAME lock,
+        // which is exactly the one-identity-one-ledger property.
         let e = p0c2_expect_refused(crate::engine::open_engine_mem(&cfg_for(
             &alias,
             &dir.join("s2"),
         )));
-        assert!(format!("{e}").contains("capacity ledger"), "{e}");
+        assert!(format!("{e}").contains("is locked by"), "{e}");
         // Graceful engine exit: stop the drain worker (it holds an Arc of
         // the engine, so a bare drop would keep the locks in-process for up
         // to its 200ms park), then drop and wait for the kernel locks to
@@ -3952,7 +3955,6 @@ mod tests {
                 queue_max_tasks: 0,
                 staging_budget_bytes: 0,
 
-                ledger_lock_path: None,
                 probe_fault: false,
             }),
         )
@@ -4334,7 +4336,6 @@ mod tests {
                 queue_max_tasks: 0,
                 staging_budget_bytes: 0,
 
-                ledger_lock_path: None,
                 probe_fault: false,
             }),
         )
@@ -4548,7 +4549,6 @@ mod tests {
                 queue_max_tasks: 0,
                 staging_budget_bytes: 0,
 
-                ledger_lock_path: None,
                 probe_fault: false,
             }),
         )
@@ -4894,7 +4894,6 @@ mod tests {
                 batch_max_wait_ms: 0,
                 queue_max_tasks: 0,
                 staging_budget_bytes: 0,
-                ledger_lock_path: None,
                 probe_fault: false,
             }),
         )
@@ -5363,7 +5362,6 @@ mod tests {
                 queue_max_tasks: 0,
                 staging_budget_bytes: 0,
 
-                ledger_lock_path: None,
                 probe_fault: true,
             },
             false,
@@ -5378,7 +5376,7 @@ mod tests {
             StdArc::new(SqliteMetadataStore::open_in_memory().unwrap()),
             StdArc::new(MemObjectStore::new()),
             StdArc::new(Metrics::default()),
-            &p0c2_opts(&p0c2_dir("probe-ok"), None),
+            &p0c2_opts(&p0c2_dir("probe-ok")),
             false,
         )
         .expect("healthy staging dir passes the capability probe");

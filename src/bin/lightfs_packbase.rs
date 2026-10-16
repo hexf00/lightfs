@@ -218,7 +218,6 @@ fn main() {
                 batch_max_wait_ms: 0,
                 queue_max_tasks: 0,
                 staging_budget_bytes: 0,
-                ledger_lock_path: None,
             };
             let core = Arc::new(
                 Core::with_options(meta, store.clone(), DEFAULT_SUPERSEDED_SECS, None, Some(wb))

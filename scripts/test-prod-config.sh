@@ -37,13 +37,43 @@ EOF
 # one-time provisioning of the (simulated) production bucket
 target/debug/lightfs create-bucket --config "$CFG"
 
-cleanup() { rm -f "$CFG" "$DB" "$DB-wal" "$DB-shm"; }
+# S4.14.1: lightfs-shell is client-only — writes/reads go through a
+# short-lived `lightfs server`; fsck runs OFFLINE (server stopped).
+cat >> "$CFG" <<EOF
+[server]
+bind = "127.0.0.1:18093"
+EOF
+PORT=18093
+SRV_PID=""
+cleanup() {
+  [[ -n "${SRV_PID:-}" ]] && kill "${SRV_PID:-}" 2>/dev/null || true
+  rm -f "$CFG" "$DB" "$DB-wal" "$DB-shm"
+}
 trap cleanup EXIT
-
-SHELL="target/debug/lightfs-shell"
+start_server() {
+  target/debug/lightfs server --config "$CFG" >>/tmp/lightfs-prod-server-$$.log 2>&1 &
+  SRV_PID=$!
+  for _ in $(seq 1 100); do
+    curl -s -m 1 -o /dev/null "http://127.0.0.1:$PORT/health" && return 0
+    sleep 0.2
+  done
+  echo "prod-sim server did not come up" >&2; return 1
+}
+stop_server() {
+  if [[ -n "${SRV_PID:-}" ]]; then
+    kill "$SRV_PID" 2>/dev/null || true
+    wait "$SRV_PID" 2>/dev/null || true
+    SRV_PID=""
+  fi
+}
+SHELL="target/debug/lightfs-shell --server http://127.0.0.1:$PORT"
+start_server
 $SHELL --config "$CFG" mkdir /prod-sim
 $SHELL --config "$CFG" write /prod-sim/data --string produced-on-prod-shaped-config
 $SHELL --config "$CFG" cat /prod-sim/data | grep -q "produced-on-prod-shaped-config"
+stop_server
 target/debug/lightfs fsck --config "$CFG" | grep -q "clean"
+start_server
 $SHELL --config "$CFG" rm /prod-sim/data >/dev/null
+stop_server
 echo "PRODUCTION CONFIG SWITCH OK (bucket=$PROD_BUCKET, region from config)"

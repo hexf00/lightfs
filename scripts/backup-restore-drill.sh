@@ -48,12 +48,12 @@ CFGEOF
 
 SERVER_PID=""
 lsh() { ./target/release/lightfs-shell --config "$CFG" --server "http://127.0.0.1:$PORT" "$@"; }
-rsh() { ./target/release/lightfs-shell --config "$RUN/restored.toml" "$@"; }
 rfsck() { ./target/release/lightfs fsck --config "$RUN/restored.toml"; }
 sha() { "${SHA_TOOL:-shasum}" -a 256 "$@"; }
 
 cleanup() {
   [[ -n "${SERVER_PID:-}" ]] && kill "$SERVER_PID" 2>/dev/null || true
+  [[ -n "${RSRV_PID:-}" ]] && kill "$RSRV_PID" 2>/dev/null || true
   rm -rf "$RUN"
 }
 trap cleanup EXIT
@@ -71,6 +71,13 @@ start_server() {
   done
   echo "server did not start" >&2; exit 1
 }
+stop_server() {
+  if [[ -n "${SERVER_PID:-}" ]]; then
+    kill "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+    SERVER_PID=""
+  fi
+}
 start_server
 
 {
@@ -84,8 +91,11 @@ start_server
   echo "  files: /docs/a.txt (18B), /docs/binary.bin (1MiB random)"
 
   echo "== [2] fsck + record pre-backup state"
+  # S4.14.1: fsck is OFFLINE maintenance — stop the server, run it, restart.
+  stop_server
   ./target/release/lightfs fsck --config "$CFG" | grep -q clean
   echo "  fsck: clean"
+  start_server
   lsh tree / | sort > "$RUN/tree-before.txt"
   lsh cat /docs/a.txt | sha > "$RUN/sum-a.txt"
   lsh cat /docs/binary.bin | sha > "$RUN/sum-b.txt"
@@ -120,7 +130,22 @@ enabled = false
 [cache.data]
 enabled = false
 RESTOREOF
-  ./target/release/lightfs-shell --config "$RC" tree / | sort > "$RUN/tree-restored.txt"
+  # S4.14.1: lightfs-shell is client-only — serve the restored database
+  # with a short-lived server and talk to it over RPC.
+  cat >> "$RC" <<RESTOREOF
+[server]
+bind = "127.0.0.1:18090"
+RESTOREOF
+  RPORT=18090
+  RSRV_PID=""
+  ./target/release/lightfs server --config "$RC" >>"$RUN/restored-server.log" 2>&1 &
+  RSRV_PID=$!
+  for _ in $(seq 1 100); do
+    curl -s -m 1 -o /dev/null "http://127.0.0.1:$RPORT/health" && break
+    sleep 0.2
+  done
+  rsh() { ./target/release/lightfs-shell --config "$RC" --server "http://127.0.0.1:$RPORT" "$@"; }
+  ./target/release/lightfs-shell --config "$RC" --server "http://127.0.0.1:$RPORT" tree / | sort > "$RUN/tree-restored.txt"
   diff "$RUN/tree-before.txt" "$RUN/tree-restored.txt" && echo "  file tree: identical to pre-backup state"
   rsh cat /docs/a.txt | sha | diff "$RUN/sum-a.txt" - && echo "  a.txt checksum: identical (pre-backup content)"
   rsh cat /docs/binary.bin | sha | diff "$RUN/sum-b.txt" - && echo "  binary.bin checksum: identical"

@@ -81,9 +81,9 @@ echo "target endpoint: $LIGHTFS_OSS_ENDPOINT bucket: $LIGHTFS_OSS_BUCKET (creden
 echo "== 1. signature/region/addressing: create + read back (byte-exact)"
 head -c 1048576 /dev/urandom > "$RUN/payload.bin"
 EXPECT_SHA=$({ sha256sum 2>/dev/null || shasum -a 256; } < "$RUN/payload.bin" | awk '{print $1}')
-./target/release/lightfs-shell --config "$CFG" mkdir /oss-acc
-./target/release/lightfs-shell --config "$CFG" write /oss-acc/blob --stdin < "$RUN/payload.bin"
-ACTUAL_SHA=$(./target/release/lightfs-shell --config "$CFG" cat /oss-acc/blob | { sha256sum 2>/dev/null || shasum -a 256; } | awk '{print $1}')
+./target/release/lightfs-shell --config "$CFG" --server "http://127.0.0.1:18089" mkdir /oss-acc
+./target/release/lightfs-shell --config "$CFG" --server "http://127.0.0.1:18089" write /oss-acc/blob --stdin < "$RUN/payload.bin"
+ACTUAL_SHA=$(./target/release/lightfs-shell --config "$CFG" --server "http://127.0.0.1:18089" cat /oss-acc/blob | { sha256sum 2>/dev/null || shasum -a 256; } | awk '{print $1}')
 if [[ "$ACTUAL_SHA" == "$EXPECT_SHA" ]]; then
     echo "  read-back byte-exact: $ACTUAL_SHA"
 else
@@ -92,7 +92,7 @@ else
 fi
 
 echo "== 2. range reads"
-./target/release/lightfs-shell --config "$CFG" read /oss-acc/blob 0 2>/dev/null | head -1 || true
+./target/release/lightfs-shell --config "$CFG" --server "http://127.0.0.1:18089" read /oss-acc/blob 0 2>/dev/null | head -1 || true
 
 echo "== 3. concurrent multipart write (part concurrency 4)"
 LIGHTFS_S3_PART_CONCURRENCY=4 ./target/release/lightfs-bench \
