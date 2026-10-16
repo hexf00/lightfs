@@ -328,10 +328,12 @@ mod tests {
         );
     }
 
-    /// S4.13 (model gap A): a live engine lock skips ONLY the stale-pack
-    /// sweep. The deletion-intent drain still runs with its real semantics,
-    /// the engine's in-flight stale building row is NOT touched while the
-    /// lock is held, and a sweep after the lock is released converges it.
+    /// S4.13.1 (model gap A): a live engine lock skips ONLY the stale-pack
+    /// sweep. The deletion-intent drain still runs with its real semantics
+    /// for BOTH kinds of work — an intent durably registered BEFORE gc_run
+    /// is invoked (pack flipped to `deleting` up front) and a candidate the
+    /// run enrolls itself — while the engine's in-flight stale building row
+    /// is NOT touched. A sweep after the lock is released converges it.
     /// Every assertion reads SQLite row state, object-store state or the
     /// durable intent queue — never a log line.
     #[test]
@@ -367,11 +369,37 @@ mod tests {
         core.metadata().register_pack(stale, 5).unwrap();
         mem.put(stale, b"stale").unwrap();
 
-        // A reclaimable pack that is already unreferenced: its durable
-        // deletion intent is exactly the work the drain must keep doing
-        // even while the sweep is skipped.
+        // (2a) A PRE-EXISTING durable deletion intent: fully registered
+        // BEFORE gc_run is ever called, so the drain below proves it
+        // executes work it did not create in this run. Registration and
+        // the pending intent row land in ONE transaction, so pack state
+        // `deleting` is the durable evidence the intent exists.
+        let preexisting = "packs/s413-preexisting.pack";
+        core.metadata().register_pack(preexisting, 7).unwrap();
+        core.metadata().mark_pack_uploaded(preexisting, 1).unwrap();
+        core.metadata()
+            .wb_finalize_batch_if_terminal(preexisting, 1)
+            .unwrap();
+        mem.put(preexisting, b"dead-before-gc").unwrap();
+        assert!(
+            core.metadata()
+                .gc_register_pack_deletion(preexisting, 1)
+                .unwrap(),
+            "the unreferenced pack registers its durable intent"
+        );
+        assert_eq!(
+            core.metadata()
+                .pack_state(preexisting)
+                .unwrap()
+                .map(|(s, _)| s),
+            Some("deleting".into()),
+            "registered = flipping unreferenced -> deleting with a pending intent"
+        );
+
+        // (2b) A reclaimable pack that is merely unreferenced: NO intent
+        // yet — gc_run must enroll it itself in this same run.
         let reclaimable = "packs/s413-reclaim.pack";
-        core.metadata().register_pack(reclaimable, 7).unwrap();
+        core.metadata().register_pack(reclaimable, 9).unwrap();
         core.metadata().mark_pack_uploaded(reclaimable, 1).unwrap();
         core.metadata()
             .wb_finalize_batch_if_terminal(reclaimable, 1)
@@ -397,17 +425,30 @@ mod tests {
         );
         assert!(mem.head(stale).is_ok(), "its object is not touched either");
 
-        // 2) ... but the deletion-intent drain still runs to real semantics.
+        // 2) ... but the deletion-intent drain still runs to real semantics:
+        //    ONE candidate enrolled fresh this run, TWO intents completed
+        //    (the pre-existing one plus the newly enrolled one).
         let summary =
             crate::cmd::gc_run(&core, Some(backup_root.to_str().unwrap()), 5, 0, now).unwrap();
         assert_eq!(
-            (summary.enrolled.0, summary.done),
-            (1, 1),
-            "the reclaimable pack is enrolled and executed while the sweep is skipped"
+            summary.enrolled.0, 1,
+            "only the not-yet-registered pack is enrolled by this run"
+        );
+        assert_eq!(
+            summary.done, 2,
+            "both the pre-existing and the fresh intent execute under the skipped sweep"
+        );
+        assert!(
+            mem.head(preexisting).is_err(),
+            "the pre-existing intent really deleted its object"
+        );
+        assert!(
+            core.metadata().pack_state(preexisting).unwrap().is_none(),
+            "the pre-existing pack row went with its completed intent"
         );
         assert!(
             mem.head(reclaimable).is_err(),
-            "the drain really deleted the reclaimable object"
+            "the drain really deleted the freshly enrolled object"
         );
         assert!(
             core.metadata().pack_state(reclaimable).unwrap().is_none(),

@@ -282,14 +282,18 @@ Candidate gaps from the S4.13 task, audited against the code:
   (`s410_gc_stale_phase_respects_engine_lock`) only asserted the
   `Some/None` return of `gc_stale_pack_phase`. New test
   `s413_gc_lock_skip_keeps_stale_row_and_still_drains_intents` (src/engine.rs)
-  pins the full behavior with row/object/intent assertions: under a held
-  engine lock the sweep is skipped AND the stale building row (and its
-  object) survive untouched, while the deletion-intent drain still runs to
-  real semantics (enroll + execute + complete on an unrelated unreferenced
-  pack); after the lock is released the next sweep adjudicates the stale row
-  (building → deleting + pending intent) and the following gc run converges
-  it completely. Corresponds to model actions `GcStartBusy` (skip) +
-  `Draining` work + `GcStart`/`GcSweepDone` (later pass).
+  pins the full behavior with row/object/intent assertions, and
+  distinguishes the TWO sources of drain work (S4.13.1 revision): an intent
+  durably registered BEFORE `gc_run` is invoked (the unreferenced pack is
+  flipped to `deleting` with its pending intent in one transaction before
+  the test takes the lock) AND a candidate the run enrolls itself
+  (`enrolled.0 = 1, done = 2`). Under a held engine lock the sweep is
+  skipped AND the stale building row (and its object) survive untouched
+  while BOTH intents execute; after the lock is released the next sweep
+  adjudicates the stale row (building → deleting + pending intent) and the
+  following gc run converges it completely. Corresponds to model actions
+  `GcStartBusy` (skip) + `Draining` work + `GcStart`/`GcSweepDone` (later
+  pass).
 - **B. Backup protection vs deletion lifecycle — NO gap.**
   `p0b_protected_object_survives_gc_until_prune`,
   `p0b_gc_end_to_end_enroll_execute_and_protection_filter` and
