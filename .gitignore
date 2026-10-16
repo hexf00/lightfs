@@ -10,3 +10,7 @@ nohup.out
 # default relative staging_dir (./staging) junk from local runs; real
 # deployments configure an absolute path outside the repo
 staging/
+
+# TLC trace-exploration artifacts (S4.12.1: never commit these)
+*_TTrace_*
+formal/**/states/
