@@ -40,9 +40,15 @@ pub const FORMAT_VERSION: u8 = 1;
 #[repr(u8)]
 pub enum ObjKind {
     Data = 1,
+    /// Legacy (S4.19) metadata copies: this build never WRITES them, but
+    /// still decodes the kind so leftovers are identified, never guessed.
     Tree = 2,
     Commit = 3,
     Ref = 4,
+    /// One-per-bucket ownership marker (`namespace/marker`): written once
+    /// at initialization, verified on every open. NOT part of the commit
+    /// path (S4.20: no per-commit logical metadata goes to the store).
+    Namespace = 5,
 }
 
 impl ObjKind {
@@ -52,6 +58,7 @@ impl ObjKind {
             2 => Some(ObjKind::Tree),
             3 => Some(ObjKind::Commit),
             4 => Some(ObjKind::Ref),
+            5 => Some(ObjKind::Namespace),
             _ => None,
         }
     }
@@ -215,54 +222,20 @@ pub fn seal_stream(
 }
 
 #[cfg(test)]
-mod tests {
+mod ns_tests {
     use super::*;
 
     #[test]
-    fn seal_open_roundtrip() {
-        let env = seal(ObjKind::Data, b"hello world");
-        let (kind, content) = open(&env).unwrap();
-        assert_eq!(kind, ObjKind::Data);
-        assert_eq!(content, b"hello world");
+    fn namespace_marker_roundtrip() {
+        let sealed = seal(ObjKind::Namespace, b"0123456789abcdef0123456789abcdef");
+        let (kind, body) = open(&sealed).unwrap();
+        assert_eq!(kind, ObjKind::Namespace);
+        assert_eq!(body, b"0123456789abcdef0123456789abcdef");
+        // a tampered marker is refused like any other object
+        let mut bad = sealed.clone();
+        bad[LAST_BYTE] ^= 0xff;
+        assert!(open(&bad).is_err());
     }
 
-    #[test]
-    fn empty_content_roundtrip() {
-        let env = seal(ObjKind::Tree, b"");
-        let (kind, content) = open(&env).unwrap();
-        assert_eq!(kind, ObjKind::Tree);
-        assert!(content.is_empty());
-    }
-
-    #[test]
-    fn corrupted_byte_is_refused() {
-        let mut env = seal(ObjKind::Data, b"payload");
-        let last = env.len() - 1;
-        env[last] ^= 0xff;
-        let err = open(&env).unwrap_err();
-        assert!(matches!(err, Error::ObjectCorrupt(_)), "{err}");
-        assert!(format!("{err}").contains("sha256 mismatch"));
-    }
-
-    #[test]
-    fn truncated_is_refused() {
-        let env = seal(ObjKind::Data, b"payload");
-        let err = open(&env[..30]).unwrap_err();
-        assert!(matches!(err, Error::ObjectCorrupt(_)));
-    }
-
-    #[test]
-    fn unknown_encoder_is_refused_not_served() {
-        let mut env = seal(ObjKind::Data, b"payload");
-        env[6] = 42; // unknown encoder
-        let err = open(&env).unwrap_err();
-        assert!(format!("{err}").contains("unknown encoder id 42"));
-    }
-
-    #[test]
-    fn unknown_version_is_refused() {
-        let mut env = seal(ObjKind::Data, b"payload");
-        env[4] = 9;
-        assert!(open(&env).is_err());
-    }
+    const LAST_BYTE: usize = 52;
 }

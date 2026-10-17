@@ -742,6 +742,34 @@ impl Store {
     /// be a vnext model with at least one readable ref. Running gc with
     /// a lost or unreadable ref set would treat reachable objects as
     /// garbage — refuse instead.
+    /// The namespace id this database owns (None until initialized).
+    /// Lives in the existing `model` table: no schema change, and the
+    /// ownership marker on the object store must carry the SAME id.
+    pub fn namespace_id(&self) -> Result<Option<String>> {
+        self.read(|conn| {
+            conn.query_row(
+                "SELECT value FROM model WHERE key='namespace'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(db_err(other)),
+            })
+        })
+    }
+
+    pub fn set_namespace_id_tx(conn: &Connection, id: &str) -> Result<()> {
+        conn.execute(
+            "INSERT INTO model(key, value) VALUES ('namespace', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [id],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     pub fn gc_gate(&self) -> Result<()> {
         let marker_ok = self.read(|conn| {
             conn.query_row::<String, _, _>(

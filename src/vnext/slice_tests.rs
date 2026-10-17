@@ -240,58 +240,50 @@ fn slice6_gc_respects_reference_roots() {
 }
 
 #[test]
-fn slice7_recovery_view_from_objects_alone() {
-    let (core, objects) = mk_core("recover");
+fn slice7_payload_only_writes_and_content_salvage() {
+    let (core, objects) = mk_core("salvage");
+
+    // S4.20 contract: initialization writes ONE ownership marker (its own
+    // prefix), and normal commits write NOTHING but payload objects.
+    let marker: Vec<String> = list_keys(objects.as_ref(), "namespace/");
+    assert_eq!(marker.len(), 1, "exactly one namespace marker: {marker:?}");
     core.mkdir("/dir", 0o755).unwrap();
     core.create("/dir/f", 0o644).unwrap();
     let h = core.open_write("/dir/f", None).unwrap();
     core.write(&h, 0, b"recoverable-bytes").unwrap();
     core.commit_write(&h).unwrap();
+    core.unlink("/dir/f").unwrap();
 
-    // What the object store holds for meta/ (diagnostics on failure):
-    let keys: Vec<String> = {
-        let mut out = Vec::new();
-        let mut token = None;
-        loop {
-            let page = objects.list("meta/", token.as_deref(), 100).unwrap();
-            for i in &page.items {
-                out.push(i.key.clone());
-            }
-            match page.next_token {
-                Some(t) => token = Some(t),
-                None => break,
-            }
+    let meta: Vec<String> = list_keys(objects.as_ref(), "meta/");
+    assert!(meta.is_empty(), "no per-commit meta/ objects may exist: {meta:?}");
+    let payload = list_keys(objects.as_ref(), "objects/");
+    assert_eq!(payload.len(), 1, "exactly the v1 payload object: {payload:?}");
+
+    // SQLite is GONE from this point: content salvage (read-only) is the
+    // whole recovery guarantee — bytes, key and stable id, no namespace.
+    let report = recover::salvage_all_data(objects.as_ref()).unwrap();
+    assert_eq!(report.scanned, 1);
+    assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+    let obj = &report.recovered[0];
+    assert_eq!(obj.file_id, Some(1), "stable id parses from the key");
+    assert_eq!(obj.content, b"recoverable-bytes");
+    assert_eq!(report.contents().count(), 1);
+}
+
+fn list_keys(objects: &dyn crate::object_store::ObjectStore, prefix: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut token = None;
+    loop {
+        let page = objects.list(prefix, token.as_deref(), 100).unwrap();
+        for i in &page.items {
+            out.push(i.key.clone());
         }
-        out
-    };
-
-    // SQLite is GONE from this point: only the object store remains.
-    let view = match recover::namespace_view(objects.as_ref()) {
-        Ok(v) => v,
-        Err(e) => panic!("namespace_view failed (meta keys: {keys:?}): {e}"),
-    };
-    assert_eq!(view.refs.len(), 1);
-    assert_eq!(view.refs[0].name, "main");
-    // Recovery folds EVERY reachable tree, so historical versions appear
-    // next to the live one; the namespace's CURRENT content is the max
-    // version (order among equal paths is not stable — HashSet iteration).
-    let f = view
-        .files
-        .iter()
-        .filter(|f| f.path == "/dir/f")
-        .max_by_key(|f| f.version)
-        .unwrap_or_else(|| panic!("recovered namespace must contain /dir/f (meta keys: {keys:?})"));
-    assert_eq!(f.size, 17);
-    assert_eq!(f.version, 1);
-    // The recovered object reference actually reads back the bytes.
-    let obj = objects.get(&f.object_key, None).unwrap();
-    let (kind, content) = crate::vnext::envelope::open(&obj.data).unwrap();
-    assert_eq!(kind, crate::vnext::envelope::ObjKind::Data);
-    assert_eq!(content, b"recoverable-bytes");
-    // Salvage without any metadata at all still finds the content.
-    let salvaged = recover::salvage_all_data(objects.as_ref()).unwrap();
-    assert!(salvaged.iter().any(|(_, b)| b == b"recoverable-bytes"));
-    assert!(view.unpublished_commits.is_empty());
+        match page.next_token {
+            Some(t) => token = Some(t),
+            None => break,
+        }
+    }
+    out
 }
 
 #[test]

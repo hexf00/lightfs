@@ -36,7 +36,7 @@ fn fresh(tag: &str) -> Config {
     }
     // one bucket per test per run: meta/ is bucket-global, so a leftover
     // root from an earlier run must never meet a fresh DB (the engine
-    // fails closed on that today — see publish_initial_commit)
+    // fails closed on that today — see init_namespace)
     cfg.s3.bucket = format!("{}-{}-{}", BUCKET, tag, std::process::id());
     lightfs::object_store::s3::S3ObjectStore::new(cfg.s3_config())
         .expect("s3 store")
@@ -121,6 +121,23 @@ fn run_child(mode: &str, cfg: &Config) -> std::process::ExitStatus {
     cmd.status().expect("spawn child")
 }
 
+fn list_all_keys(objects: &dyn lightfs::object_store::ObjectStore) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut token = None;
+    loop {
+        let page = objects.list("", token.as_deref(), 1000).unwrap();
+        for i in &page.items {
+            out.push(i.key.clone());
+        }
+        match page.next_token {
+            Some(t) => token = Some(t),
+            None => break,
+        }
+    }
+    out.sort();
+    out
+}
+
 #[test]
 fn zz_child_harness() {
     // never runs as a test; dispatches to child_main when re-exec'd
@@ -131,6 +148,108 @@ fn zz_child_harness() {
         let bucket = it.next().unwrap().to_string();
         child_main(mode, db, bucket);
     }
+}
+
+/// S4.20 §五.2: normal writes produce ONLY payload objects — no per-commit
+/// meta/ anything (verified against a REAL backend, not just in-memory).
+#[test]
+fn normal_writes_leave_meta_prefix_empty() {
+    let cfg = fresh("payload");
+    let eng = lightfs::engine::open_engine(&cfg).unwrap();
+    eng.core.mkdir("/w", 0o755).unwrap();
+    for i in 0..20 {
+        write_file(&eng.core, &format!("/w/f{i}"), format!("payload-{i}").as_bytes());
+    }
+    // overwrite one: still only a new payload object
+    let h = eng.core.open_write("/w/f0", Some(1)).unwrap();
+    eng.core.write(&h, 0, b"payload-0-v2").unwrap();
+    eng.core.commit_write(&h).unwrap();
+
+    use lightfs::object_store::ObjectStore as _;
+    let objects = eng.core.objects();
+    let meta = list_all_keys(objects.as_ref())
+        .into_iter()
+        .filter(|k| k.starts_with("meta/"))
+        .count();
+    assert_eq!(meta, 0, "per-commit meta/ objects are gone (S4.20)");
+    let ns: Vec<_> = list_all_keys(objects.as_ref())
+        .into_iter()
+        .filter(|k| k.starts_with("namespace/"))
+        .collect();
+    assert_eq!(ns.len(), 1, "exactly the ownership marker: {ns:?}");
+    // 21 payloads (20 files + 1 overwritten v2)
+    let payloads = list_all_keys(objects.as_ref())
+        .into_iter()
+        .filter(|k| k.starts_with("objects/"))
+        .count();
+    assert_eq!(payloads, 21, "one immutable payload per committed version");
+}
+
+/// S4.20 §五.8: a DIFFERENT database opening the same bucket is refused
+/// at the namespace marker — never co-rooted, never silent.
+#[test]
+fn second_database_on_same_bucket_is_refused() {
+    let cfg = fresh("shared");
+    let eng = lightfs::engine::open_engine(&cfg).unwrap();
+    write_file(&eng.core, "/owned", b"by the first database");
+    drop(eng);
+
+    // a fresh DB in a fresh file, same bucket: refused at open
+    let mut intruder = cfg.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        intruder.metadata.path = std::env::temp_dir()
+            .join(format!("lightfs-vnext-intruder-{}.db", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+        let _ = std::fs::remove_file(&intruder.metadata.path);
+        let _ = tx.send(lightfs::engine::open_engine(&intruder));
+    });
+    // the intruder must fail, and it must be the namespace refusal
+    for _ in 0..600 {
+        if let Ok(res) = rx.try_recv() {
+            let err = res.err().expect("intruder engine must be refused");
+            let msg = format!("{err}");
+            assert!(msg.contains("another namespace") || msg.contains("co-root"),
+                    "unexpected error: {msg}");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("intruder open neither succeeded nor failed within 30s");
+}
+
+/// S4.20 §五.6: GC cannot run without SQLite — a corrupted database file
+/// fails the store open, so there is no Core to collect with. The fail-
+/// closed direction: no database, no reachability proof, no deletions.
+#[test]
+fn corrupted_sqlite_refuses_gc_entry() {
+    let cfg = fresh("gcdeny");
+    let eng = lightfs::engine::open_engine(&cfg).unwrap();
+    write_file(&eng.core, "/g", b"guard");
+    drop(eng);
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", cfg.metadata.path));
+    }
+    std::fs::write(&cfg.metadata.path, b"this is not a sqlite database at all").unwrap();
+    // the engine lock file survives but the DB is garbage: opening the
+    // store must fail loudly (engine lock + marker checks never reached)
+    let err = lightfs::engine::open_engine(&cfg).err().expect("corrupt db must refuse");
+    let _ = err; // message shape asserted loosely: any refusal is fine
+}
+
+/// S4.20 §五.5 (network leg): wrong credentials surface as an explicit
+/// error from the salvage entry point, not an empty report.
+#[test]
+fn salvage_with_unusable_backend_errors_loudly() {
+    let cfg = fresh("perms");
+    let mut bad = cfg.clone();
+    bad.s3.access_key = "not-a-valid-key".into();
+    let store = lightfs::object_store::s3::S3ObjectStore::new(bad.s3_config()).unwrap();
+    let err = lightfs::vnext::recover::salvage_all_data(&store)
+        .err()
+        .expect("list with bad credentials must error, not return empty");
+    let _ = format!("{err}"); // explicit failure; shape owned by the backend
 }
 
 #[test]
@@ -239,20 +358,30 @@ fn crash_between_data_and_metadata_recovers() {
             format!("committed-{i}").into_bytes());
     }
 
-    // namespace recovery from objects alone still folds the full state
-    let view = lightfs::vnext::recover::namespace_view(objects.as_ref()).unwrap();
-    assert_eq!(view.refs.len(), 1);
-    // the fold walks EVERY reachable tree, so historical versions appear
-    // per commit; the recovered namespace's PATH SET is the assertion
-    let mut keep_paths: Vec<&str> = view
-        .files
+    // SQLite-independent content salvage (read-only): the five keeps are
+    // restoration candidates with byte-exact payloads; both raw orphans
+    // (written WITHOUT envelopes) are explicitly rejected, never served.
+    let snapshot_before = list_all_keys(objects.as_ref());
+    let report = lightfs::vnext::recover::salvage_all_data(objects.as_ref()).unwrap();
+    let snapshot_after = list_all_keys(objects.as_ref());
+    assert_eq!(snapshot_before, snapshot_after, "salvage must not mutate OSS");
+    let mut keep_payloads: Vec<Vec<u8>> = report
+        .recovered
         .iter()
-        .map(|f| f.path.as_str())
-        .filter(|p| p.starts_with("/keep-"))
+        .filter(|o| o.key.starts_with("objects/999/") == false)
+        .map(|o| o.content.clone())
         .collect();
-    keep_paths.sort_unstable();
-    keep_paths.dedup();
-    assert_eq!(keep_paths.len(), 5, "recovered namespace carries the five keeps");
+    keep_payloads.sort();
+    let expected: Vec<Vec<u8>> = (0..5).map(|i| format!("committed-{i}").into_bytes()).collect();
+    assert_eq!(keep_payloads, expected, "byte-exact salvage of the keeps");
+    // exactly one rejection: the RAW orphan (gc already reclaimed the
+    // ledgered one — envelopes it never had are reported, never served)
+    assert_eq!(report.rejected.len(), 1, "{:?}", report.rejected);
+    assert_eq!(report.rejected[0].key, "objects/999/orphan-raw.data");
+    assert!(report.rejected[0].reason.contains("unreadable"));
+    // salvage does NOT judge committed vs orphan: everything verified is
+    // a candidate (the five keeps + nothing else — inflight never PUT)
+    assert_eq!(report.recovered.len(), 5);
 }
 
 #[test]

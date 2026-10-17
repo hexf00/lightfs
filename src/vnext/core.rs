@@ -26,16 +26,6 @@ pub(crate) const MAIN_REF: &str = "main";
 fn data_key(file_id: i64, uniq: &str) -> String {
     format!("objects/{file_id}/w-{uniq}.data")
 }
-pub(crate) fn tree_key(sha: &str) -> String {
-    format!("meta/trees/{sha}")
-}
-pub(crate) fn commit_key(sha: &str) -> String {
-    format!("meta/commits/{sha}")
-}
-pub(crate) fn ref_key(name: &str) -> String {
-    format!("meta/refs/{name}")
-}
-
 /// Loop bound for trailing-symlink resolution (POSIX ELOOP shape).
 const MAX_SYMLINK_RESOLUTIONS: usize = 40;
 
@@ -123,19 +113,36 @@ struct Level {
     entries: Vec<Entry>,
 }
 
-/// Recovery artifacts collected inside a commit transaction.
-#[derive(Default)]
-struct Acc {
-    new_trees: Vec<(String, Vec<u8>)>, // (sha, entries_json bytes)
-    commit_record: Option<(String, Vec<u8>)>, // (sha, canonical record)
-    commit_seq: Option<i64>,
-}
-
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// 16 random-ish bytes for the namespace id: pid + wall nanos + a process
+/// counter, folded through sha256. Uniqueness is the requirement (the id
+/// is a random ownership token, not a secret); no new dependency.
+fn uuid_bytes() -> [u8; 16] {
+    use std::sync::atomic::AtomicU64;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut material = Vec::with_capacity(32);
+    material.extend_from_slice(&std::process::id().to_le_bytes());
+    material.extend_from_slice(
+        &std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+            .to_le_bytes(),
+    );
+    material.extend_from_slice(&n.to_le_bytes());
+    let digest = crate::sigv4::sha256_hex(&material);
+    let mut out = [0u8; 16];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&digest[i * 2..i * 2 + 2], 16).unwrap_or(0);
+    }
+    out
 }
 
 fn uniq_suffix() -> String {
@@ -146,16 +153,7 @@ fn uniq_suffix() -> String {
     format!("{}-{nanos:x}", std::process::id())
 }
 
-fn db_err(e: rusqlite::Error) -> Error {
-    Error::Db(format!("vnext: {e}"))
-}
 
-fn record_root_tree(record: &[u8]) -> String {
-    serde_json::from_slice::<serde_json::Value>(record)
-        .ok()
-        .and_then(|v| v.get("root_tree").and_then(|x| x.as_str().map(String::from)))
-        .unwrap_or_default()
-}
 
 impl Core {
     pub fn new(store: Store, objects: Arc<dyn ObjectStore>) -> Result<Core> {
@@ -173,7 +171,7 @@ impl Core {
             metrics,
             _lock: None,
         };
-        core.publish_initial_commit()?;
+        core.init_namespace()?;
         Ok(core)
     }
 
@@ -183,80 +181,59 @@ impl Core {
         self._lock = Some(lock);
     }
 
-    /// The INITIAL commit (created by Store::initialize, which has no
-    /// object store) is the root of every parent chain. Its recovery
-    /// object and empty root tree are published here, idempotently: a
-    /// store opened a hundred times publishes exactly once.
-    fn publish_initial_commit(&self) -> Result<()> {
-        let (sha, record, tree_json): (String, Vec<u8>, Vec<u8>) = self.store.read(|conn| {
-            let (sha, root_tree_sha): (String, String) = conn
-                .query_row(
-                    "SELECT content_sha, (SELECT content_sha FROM trees WHERE id = commits.root_tree_id)
-                     FROM commits WHERE parent_id IS NULL",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .map_err(db_err)?;
-            let record = serde_json::json!({
-                "ref": MAIN_REF,
-                "parent": serde_json::Value::Null,
-                "root_tree": root_tree_sha,
-                "seq": 0,
-            })
-            .to_string()
-            .into_bytes();
-            let entries_json: String = conn
-                .query_row(
-                    "SELECT entries_json FROM trees WHERE content_sha = ?1",
-                    [root_tree_sha],
-                    |r| r.get(0),
-                )
-                .map_err(db_err)?;
-            Ok((sha, record, entries_json.into_bytes()))
-        })?;
-        if crate::sigv4::sha256_hex(&record) != sha {
-            // The stored hash must match the canonical record we would
-            // publish; if it doesn't, the store was written by different
-            // logic and we refuse to invent a recovery object.
-            return Err(Error::Db(
-                "vnext: initial commit hash does not match its canonical record".into(),
-            ));
-        }
-        // A FRESH local store opening a bucket that already carries a
-        // ref means a DIFFERENT engine's commit chain lives there.
-        // Co-rooting silently would let two chains interleave under one
-        // ref (no cross-server coordination exists — S4.18), so this
-        // fails closed. Reopens skip the check: their local DB has a
-        // main ref of its own.
-        if self.store.head(MAIN_REF)?.is_none() {
-            if let Ok(obj) = self.objects.get(&ref_key(MAIN_REF), None) {
+    /// Ownership marker, checked and enforced on EVERY open (S4.20): the
+    /// object store is payload-only — no per-commit logical metadata — so
+    /// bucket ownership rests on ONE namespace marker written at
+    /// initialization and re-verified here. SQLite holds the same id.
+    /// Order: SQLite row first, marker second — a crash between the two
+    /// fails the NEXT open closed (marker missing) instead of silently
+    /// re-rooting. A fresh store that meets a marker it does not hold is
+    /// a DIFFERENT namespace: refused, never co-rooted.
+    fn init_namespace(&self) -> Result<()> {
+        const MARKER_KEY: &str = "namespace/marker";
+        let local = self.store.namespace_id()?;
+        let remote = match self.objects.get(MARKER_KEY, None) {
+            Ok(obj) => {
                 let (kind, body) = envelope::open(&obj.data)?;
-                if kind == ObjKind::Ref {
-                    let remote: serde_json::Value =
-                        serde_json::from_slice(&body).map_err(|e| Error::Db(e.to_string()))?;
-                    let remote_commit = remote["commit"].as_str().unwrap_or("");
-                    if remote_commit != crate::sigv4::sha256_hex(&record) {
-                        return Err(Error::Db(format!(
-                            "vnext: bucket already holds a different root (ref commit                              {remote_commit}); a fresh store must not co-root with it"
-                        )));
-                    }
+                if kind != ObjKind::Namespace {
+                    return Err(Error::Db(format!(
+                        "{MARKER_KEY}: kind {kind:?} is not a namespace marker"
+                    )));
                 }
+                Some(String::from_utf8(body).map_err(|_| {
+                    Error::ObjectCorrupt(format!("{MARKER_KEY}: marker id is not UTF-8"))
+                })?)
             }
-        }
-        match self.objects.head(&commit_key(&sha)) {
-            Ok(_) => {} // already published
-            Err(Error::ObjectMissing(_)) => {
-                let _ = self.objects.put(
-                    &tree_key(&record_root_tree(&record)),
-                    &envelope::seal(ObjKind::Tree, &tree_json),
-                );
-                let _ = self
-                    .objects
-                    .put(&commit_key(&sha), &envelope::seal(ObjKind::Commit, &record));
-            }
+            Err(Error::ObjectMissing(_)) => None,
             Err(e) => return Err(e),
+        };
+        match (local.as_deref(), remote.as_deref()) {
+            (None, None) => {
+                let id = crate::sigv4::sha256_hex(&uuid_bytes()).chars().take(32).collect::<String>();
+                self.store.with_tx(|conn| Store::set_namespace_id_tx(conn, &id))?;
+                // commit point reached: from here a marker write failure
+                // leaves (Some(id), None) — the next open refuses closed.
+                self.objects.put(
+                    MARKER_KEY,
+                    &envelope::seal(ObjKind::Namespace, id.as_bytes()),
+                )?;
+                Ok(())
+            }
+            (None, Some(_)) => Err(Error::Db(format!(
+                "vnext: bucket already carries another namespace's marker ({MARKER_KEY}); \
+                 a fresh store must not co-root with it"
+            ))),
+            (Some(_), Some(r)) if local.as_deref() == Some(r) => Ok(()),
+            (Some(_), Some(r)) => Err(Error::Db(format!(
+                "vnext: namespace mismatch — this database owns {}, the bucket marker says {r}",
+                local.as_deref().unwrap_or("?")
+            ))),
+            (Some(l), None) => Err(Error::Db(format!(
+                "vnext: namespace marker missing on the object store (database owns {l}). \
+                 The bucket may have been cleared or the marker deleted; refusing to \
+                 re-root fail-closed — restore the marker object or start a new namespace"
+            ))),
         }
-        Ok(())
     }
 
     pub fn objects(&self) -> &Arc<dyn ObjectStore> {
@@ -431,41 +408,33 @@ impl Core {
     fn mutate<T>(
         &self,
         comps: &[String],
-        step: impl FnOnce(&Connection, &mut Vec<Entry>, &mut Acc) -> Result<T>,
+        step: impl FnOnce(&Connection, &mut Vec<Entry>) -> Result<T>,
     ) -> Result<T> {
-        let acc = Mutex::new(Acc::default());
-        let out = self.store.with_tx(|conn| {
+        // S4.20: the transaction IS the whole commit — no object-store
+        // metadata publication after it. The COW chain lives only in
+        // SQLite; the data plane holds immutable payload objects, and the
+        // namespace marker (checked at open) owns bucket identity.
+        self.store.with_tx(|conn| {
             // Walk INSIDE the write transaction: base trees are read under
             // BEGIN IMMEDIATE, so serialized writers can never build on a
             // stale snapshot (no silent lost updates).
             let mut chain = self.walk_dirs_tx(conn, comps)?;
-            let mut acc = acc.lock().unwrap();
             let result = {
                 let leaf = chain.last_mut().expect("walk yields ≥1");
-                step(conn, &mut leaf.entries, &mut acc)?
+                step(conn, &mut leaf.entries)?
             };
-            Self::cow_and_commit(conn, &mut chain, &mut acc)?;
+            Self::cow_and_commit(conn, &mut chain)?;
             Ok(result)
-        });
-        match out {
-            Ok(v) => {
-                self.publish_recovery(&acc.into_inner().unwrap());
-                Ok(v)
-            }
-            Err(e) => Err(e),
-        }
+        })
     }
 
     /// Bottom-up COW over `chain` + commit + ref advance. Entries of the
     /// leaf (and of any level a caller adjusted) are already mutated;
     /// child pointers are rewired by matching the OLD tree id (within a
     /// directory, at most one entry references a given child tree).
-    fn cow_and_commit(conn: &Connection, chain: &mut [Level], acc: &mut Acc) -> Result<()> {
-        let (last_id, last_sha, _) = Self::cow_branch(conn, chain, acc)?;
-        let (_, seq, record, record_sha) =
-            Store::commit_mainline_tx(conn, MAIN_REF, last_id, &last_sha)?;
-        acc.commit_record = Some((record_sha, record));
-        acc.commit_seq = Some(seq);
+    fn cow_and_commit(conn: &Connection, chain: &mut [Level]) -> Result<()> {
+        let (last_id, last_sha, _) = Self::cow_branch(conn, chain)?;
+        Store::commit_mainline_tx(conn, MAIN_REF, last_id, &last_sha)?;
         Ok(())
     }
 
@@ -473,11 +442,7 @@ impl Core {
     /// `(new_top_id, new_top_sha, old_top_tid)` so a caller splicing this
     /// branch under a shared prefix can rewire the parent entry by the old
     /// tree id. `chain` must be non-empty.
-    fn cow_branch(
-        conn: &Connection,
-        chain: &mut [Level],
-        acc: &mut Acc,
-    ) -> Result<(i64, String, i64)> {
+    fn cow_branch(conn: &Connection, chain: &mut [Level]) -> Result<(i64, String, i64)> {
         let top_old = chain[0].tid;
         let mut last_id = 0;
         let mut last_sha = String::new();
@@ -504,35 +469,10 @@ impl Core {
                     }
                 }
             }
-            acc.new_trees.push((sha.clone(), json.into_bytes()));
             last_id = id;
             last_sha = sha;
         }
         Ok((last_id, last_sha, top_old))
-    }
-
-    /// Best-effort recovery copies. Failures logged, never propagated.
-    fn publish_recovery(&self, acc: &Acc) {
-        for (sha, json) in &acc.new_trees {
-            let _ = self
-                .objects
-                .put(&tree_key(sha), &envelope::seal(ObjKind::Tree, json));
-        }
-        if let Some((sha, record)) = &acc.commit_record {
-            let _ = self
-                .objects
-                .put(&commit_key(sha), &envelope::seal(ObjKind::Commit, record));
-            let proj = serde_json::json!({
-                "ref": MAIN_REF,
-                "commit": sha,
-                "seq": acc.commit_seq.unwrap_or(0),
-            })
-            .to_string();
-            let _ = self.objects.put(
-                &ref_key(MAIN_REF),
-                &envelope::seal(ObjKind::Ref, proj.as_bytes()),
-            );
-        }
     }
 
     // ---- reads ----
@@ -863,12 +803,11 @@ impl Core {
             .last()
             .cloned()
             .ok_or_else(|| Error::InvalidPath(path.to_string()))?;
-        self.mutate(&comps[..comps.len() - 1], |conn, entries, acc| {
+        self.mutate(&comps[..comps.len() - 1], |conn, entries| {
             if entries.iter().any(|e| e.n == name) {
                 return Err(Error::AlreadyExists(path.to_string()));
             }
             let (child_tid, child_sha) = Store::insert_tree_json_tx(conn, "[]")?;
-            acc.new_trees.push((child_sha.clone(), b"[]".to_vec()));
             entries.push(Entry {
                 n: name,
                 k: "dir".into(),
@@ -894,7 +833,7 @@ impl Core {
             .last()
             .cloned()
             .ok_or_else(|| Error::InvalidPath(path.to_string()))?;
-        self.mutate(&comps[..comps.len() - 1], |conn, entries, _acc| {
+        self.mutate(&comps[..comps.len() - 1], |conn, entries| {
             if entries.iter().any(|e| e.n == name) {
                 return Err(Error::AlreadyExists(path.to_string()));
             }
@@ -926,7 +865,7 @@ impl Core {
             .ok_or_else(|| Error::InvalidPath(path.to_string()))?;
         // The link is returned UNRESOLVED — a dangling target is legal
         // (POSIX), so a follow-lookup here would report NotFound.
-        let entry = self.mutate(&comps[..comps.len() - 1], |conn, entries, _acc| {
+        let entry = self.mutate(&comps[..comps.len() - 1], |conn, entries| {
             if entries.iter().any(|e| e.n == name) {
                 return Err(Error::AlreadyExists(path.to_string()));
             }
@@ -971,7 +910,7 @@ impl Core {
             .last()
             .cloned()
             .ok_or_else(|| Error::InvalidPath(path.to_string()))?;
-        self.mutate(&comps[..comps.len() - 1], |_conn, entries, _acc| {
+        self.mutate(&comps[..comps.len() - 1], |_conn, entries| {
             let entry = entries
                 .iter()
                 .find(|e| e.n == name)
@@ -995,7 +934,7 @@ impl Core {
             .last()
             .cloned()
             .ok_or_else(|| Error::InvalidPath(path.to_string()))?;
-        self.mutate(&comps[..comps.len() - 1], |conn, entries, _acc| {
+        self.mutate(&comps[..comps.len() - 1], |conn, entries| {
             let entry = entries
                 .iter()
                 .find(|e| e.n == name)
@@ -1028,7 +967,7 @@ impl Core {
             .last()
             .cloned()
             .ok_or_else(|| Error::InvalidPath(path.to_string()))?;
-        self.mutate(&comps[..comps.len() - 1], |_conn, entries, _acc| {
+        self.mutate(&comps[..comps.len() - 1], |_conn, entries| {
             let entry = entries
                 .iter_mut()
                 .find(|e| e.n == name)
@@ -1057,7 +996,6 @@ impl Core {
             .ok_or_else(|| Error::InvalidPath(new_path.to_string()))?;
         // Parents only: the leaves are ENTRIES in the last level (same
         // contract as every other mutation — never walk a leaf as a dir).
-        let acc = Mutex::new(Acc::default());
         self.store.with_tx(|conn| {
             // Both chains are walked INSIDE the transaction (same
             // lost-update discipline as every other mutation), and the
@@ -1142,17 +1080,16 @@ impl Core {
                 m.n = new_name;
                 target.entries.push(m);
             }
-            let mut a = acc.lock().unwrap();
             if same_leaf_dir {
                 // one directory changed: plain linear cow
-                return Self::cow_and_commit(conn, &mut old_chain, &mut a);
+                return Self::cow_and_commit(conn, &mut old_chain);
             }
             // Two branches hanging off a shared prefix: cow each branch
             // bottom-up, splice both new tops into the prefix's last level
             // (the chain copies share tids, so either copy carries it),
             // then cow the prefix + commit.
             if old_chain.len() > split_at {
-                let (id, sha, old_top) = Self::cow_branch(conn, &mut old_chain[split_at..], &mut a)?;
+                let (id, sha, old_top) = Self::cow_branch(conn, &mut old_chain[split_at..])?;
                 let top = &mut old_chain[split_at - 1];
                 let slot = top
                     .entries
@@ -1163,7 +1100,7 @@ impl Core {
                 slot.w = Some(sha);
             }
             if new_chain.len() > split_at {
-                let (id, sha, new_top) = Self::cow_branch(conn, &mut new_chain[split_at..], &mut a)?;
+                let (id, sha, new_top) = Self::cow_branch(conn, &mut new_chain[split_at..])?;
                 let top = &mut old_chain[split_at - 1];
                 let slot = top
                     .entries
@@ -1173,10 +1110,8 @@ impl Core {
                 slot.tid = Some(id);
                 slot.w = Some(sha);
             }
-            Self::cow_and_commit(conn, &mut old_chain[..split_at], &mut a)
-        })?;
-        self.publish_recovery(&acc.into_inner().unwrap());
-        Ok(())
+            Self::cow_and_commit(conn, &mut old_chain[..split_at])
+        })
     }
 
     // ---- writes ----
@@ -1237,7 +1172,7 @@ impl Core {
         let version = expected + 1;
         let (mtime, size, etag) = (now_secs(), content.len() as i64, info.etag.clone());
         let key2 = key.clone();
-        self.mutate(&comps[..comps.len() - 1], |conn, entries, _acc| {
+        self.mutate(&comps[..comps.len() - 1], |conn, entries| {
             Store::insert_file_version_tx(conn, &FileVersionRow {
                 file_id,
                 version,
@@ -1339,7 +1274,7 @@ impl Core {
                 .head(&key)?
                 .etag
         };
-        self.mutate(&comps[..comps.len() - 1], |conn, entries, _acc| {
+        self.mutate(&comps[..comps.len() - 1], |conn, entries| {
             Store::insert_file_version_tx(conn, &FileVersionRow {
                 file_id,
                 version,
