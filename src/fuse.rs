@@ -145,7 +145,7 @@ fn errno(e: &Error) -> Errno {
         // silent retry, eviction, or degradation.
         Error::Capacity(_) => Errno::ENOSPC,
         Error::Conflict { .. } => Errno::EIO,
-        Error::Storage(_) | Error::Db(_) | Error::Io(_) | Error::Config(_) => Errno::EIO,
+        Error::Storage(_) | Error::Db(_) | Error::Io(_) | Error::Config(_) | Error::ObjectCorrupt(_) => Errno::EIO,
     }
 }
 

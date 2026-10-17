@@ -7,7 +7,7 @@ use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
 
-use crate::core::Core;
+use crate::vnext::Core;
 use crate::engine::Engine;
 use crate::error::{Error, Result};
 
@@ -387,7 +387,7 @@ fn handle_request_inner(mut req: tiny_http::Request, core: &Core) {
                                 "X-LightFS-Node-Id requires X-LightFS-Expected-Version".into(),
                             )
                         })?;
-                        core.write_stream_by_id(id, expected, &mut f, written)
+                        core.write_stream_by_id(id, Some(expected), &mut f, written)
                     }
                     None => core.write_stream(&path, expected_version, create, &mut f, written),
                 }

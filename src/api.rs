@@ -1,11 +1,11 @@
 //! FsApi: the filesystem interface adapters program against.
-//! Core implements it in-process (embedded/server); the network client
+//! The vnext Core implements it in-process (server); the network client
 //! implements it over the LightFS protocol. Adapters (shell, FUSE) never
 //! see SQLite or S3.
 
-use crate::core::{Core, WriteHandle};
 use crate::error::Result;
 use crate::metadata::Node;
+use crate::vnext::core::{Core, WriteHandle};
 
 /// One buffered write session. Commit publishes content atomically with
 /// optimistic version checking.
@@ -47,7 +47,7 @@ pub trait FsApi: Send + Sync {
     /// Return the stored target of the symlink at `path` (no-follow).
     fn readlink(&self, path: &str) -> Result<String>;
 
-    // ---- stable-identity anchors (M-phase protocol) ----
+    // ---- stable-identity anchors (by-id protocol) ----
     //
     // These locate a node by its STABLE id instead of re-resolving the
     // path, so an open handle keeps working across renames by other
@@ -70,11 +70,8 @@ pub trait FsApi: Send + Sync {
     }
 
     /// Read a byte range by id DIRECTLY from the authority, bypassing any
-    /// read cache (Phase Q). This is the commit chain's base read: overlay
-    /// assembly (flush, truncate) must observe committed content through
-    /// the store, never through a cache — the K3 doctrine is structural,
-    /// not advisory. The default is the plain read (no cache exists in
-    /// that implementation); cache-carrying layers override the bypass.
+    /// read cache. The vnext core has no cache; the default is the plain
+    /// by-id read.
     fn read_by_id_authoritative(
         &self,
         node_id: i64,
@@ -175,11 +172,7 @@ impl FsApi for Core {
         offset: u64,
         size: u64,
     ) -> Result<Vec<u8>> {
-        let (mut r, len) = Core::open_read_by_id(self, node_id, offset, size)?;
-        use std::io::Read as _;
-        let mut out = Vec::with_capacity(len as usize);
-        r.read_to_end(&mut out)?;
-        Ok(out)
+        Core::read_by_id(self, node_id, offset, size)
     }
     fn open_write_by_id(
         &self,
@@ -187,9 +180,8 @@ impl FsApi for Core {
         path: &str,
         expected_version: Option<i64>,
     ) -> Result<Box<dyn WriteSession + '_>> {
-        // In-process there is no re-resolution step to get wrong: anchor
-        // the handle on the id and let commit_write's existing by-id CAS
-        // gate versions (path stays for error messages only).
+        // Anchor the handle on the id and let commit's file-level version
+        // gate do the CAS (path stays for error messages only).
         let handle = Core::open_write_id(self, node_id, path, expected_version)?;
         Ok(Box::new(CoreWriteSession { core: self, handle }))
     }

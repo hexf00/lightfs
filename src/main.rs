@@ -1,7 +1,6 @@
 //! `lightfs` — single binary entry point.
 //!
 //! lightfs server   [--config PATH]   own the metadata + serve the protocol
-//! lightfs fsck     [--config PATH]   report metadata/object divergence
 //! lightfs mount    [--config PATH] MOUNTPOINT   FUSE (Linux only, Phase 8)
 //! lightfs version
 
@@ -17,7 +16,7 @@ fn main() {
 
 fn print_usage() {
     eprintln!(
-        "usage: lightfs [--config PATH] <server|fsck|mount|backup [--expires-in SECS]|backup prune --id ID|gc|create-bucket [--insecure-public-rw]|version>\n\
+        "usage: lightfs [--config PATH] <server|mount|create-bucket [--insecure-public-rw]|version>\n\
          see README"
     );
 }
@@ -43,64 +42,6 @@ fn run(args: Vec<String>) -> Result<(), lightfs::error::Error> {
             println!("lightfs {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Some("backup") => {
-            let cfg = Config::load_or_defaults(config_path.as_deref())?;
-            // `lightfs backup prune --id ID` — the only sanctioned way to
-            // remove a backup (incl. resolving a fail-closed corrupt one).
-            if rest.get(1).map(String::as_str) == Some("prune") {
-                let mut id: Option<&str> = None;
-                let mut it = rest[2..].iter();
-                while let Some(a) = it.next() {
-                    match a.as_str() {
-                        "--id" => {
-                            id = Some(it.next().ok_or_else(|| {
-                                lightfs::error::Error::Config(
-                                    "backup prune: --id needs a value".into(),
-                                )
-                            })?);
-                        }
-                        other => {
-                            return Err(lightfs::error::Error::Config(format!(
-                                "backup prune: unknown argument '{other}' (usage: backup prune --id ID)"
-                            )));
-                        }
-                    }
-                }
-                let Some(id) = id else {
-                    return Err(lightfs::error::Error::Config(
-                        "backup prune needs --id ID".into(),
-                    ));
-                };
-                return lightfs::cmd::backup_prune(&cfg, id);
-            }
-            // Legacy single-file form (`lightfs backup OUTPUT`) is gone:
-            // a bare file can't carry a manifest, so gc could never prove
-            // what it references. The canonical root is the only backup.
-            let mut expires_in: Option<u64> = None;
-            let mut it = rest[1..].iter();
-            while let Some(a) = it.next() {
-                match a.as_str() {
-                    "--expires-in" => {
-                        let v = it.next().ok_or_else(|| {
-                            lightfs::error::Error::Config("--expires-in needs a value".into())
-                        })?;
-                        expires_in = Some(v.parse().map_err(|_| {
-                            lightfs::error::Error::Config(format!(
-                                "--expires-in: expected a non-negative integer, got '{v}'"
-                            ))
-                        })?);
-                    }
-                    other => {
-                        return Err(lightfs::error::Error::Config(format!(
-                            "backup: unknown argument '{other}': backups publish as directories \
-                             under the canonical [backup] root; a positional OUTPUT path (legacy \
-                             single-file backup) is not supported and not auto-protected"
-                        )));
-                    }
-                }
-            }
-            lightfs::cmd::backup(&cfg, expires_in)
-        }
         Some("create-bucket") => {
             let cfg = Config::load_or_defaults(config_path.as_deref())?;
             let public = rest.iter().any(|a| a == "--insecure-public-rw");
@@ -112,15 +53,6 @@ fn run(args: Vec<String>) -> Result<(), lightfs::error::Error> {
                 ));
             }
             lightfs::cmd::create_bucket(&cfg, public)
-        }
-        Some("gc") => {
-            let cfg = Config::load_or_defaults(config_path.as_deref())?;
-            lightfs::cmd::gc(&cfg)
-        }
-        Some("fsck") => {
-            let cfg = Config::load_or_defaults(config_path.as_deref())?;
-            let fix = rest.iter().any(|a| a == "--fix");
-            lightfs::cmd::fsck(&cfg, fix)
         }
         Some("server") => {
             let cfg = Config::load_or_defaults(config_path.as_deref())?;

@@ -513,16 +513,13 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::Core;
-    use crate::metadata::sqlite::SqliteMetadataStore;
     use crate::object_store::mem::MemObjectStore;
+    use crate::vnext::{Core, Store};
     use std::io::Write;
 
     fn shell() -> Shell {
-        let core = Core::new(
-            Arc::new(SqliteMetadataStore::open_in_memory().unwrap()),
-            Arc::new(MemObjectStore::new()),
-        );
+        let core =
+            Core::new(Store::open_in_memory().unwrap(), Arc::new(MemObjectStore::new())).unwrap();
         Shell::new(Arc::new(core))
     }
 

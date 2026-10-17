@@ -589,7 +589,7 @@ impl FsApi for CacheFs {
 mod tests {
     use super::*;
     use crate::config::{Config, MetadataSection};
-    use crate::core::Core;
+    use crate::vnext::Core;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
 
@@ -1076,7 +1076,7 @@ mod r1 {
     use super::tests::core_at;
     use super::*;
     use crate::api::FsApi;
-    use crate::core::Core;
+    use crate::vnext::Core;
 
     fn cached(core: Arc<Core>, prefix: &str, budget: u64) -> CacheFs {
         CacheFs::new(core, prefix.to_string(), budget)
@@ -1271,7 +1271,7 @@ mod r1b {
     use super::tests::core_at;
     use super::*;
     use crate::api::FsApi;
-    use crate::core::Core;
+    use crate::vnext::Core;
     use std::sync::Barrier;
     use std::sync::atomic::AtomicBool;
     use std::thread;
@@ -1511,7 +1511,7 @@ mod r2 {
     use super::tests::core_at;
     use super::*;
     use crate::api::FsApi;
-    use crate::core::Core;
+    use crate::vnext::Core;
     use std::time::Instant;
 
     const CHUNK: u64 = 128 * 1024;

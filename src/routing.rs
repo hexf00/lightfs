@@ -486,7 +486,7 @@ impl FsApi for RoutingFs {
 mod tests {
     use super::*;
     use crate::config::{Config, MetadataSection};
-    use crate::core::Core;
+    use crate::vnext::Core;
     use crate::policy::RawRule;
     // Only CountingFs (unix-gated) uses these.
     #[cfg(unix)]

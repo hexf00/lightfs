@@ -56,6 +56,11 @@ pub enum Error {
     /// silently degraded, retried, or worked around by evicting staged
     /// data (S4 P0-c invariant 7).
     Capacity(String),
+    /// Stored object failed its integrity envelope (bad magic, unknown
+    /// format version/encoder, truncated body, sha256 mismatch). The
+    /// object is refused and REPORTED — damaged data is never served as
+    /// if it were correct (vnext contract C).
+    ObjectCorrupt(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -95,6 +100,7 @@ impl fmt::Display for Error {
             Error::Exdev(m) => write!(f, "cross-device link: {m}"),
             Error::Config(m) => write!(f, "config: {m}"),
             Error::Capacity(m) => write!(f, "capacity-exhausted: {m}"),
+            Error::ObjectCorrupt(m) => write!(f, "object corrupt: {m}"),
         }
     }
 }
@@ -134,6 +140,7 @@ impl Error {
             Error::Exdev(_) => "EXDEV",
             Error::Config(_) => "CONFIG",
             Error::Capacity(_) => "CAPACITY",
+            Error::ObjectCorrupt(_) => "OBJECT_CORRUPT",
         }
     }
 }

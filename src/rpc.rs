@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::core::Core;
+use crate::vnext::Core;
 use crate::error::{Error, Result};
 use crate::metadata::{Node, NodeKind};
 
@@ -145,22 +145,6 @@ fn handle(core: &Core, method: &str, params: &Value) -> Result<Value> {
                 "s3_list": g(&m.s3_list),
                 "bytes_read": g(&m.bytes_read), "bytes_written": g(&m.bytes_written),
                 "conflicts": g(&m.conflicts), "metadata_tx": g(&m.metadata_tx),
-                "pack_uploads": g(&m.pack_uploads), "pack_entries": g(&m.pack_entries),
-                "pack_dead_bytes": g(&m.pack_dead_bytes),
-                "pack_cache_hits": g(&m.pack_cache_hits), "pack_cache_misses": g(&m.pack_cache_misses),
-                "pack_cache_evictions": g(&m.pack_cache_evictions),
-                "pack_bytes_loaded": g(&m.pack_bytes_loaded),
-                "wb_enqueued": g(&m.wb_enqueued), "wb_drained": g(&m.wb_drained),
-                "wb_conflicts": g(&m.wb_conflicts),
-                "wb_packs": g(&m.wb_packs), "wb_overflow": g(&m.wb_overflow),
-                "wb_coalesced": g(&m.wb_coalesced), "wb_cancelled": g(&m.wb_cancelled),
-                "wb_discarded": g(&m.wb_discarded), "wb_cas_ok": g(&m.wb_cas_ok),
-                // live queue state: "fully drained" = queued == 0 AND
-                // draining == 0 (dead-lettered rows are terminal, not
-                // pending work)
-                "wb_queued": core.wb().map(|w| w.queue_counts().0).unwrap_or(0),
-                "wb_draining": core.wb().map(|w| w.queue_counts().1).unwrap_or(0),
-                "wb_dead": core.wb().map(|w| w.queue_counts().2).unwrap_or(0),
             }))
         }
         "lookup" | "getattr" | "open" => {
@@ -304,15 +288,12 @@ pub fn handle_body(core: &Core, body: &[u8]) -> (Value, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::sqlite::SqliteMetadataStore;
     use crate::object_store::mem::MemObjectStore;
+    use crate::vnext::Store;
     use std::sync::Arc;
 
     fn core() -> Core {
-        Core::new(
-            Arc::new(SqliteMetadataStore::open_in_memory().unwrap()),
-            Arc::new(MemObjectStore::new()),
-        )
+        Core::new(Store::open_in_memory().unwrap(), Arc::new(MemObjectStore::new())).unwrap()
     }
 
     fn call(core: &Core, id: i64, method: &str, params: Value) -> (bool, Value) {

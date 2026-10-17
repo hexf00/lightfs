@@ -350,7 +350,7 @@ fn errno(e: &Error) -> c_int {
         // budget guards disk space); never a silent retry or eviction.
         Error::Capacity(_) => ENOSPC,
         Error::Conflict { .. } => EIO,
-        Error::Storage(_) | Error::Db(_) | Error::Io(_) | Error::Config(_) => EIO,
+        Error::Storage(_) | Error::Db(_) | Error::Io(_) | Error::Config(_) | Error::ObjectCorrupt(_) => EIO,
     }
 }
 

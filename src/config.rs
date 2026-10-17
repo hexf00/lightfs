@@ -185,7 +185,7 @@ pub struct RetentionSection {
 impl Default for RetentionSection {
     fn default() -> Self {
         Self {
-            superseded_secs: crate::core::DEFAULT_SUPERSEDED_SECS,
+            superseded_secs: 7 * 24 * 3600,
         }
     }
 }
