@@ -39,7 +39,7 @@ cp config/example.toml cfg.toml      # edit endpoint/bucket/credentials
 ./target/release/lightfs mount --config cfg.toml /mnt/lightfs   # Linux + /dev/fuse
 ```
 
-CLI: `lightfs {server|mount|fsck|backup|gc|create-bucket|version}`
+CLI: `lightfs {server|mount|fsck|backup [--expires-in SECS]|backup prune --id ID|gc|create-bucket|version}` plus the standalone `lightfs-shell` / `lightfs-bench` binaries.
 
 ## Backup & gc
 
