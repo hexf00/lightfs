@@ -1,8 +1,10 @@
 # The vnext model — SQLite authority, payload-only object store
 
-Status: S4.21 (branch `vnext`; S4.20 removed per-commit meta/ publication,
+Status: S4.22 (branch `vnext`; S4.20 removed per-commit meta/ publication,
 S4.21 merged the new-file write into one transaction, split the three
-object identities and made the namespace claim atomic).
+object identities and made the namespace claim atomic; S4.22 moved
+object registration INTO that transaction and backend-qualified the
+ledger end to end).
 This document is the authoritative description: what is authoritative,
 what the object store holds, how crashes decompose, what disaster
 recovery guarantees (and explicitly does NOT guarantee), and where the
@@ -90,17 +92,37 @@ backend-neutrality boundaries sit.
 ```
 1. PUT data object   (envelope v1, immutable Object-ID key) — NO SQLite
                      write lock is held across the upload
-2. ledger the key    (durable SQLite row)
-3. BEGIN IMMEDIATE   walk base trees INSIDE the tx (no stale-snapshot
-                     lost updates); for a NEW file, allocate the File
-                     ID and create the directory entry HERE (S4.21: no
+2. BEGIN IMMEDIATE   walk base trees INSIDE the tx (no stale-snapshot
+                     lost updates); REGISTER the uploaded object
+                     (ledger row, S4.22: inside the tx, not a separate
+                     autocommit); for a NEW file, allocate the File ID
+                     and create the directory entry HERE (S4.21: no
                      separate empty-file create commit); for an
                      existing file, judge the caller's CAS against the
                      in-transaction entry; insert file_version, bind
                      the StorageRef, COW the touched chain, append
                      commit, advance ref — one transaction
-4. COMMIT            ← the commit is durable HERE; nothing follows
+3. COMMIT            ← the commit is durable HERE; registration and
+                        file reference took effect atomically
 ```
+
+ONE SQLite write transaction per successful content commit (S4.22:
+the pre-transaction ledger autocommit is gone).
+
+**Failure contract (S4.22).** A PUT that succeeded but whose logical
+commit failed — confirmed Conflict/kind/path failure, uncertain commit,
+any error — is re-registered in an INDEPENDENT transaction so reachability
+gc can prove-and-reclaim it. The original error is ALWAYS returned
+unchanged; cleanup never masks the caller's truth. A failed or
+interrupted re-registration leaves the object UNREGISTERED, and gc
+provably never deletes unregistered objects: the residue is safe by
+construction. SQLite commit-error semantics are classified, not assumed:
+a failed COMMIT is probed with ROLLBACK — a succeeding ROLLBACK proves
+certain rollback (transaction still open, e.g. BUSY); a ROLLBACK refused
+because no transaction is active proves the commit DID apply. The two
+cases surface as distinct errors; re-registration is safe in both worlds
+because the ledger alone never makes an object a deletion candidate —
+reachability does.
 
 Every decision (path conflict, CAS, kind) is judged INSIDE the
 transaction; the pre-transaction lookup is advisory only (it saves
@@ -113,10 +135,11 @@ Crash decomposition:
 
 | crash window | state after restart |
 |---|---|
-| during 1 / before 2 | raw object, no ledger row: gc can NOT prove it dead → kept (fail-safe; salvage can read it) |
-| during 2 / before 3 | ledgered, unreferenced → reachability gc reclaims |
-| during 3 | one transaction → SQLite rolls back; ledgered-orphan as above — a committed upload whose logical commit failed is NEVER risk-deleted for cleanup convenience |
-| after 4 | done — there IS no post-commit publication step to lose |
+| during 1 (the PUT) | no confirmed upload, or a raw object with no ledger row: gc can NOT prove it dead → kept (fail-safe; salvage can read it) |
+| killed with the tx OPEN | SQLite rolls back on restart: neither the file version NOR the in-tx registration exists (one atomic unit) — cross-process kill-window tested |
+| confirmed logical failure (conflict/kind/path) | main tx rolled back; the upload is re-registered in an independent tx → ledgered, unreferenced → gc reclaims; re-registration failure/crash leaves it unregistered → kept (fail-safe) |
+| uncertain COMMIT error | classified by ROLLBACK probe (certain rollback vs applied); object re-registered either way — safe in both worlds |
+| after COMMIT | done — registration, reference and commit took effect together; there is no post-commit step to lose |
 
 ## 3. Recovery
 
@@ -125,8 +148,10 @@ WAL + synchronous=FULL; a killed or crashed process recovers the full,
 consistent namespace from SQLite alone (covered by graceful-restart and
 SIGKILL integration tests). GC keeps its fail-closed gate: the model
 marker row AND at least one ref row must be readable IN SQLITE, or gc
-refuses; unreachable-provable objects only; `objects/` keys without a
-ledger row are NEVER deleted (they cannot be proven dead). Corrupted or
+refuses; unreachable-provable objects only, judged on full (backend,
+locator) pairs; objects without a ledger row are NEVER deleted (they
+cannot be proven dead); rows bound to a backend this engine cannot see
+are never deleted and never reinterpreted (S4.22). Corrupted or
 missing SQLite fails the store open, so gc has no entry point at all.
 
 **B. Database lost: content salvage, READ-ONLY.**

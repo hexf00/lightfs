@@ -1220,15 +1220,20 @@ impl Core {
     }
 
     /// Commit a write session: data PUT first (envelope-sealed, integrity
-    /// digest inside), then ONE metadata transaction. A file-level
-    /// version conflict (another writer committed first) is an explicit
-    /// Conflict; the orphaned object stays ledgered for reachability gc.
+    /// digest inside), then ONE metadata transaction — S4.22: the object
+    /// REGISTRATION lives in that same transaction (the separate
+    /// autocommit ledger write is gone; one SQLite write transaction per
+    /// successful content commit). A file-level version conflict or any
+    /// other confirmed logical failure rolls the transaction back AND
+    /// re-registers the uploaded object in an INDEPENDENT transaction, so
+    /// gc can prove-and-reclaim it; a failed or interrupted
+    /// re-registration leaves the object UNREGISTERED, which gc never
+    /// deletes (fail-safe residue, never risk-deleted for cleanup).
     pub fn commit_write(&self, handle: &WriteHandle) -> Result<Node> {
         let content = handle.snapshot();
         let key = data_key(&new_object_id());
         let sealed = envelope::seal(ObjKind::Data, &content);
         let info = self.objects.put(&key, &sealed)?;
-        self.store.ledger_object(&key)?;
 
         let comps = Self::split_path(&handle.path)?;
         let name = comps
@@ -1241,7 +1246,10 @@ impl Core {
         let (mtime, size, etag) = (now_secs(), content.len() as i64, info.etag.clone());
         let backend = self.objects.backend_id();
         let key2 = key.clone();
-        self.mutate(&comps[..comps.len() - 1], |conn, entries| {
+        let result = self.mutate(&comps[..comps.len() - 1], |conn, entries| {
+            // Registration is INSIDE the commit transaction: ledger row
+            // and file reference commit atomically or not at all.
+            Store::ledger_object_tx(conn, &backend, &key)?;
             Store::insert_file_version_tx(conn, &FileVersionRow {
                 file_id,
                 version,
@@ -1280,8 +1288,36 @@ impl Core {
             entry.s = size;
             entry.mt = mtime;
             Ok(())
-        })?;
+        });
+        Self::reregister_uploaded_object_on_failure(self, &backend, &key, &result);
+        result?;
         self.lookup(&handle.path)
+    }
+
+    /// S4.22 failure contract: after a successful PUT whose logical
+    /// commit did NOT succeed (confirmed conflict, uncertain commit,
+    /// anything), the uploaded object is re-registered in an INDEPENDENT
+    /// transaction so reachability gc can reclaim it. The ORIGINAL error
+    /// is always returned unchanged — cleanup convenience never masks
+    /// the caller's truth. If re-registration itself fails, that is
+    /// logged as a diagnostic and the object stays UNREGISTERED: gc
+    /// provably keeps objects without a ledger row, so the residue is
+    /// safe, not destructive.
+    fn reregister_uploaded_object_on_failure<T>(
+        core: &Core,
+        backend: &str,
+        key: &str,
+        result: &Result<T>,
+    ) {
+        if result.is_ok() {
+            return;
+        }
+        if let Err(le) = core.store.ledger_object(backend, key) {
+            eprintln!(
+                "lightfs: WARNING orphan re-registration failed for {key} (object kept \
+                 UNREGISTERED — gc never deletes without a ledger row): {le}"
+            );
+        }
     }
 
     /// Server streaming write (S4.21 merged path): a new-file write is
@@ -1339,8 +1375,10 @@ impl Core {
         let info = self.objects.put(&key, &spooled)?;
         let backend = self.objects.backend_id();
         let etag = info.etag;
-        self.store.ledger_object(&key)?;
-        self.mutate(&comps[..comps.len() - 1], |conn, entries| {
+        let result = self.mutate(&comps[..comps.len() - 1], |conn, entries| {
+            // Registration is INSIDE the commit transaction (S4.22): the
+            // ledger row and the logical commit land atomically.
+            Store::ledger_object_tx(conn, &backend, &key)?;
             let entry = entries.iter_mut().find(|e| e.n == name);
             let (file_id, base_version) = match entry {
                 // EXISTING file: overwrite, caller's CAS condition judged
@@ -1422,7 +1460,9 @@ impl Core {
             e.s = len as i64;
             e.mt = now_secs();
             Ok(())
-        })?;
+        });
+        Self::reregister_uploaded_object_on_failure(self, &backend, &key, &result);
+        result?;
         self.lookup(path)
     }
 

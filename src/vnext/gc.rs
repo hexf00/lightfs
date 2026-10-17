@@ -1,10 +1,15 @@
 //! vnext reachability gc. Deletion domain = objects ledgered under our
 //! authority MINUS objects reachable from EVERY valid reference root
 //! (all refs → their full commit chains → COW trees → file entries).
-//! Fail-closed: without a readable model marker and at least one ref,
-//! reachability cannot be proven and NOTHING is deleted. Recovery
-//! objects (`meta/…`, content-addressed) are never in the deletion
-//! domain — they are the disaster-recovery assets, not garbage.
+//! The ledger and the reachability walk are BACKEND-QUALIFIED
+//! end-to-end (S4.22): a candidate is a (backend, locator) pair, and a
+//! row whose backend is NOT the engine's bound store is never deleted
+//! and never assumed to belong to the configured backend — this engine
+//! has no handle to it, so deletion would be a guess. Fail-closed:
+//! without a readable model marker and at least one ref, reachability
+//! cannot be proven and NOTHING is deleted. Recovery objects
+//! (`meta/…`, content-addressed) are never in the deletion domain —
+//! they are the disaster-recovery assets, not garbage.
 
 use std::collections::HashSet;
 
@@ -17,6 +22,10 @@ pub struct GcReport {
     pub candidates: usize,
     pub deleted: u64,
     pub failed: u64,
+    /// Ledger rows bound to a backend this engine cannot see: kept
+    /// unconditionally (never deleted, never reinterpreted as belonging
+    /// to the configured store).
+    pub foreign_kept: u64,
     pub skipped_unreachable_proof: bool,
 }
 
@@ -49,7 +58,7 @@ pub fn collect(core: &Core) -> Result<GcReport> {
         }
     }
 
-    let mut live_objects: HashSet<String> = HashSet::new();
+    let mut live_objects: HashSet<(String, String)> = HashSet::new();
     let mut tree_stack: Vec<i64> = Vec::new();
     for id in &live_commit_ids {
         if let Some(c) = by_id.get(id) {
@@ -65,33 +74,42 @@ pub fn collect(core: &Core) -> Result<GcReport> {
             match (e.k.as_str(), e.tid) {
                 ("dir", Some(child)) => tree_stack.push(child),
                 _ => {
-                    // Reachability is judged on the LOCATOR (the backend's
-                    // physical key); the backend tag is routing metadata,
-                    // not part of the reachability identity.
+                    // Reachability is judged on the FULL storage
+                    // reference: the same locator text on a different
+                    // backend is a different physical object and must
+                    // never stand in for it.
                     if let Some(r) = &e.o {
-                        live_objects.insert(r.locator.clone());
+                        live_objects.insert((r.backend.clone(), r.locator.clone()));
                     }
                 }
             }
         }
     }
 
+    let bound_backend = core.objects().backend_id();
     let known = core.store().known_objects()?;
+    let candidates: Vec<&(String, String)> = known
+        .iter()
+        .filter(|pair| !live_objects.contains(*pair))
+        .collect();
     let report = GcReport {
         live_objects: live_objects.len(),
-        candidates: known.iter().filter(|k| !live_objects.contains(*k)).count(),
+        candidates: candidates.len(),
         ..GcReport::default()
     };
     let mut report = report;
-    for key in &known {
-        if live_objects.contains(key) {
+    for (backend, locator) in candidates {
+        if *backend != bound_backend {
+            // No deletion domain authority over another backend: kept and
+            // reported, never reinterpreted as "probably ours".
+            report.foreign_kept += 1;
             continue;
         }
-        // Idempotent delete (missing key is fine); only forget the
-        // ledger row AFTER the delete reported success.
-        match core.objects().delete(key) {
+        // Idempotent delete (missing key is fine); only forget the ledger
+        // row AFTER the delete reported success.
+        match core.objects().delete(locator) {
             Ok(()) => {
-                core.store().forget_object(key)?;
+                core.store().forget_object(backend, locator)?;
                 report.deleted += 1;
             }
             Err(_) => {

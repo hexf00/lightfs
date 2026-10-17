@@ -45,6 +45,16 @@ fn fresh(tag: &str) -> Config {
     cfg
 }
 
+/// The same stable string S3ObjectStore::backend_id reports (endpoint +
+/// bucket) — ledger rows in child modes must name the real backend.
+fn backend_id(cfg: &Config) -> String {
+    format!(
+        "s3://{}/{}",
+        cfg.s3.endpoint.trim_end_matches('/'),
+        cfg.s3.bucket
+    )
+}
+
 fn write_file(core: &lightfs::vnext::Core, path: &str, bytes: &[u8]) {
     core.create(path, 0o644).unwrap();
     let h = core.open_write(path, None).unwrap();
@@ -99,10 +109,57 @@ fn child_main(mode: &str, db: String, bucket: String) -> ! {
             // must keep it (fail-safe: never delete the unprovable).
             let ledgered = "objects/999/orphan-ledgered.data";
             core.objects().put(ledgered, b"orphan bytes").unwrap();
-            core.store().ledger_object(ledgered).unwrap();
+            core.store().ledger_object(&backend_id(&cfg), ledgered).unwrap();
             core.objects()
                 .put("objects/999/orphan-raw.data", b"raw bytes")
                 .unwrap();
+            std::process::exit(9);
+        }
+        // S4.22 kill-window: SIGKILL AFTER a raw PUT, BEFORE any ledger
+        // row — the object is unregistered residue; gc must never delete
+        // it (the ledger is the deletion domain, not the bucket).
+        "kill_after_put" => {
+            write_file(core, "/keep-0", b"committed-0");
+            core.objects()
+                .put("objects/raw-kill.data", b"unregistered-residue")
+                .unwrap();
+            std::process::exit(9);
+        }
+        // S4.22 kill-window: SIGKILL INSIDE the metadata transaction —
+        // SQLite rolls back on restart: neither the ledger row nor the
+        // file version may exist, and the engine opens cleanly.
+        "kill_in_tx" => {
+            write_file(core, "/keep-0", b"committed-0");
+            let fid = core.lookup("/keep-0").unwrap().id;
+            let be = backend_id(&cfg);
+            let _ = core.store().with_tx(|conn| -> lightfs::error::Result<()> {
+                lightfs::vnext::store::Store::ledger_object_tx(
+                    conn,
+                    &be,
+                    "objects/in-tx-kill.data",
+                )?;
+                lightfs::vnext::store::Store::insert_file_version_tx(
+                    conn,
+                    &lightfs::vnext::store::FileVersionRow {
+                        file_id: fid,
+                        version: 99,
+                        size: 1,
+                        mtime: 0,
+                        mode: 0o644,
+                        object_backend: be.clone(),
+                        object_key: "objects/in-tx-kill.data".into(),
+                        etag: "never".into(),
+                    },
+                )?;
+                // die with the transaction open
+                std::process::exit(9);
+            });
+            unreachable!();
+        }
+        // S4.22 kill-window: SIGKILL immediately AFTER a committed write
+        // was acked — the commit must survive (no lost committed files).
+        "kill_after_commit" => {
+            write_file(core, "/durable", b"durable-bytes");
             std::process::exit(9);
         }
         // normal completion: the restart workflow's first act
@@ -539,4 +596,65 @@ fn namespace_claim_race_two_processes_exactly_one_winner() {
         msg.contains("namespace mismatch") || msg.contains("another namespace's marker"),
         "{msg}"
     );
+}
+
+/// S4.22 §四.5: SIGKILL in each failure window (after PUT / inside the
+/// transaction / after commit) loses NO committed file and lets gc
+/// reclaim NOTHING that was not provably dead.
+#[test]
+fn s422_kill_windows_no_loss_no_wrong_reclaim() {
+    // Window A: killed after the PUT, before any registration.
+    {
+        let cfg = fresh("kput");
+        let st = run_child("kill_after_put", &cfg);
+        assert_eq!(st.code(), Some(9), "child must die hard");
+        let eng = lightfs::engine::open_engine(&cfg).unwrap();
+        assert_eq!(eng.core.read("/keep-0", 0, 64).unwrap(), b"committed-0");
+        // Unregistered residue: gc keeps it (deletion domain = ledger).
+        let objects = eng.core.objects();
+        let before = list_all_keys(objects.as_ref());
+        let rep = lightfs::vnext::gc::collect(&eng.core).unwrap();
+        assert_eq!(rep.deleted, 0, "unregistered object must NOT be reclaimed");
+        assert_eq!(
+            list_all_keys(objects.as_ref()),
+            before,
+            "gc changed nothing in window A"
+        );
+        // Register it (as the crash WOULD have, had the process lived) —
+        // now it is provably unreachable and gc reclaims exactly it.
+        eng.core
+            .store()
+            .ledger_object(&backend_id(&cfg), "objects/raw-kill.data")
+            .unwrap();
+        let rep = lightfs::vnext::gc::collect(&eng.core).unwrap();
+        assert_eq!(rep.deleted, 1);
+        assert!(objects.get("objects/raw-kill.data", None).is_err());
+    }
+    // Window B: killed INSIDE the metadata transaction.
+    {
+        let cfg = fresh("ktx");
+        let st = run_child("kill_in_tx", &cfg);
+        assert_eq!(st.code(), Some(9));
+        let eng = lightfs::engine::open_engine(&cfg).unwrap();
+        // Transaction rolled back: no ledger row, no phantom version.
+        let known = eng.core.store().known_objects().unwrap();
+        assert!(
+            !known.iter().any(|(_, l)| l == "objects/in-tx-kill.data"),
+            "in-transaction registration must not survive: {known:?}"
+        );
+        let node = eng.core.lookup("/keep-0").unwrap();
+        assert_eq!(eng.core.read("/keep-0", 0, 64).unwrap(), b"committed-0");
+        assert_eq!(node.version, 1, "no phantom version 99");
+    }
+    // Window C: killed immediately after a committed write was acked.
+    {
+        let cfg = fresh("kcommit");
+        let st = run_child("kill_after_commit", &cfg);
+        assert_eq!(st.code(), Some(9));
+        let eng = lightfs::engine::open_engine(&cfg).unwrap();
+        assert_eq!(eng.core.read("/durable", 0, 64).unwrap(), b"durable-bytes");
+        // gc is safe right after restart: the committed object stays.
+        lightfs::vnext::gc::collect(&eng.core).unwrap();
+        assert_eq!(eng.core.read("/durable", 0, 64).unwrap(), b"durable-bytes");
+    }
 }

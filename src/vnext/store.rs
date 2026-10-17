@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use crate::error::{Error, Result};
 
-pub const MODEL_MARKER: &str = "vnext-2";
+pub const MODEL_MARKER: &str = "vnext-3";
 
 /// A persisted object reference: the LOGICAL binding of an immutable data
 /// object to the backend that holds it. `backend` names the configured
@@ -199,8 +199,10 @@ impl Store {
                 seq       INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS objects (
-                key           TEXT PRIMARY KEY,
-                registered_at INTEGER NOT NULL
+                backend       TEXT NOT NULL,
+                locator       TEXT NOT NULL,
+                registered_at INTEGER NOT NULL,
+                PRIMARY KEY (backend, locator)
             );
             "#,
         )
@@ -319,19 +321,45 @@ impl Store {
     // ---- primitive row operations (callers own transaction boundaries
     // through `with_tx`; read paths take the connection lock directly) ----
 
-    pub(crate) fn with_tx<T>(
+    /// One serialized write transaction. The closure's error ROLLS BACK
+    /// with certainty (we issue the ROLLBACK ourselves). A COMMIT failure
+    /// is NOT assumed to equal rollback: SQLite explicitly leaves the
+    /// outcome of an errored COMMIT indeterminate in some failure classes
+    /// (I/O errors during journal sync), and a BUSY commit leaves the
+    /// transaction OPEN. Classification by probe: a succeeding ROLLBACK
+    /// proves the transaction never applied (certain rollback); a
+    /// ROLLBACK refused because no transaction is active proves the
+    /// commit DID apply. Both are surfaced as distinct errors — callers
+    /// must never report a certain outcome for an uncertain one, and the
+    /// write path's orphan re-registration stays safe in both worlds
+    /// (ledgering a referenced object is harmless; reachability, not the
+    /// ledger, decides deletion).
+    pub fn with_tx<T>(
         &self,
         f: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<T> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch("BEGIN IMMEDIATE").map_err(db_err)?;
         match f(&conn) {
-            Ok(v) => {
-                conn.execute_batch("COMMIT").map_err(db_err)?;
-                Ok(v)
-            }
+            Ok(v) => match conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(v),
+                Err(commit_err) => match conn.execute_batch("ROLLBACK") {
+                    // The transaction is still ours: nothing applied.
+                    Ok(()) => Err(Error::Db(format!(
+                        "commit failed, transaction rolled back (certain): {commit_err}"
+                    ))),
+                    Err(_) => Err(Error::Db(format!(
+                        "commit failed and the outcome is UNCERTAIN (rollback refused: \
+                         the commit may have applied): {commit_err}"
+                    ))),
+                },
+            },
             Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK");
+                if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                    return Err(Error::Db(format!(
+                        "{e}; additionally the rollback FAILED (outcome UNCERTAIN): {rb}"
+                    )));
+                }
                 Err(e)
             }
         }
@@ -669,45 +697,48 @@ impl Store {
         })
     }
 
-    /// Ledger an object BEFORE/AFTER its PUT: a row here means "this key
-    /// was written under our authority and must be considered for gc".
-    /// Crash windows can leave ledger rows for objects no commit
-    /// references — exactly what reachability gc collects.
-    pub fn ledger_object(&self, key: &str) -> Result<()> {
+    /// Ledger an uploaded object: a row here means "this (backend,
+    /// locator) was written under our authority and must be considered
+    /// for gc". Registration carries the BACKEND IDENTITY: the same
+    /// locator string on a different backend is a DIFFERENT physical
+    /// object and never conflated. Crash windows can leave rows for
+    /// objects no commit references — exactly what reachability gc
+    /// collects; objects WITHOUT a row are never deleted (fail-safe).
+    pub fn ledger_object(&self, backend: &str, locator: &str) -> Result<()> {
+        self.read(|conn| Self::ledger_object_tx(conn, backend, locator))
+    }
+
+    /// Same registration INSIDE an open transaction (the success path
+    /// registers in the commit's own transaction — S4.22).
+    pub fn ledger_object_tx(conn: &Connection, backend: &str, locator: &str) -> Result<()> {
+        conn.execute(
+            "INSERT OR IGNORE INTO objects(backend, locator, registered_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![backend, locator, now_secs()],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn forget_object(&self, backend: &str, locator: &str) -> Result<()> {
         self.read(|conn| {
             conn.execute(
-                "INSERT OR IGNORE INTO objects(key, registered_at) VALUES (?1, ?2)",
-                rusqlite::params![key, now_secs()],
+                "DELETE FROM objects WHERE backend=?1 AND locator=?2",
+                rusqlite::params![backend, locator],
             )
             .map_err(db_err)?;
             Ok(())
         })
     }
 
-    pub fn ledger_object_tx(conn: &Connection, key: &str) -> Result<()> {
-        conn.execute(
-            "INSERT OR IGNORE INTO objects(key, registered_at) VALUES (?1, ?2)",
-            rusqlite::params![key, now_secs()],
-        )
-        .map_err(db_err)?;
-        Ok(())
-    }
-
-    pub fn forget_object(&self, key: &str) -> Result<()> {
-        self.read(|conn| {
-            conn.execute("DELETE FROM objects WHERE key=?1", [key])
-                .map_err(db_err)?;
-            Ok(())
-        })
-    }
-
-    pub fn known_objects(&self) -> Result<Vec<String>> {
+    /// Every ledger row as a (backend, locator) pair — gc's deletion
+    /// domain, backend-qualified end to end.
+    pub fn known_objects(&self) -> Result<Vec<(String, String)>> {
         self.read(|conn| {
             let mut stmt = conn
-                .prepare("SELECT key FROM objects ORDER BY key")
+                .prepare("SELECT backend, locator FROM objects ORDER BY backend, locator")
                 .map_err(db_err)?;
             let rows = stmt
-                .query_map([], |r| r.get::<_, String>(0))
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
                 .map_err(db_err)?;
             rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)
         })

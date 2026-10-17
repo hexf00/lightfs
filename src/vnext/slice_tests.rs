@@ -222,7 +222,7 @@ fn slice6_gc_respects_reference_roots() {
     objects
         .put("objects/999/w-orphan.data", b"garbage")
         .unwrap();
-    core.store().ledger_object("objects/999/w-orphan.data").unwrap();
+    core.store().ledger_object("mem", "objects/999/w-orphan.data").unwrap();
 
     let report = gc::collect(&core).unwrap();
     assert_eq!(report.deleted, 1, "only the true orphan is collected");
@@ -631,4 +631,134 @@ fn s421_put_if_absent_claim_semantics() {
     assert!(!s.put_if_absent("ns/marker", b"two").unwrap());
     // The loser changed nothing.
     assert_eq!(s.get("ns/marker", None).unwrap().data, b"one");
+}
+
+// ---- S4.22: transactional registration & backend-aware gc ledger ----
+
+/// A CONFIRMED logical failure (CAS conflict) rolls the main transaction
+/// back, re-registers the uploaded object in an INDEPENDENT transaction,
+/// and still returns the REAL error. The orphan is then provably dead
+/// for gc; the committed file is untouched.
+#[test]
+fn s422_conflict_reregisters_uploaded_orphan_gable() {
+    let (core, objects) = mk_core("s422-conflict");
+    core.create("/f", 0o644).unwrap();
+    let h1 = core.open_write("/f", None).unwrap();
+    core.write(&h1, 0, b"winner").unwrap();
+    core.commit_write(&h1).unwrap();
+
+    let before: std::collections::HashSet<_> = core.store().known_objects().unwrap().into_iter().collect();
+    // A STALE session: snapshot taken at version 0, commit attempts v1.
+    let h2 = core.open_write("/f", Some(0)).unwrap();
+    core.write(&h2, 0, b"loser").unwrap();
+    let err = core.commit_write(&h2).unwrap_err();
+    assert!(format!("{err}").contains("conflict"), "real error returned: {err}");
+
+    // The loser's upload became a ledgered orphan: exactly one new row.
+    let known = core.store().known_objects().unwrap();
+    let new_rows: Vec<_> = known
+        .iter()
+        .filter(|p| !before.contains(*p))
+        .cloned()
+        .collect();
+    assert_eq!(new_rows.len(), 1, "exactly the re-registered orphan: {new_rows:?}");
+    let (_, locator) = new_rows[0].clone();
+    assert!(
+        objects.get(&locator, None).is_ok(),
+        "the uploaded loser object exists"
+    );
+    // gc reclaims exactly the orphan; the winner is untouched.
+    let rep = crate::vnext::gc::collect(&core).unwrap();
+    assert_eq!(rep.deleted, 1, "{rep:?}");
+    assert!(objects.get(&locator, None).is_err(), "orphan reclaimed");
+    assert_eq!(core.read("/f", 0, 64).unwrap(), b"winner");
+}
+
+/// The ledger is BACKEND-QUALIFIED: the same locator under two backends
+/// is two rows, never conflated; forgetting one leaves the other.
+#[test]
+fn s422_ledger_is_backend_qualified() {
+    let dir = std::env::temp_dir().join(format!(
+        "lfs-vnext-s422-ledger-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = Store::open(&dir.join("meta.db").to_string_lossy()).unwrap();
+    store.ledger_object("mem-a", "objects/dup.data").unwrap();
+    store.ledger_object("mem-b", "objects/dup.data").unwrap();
+    let known = store.known_objects().unwrap();
+    assert_eq!(known.len(), 2, "same locator, different backends: {known:?}");
+    assert!(known.contains(&("mem-a".into(), "objects/dup.data".into())));
+    assert!(known.contains(&("mem-b".into(), "objects/dup.data".into())));
+    store.forget_object("mem-a", "objects/dup.data").unwrap();
+    let known = store.known_objects().unwrap();
+    assert_eq!(known, vec![("mem-b".into(), "objects/dup.data".into())]);
+}
+
+/// gc refuses to delete rows bound to a backend it cannot see — and
+/// never reinterprets them as belonging to the configured store.
+#[test]
+fn s422_gc_keeps_foreign_backend_rows() {
+    let (core, objects) = mk_core("s422-foreign");
+    core.create("/f", 0o644).unwrap();
+    let h = core.open_write("/f", None).unwrap();
+    core.write(&h, 0, b"live").unwrap();
+    core.commit_write(&h).unwrap();
+    // Our own orphan (gc-eligible) and someone else's ledger row.
+    objects.put("objects/ours-orphan.data", b"o").unwrap();
+    core.store().ledger_object("mem", "objects/ours-orphan.data").unwrap();
+    core.store().ledger_object("another-backend", "objects/dup.data").unwrap();
+
+    let rep = crate::vnext::gc::collect(&core).unwrap();
+    assert_eq!(rep.deleted, 1, "exactly the current-backend orphan: {rep:?}");
+    assert_eq!(rep.foreign_kept, 1, "foreign row kept, never deleted: {rep:?}");
+    assert!(objects.get("objects/ours-orphan.data", None).is_err());
+    // The foreign row is still in the ledger (untouched authority).
+    let known = core.store().known_objects().unwrap();
+    assert!(known.contains(&("another-backend".into(), "objects/dup.data".into())));
+}
+
+/// Success-path registration is IN the commit transaction: a rolled
+/// back step leaves NEITHER a file version NOR a ledger row (atomicity
+/// observed from outside; the cross-process kill-window test covers the
+/// process-death variant).
+#[test]
+fn s422_registration_is_inside_the_commit_transaction() {
+    let (core, _objects) = mk_core("s422-atomic");
+    core.create("/f", 0o644).unwrap();
+    let known_before = core.store().known_objects().unwrap().len();
+
+    // A step error AFTER the in-tx registration must roll BOTH back.
+    // Drive it through commit_write with a kind conflict: turn /f into a
+    // directory-like mismatch by writing through a path that now names a
+    // different file id (rename swap). Simplest deterministic in-tx
+    // failure after registration: CAS conflict.
+    let h1 = core.open_write("/f", None).unwrap();
+    core.write(&h1, 0, b"winner").unwrap();
+    core.commit_write(&h1).unwrap();
+    let after_winner: std::collections::HashSet<_> =
+        core.store().known_objects().unwrap().into_iter().collect();
+    assert_eq!(after_winner.len(), known_before + 1, "winner registered in-tx");
+    let h2 = core.open_write("/f", Some(0)).unwrap();
+    core.write(&h2, 0, b"loser").unwrap();
+    assert!(core.commit_write(&h2).is_err());
+
+    let known = core.store().known_objects().unwrap();
+    let new_rows: Vec<_> = known
+        .iter()
+        .filter(|p| !after_winner.contains(*p))
+        .cloned()
+        .collect();
+    assert_eq!(
+        new_rows.len(),
+        1,
+        "only the re-registered orphan is new; the rolled-back in-tx registration left nothing"
+    );
+    // No phantom version: /f is still at version 1 with winner bytes.
+    assert_eq!(core.lookup("/f").unwrap().version, 1);
+    assert_eq!(core.read("/f", 0, 64).unwrap(), b"winner");
 }
