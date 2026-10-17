@@ -1,59 +1,62 @@
-# The vnext model — immutable metadata authority over object storage
+# The vnext model — SQLite authority, payload-only object store
 
-Status: S4.19 first integration slice (branch `vnext`). This document is
-the authoritative description of the new core: what is authoritative,
-what is rebuildable, how crashes decompose, and what is deliberately out
-of scope.
+Status: S4.20 (branch `vnext`, supersedes the S4.19 recovery-copy design).
+This document is the authoritative description: what is authoritative,
+what the object store holds, how crashes decompose, what disaster
+recovery guarantees (and explicitly does NOT guarantee), and where the
+backend-neutrality boundaries sit.
 
-## 1. Authority
+## 1. Authority and storage boundary
 
-Five object classes, all immutable except refs:
-
-```
-refs        (mutable, one row per branch: name → commit sha, seq)
-  └─ commits        {parent, root_tree, seq}            meta/commits/<sha>
-       └─ trees     COW directories, entries JSON,
-                    content-addressed (sha256 of canonical JSON)
-                                                       meta/trees/<sha>
-             └─ file_versions  (file_id, version) unique — the optimistic
-                               concurrency anchor per FILE
-                    └─ data objects (envelope v1)    objects/<fid>/w-*.data
-```
-
-- The LOGICAL authority is the object store: `meta/refs/{name}` names a
-  commit; walking parent links folds every tree the namespace ever had.
-  `vnext::recover::namespace_view` does exactly this and needs no
-  database (covered by tests against real MinIO).
-- SQLite (`src/vnext/store.rs`, seven tables) is the EXECUTION layer:
-  current tree row ids, the per-file version table that makes conflicts
-  explicit, the object ledger. Every tree/commit row carries the
-  content hash it publishes; the store refuses to open for writing when
-  the initial commit's hash does not match its canonical record.
-- **No second mutable projection exists.** The S4.18 "mutable nodes
-  table" idea was NOT carried into vnext: there is no mutable node-row
-  authority anywhere. What SQLite holds is either (a) the immutable
-  content-addressed rows themselves (trees/commits — verifiable against
-  the objects they publish), (b) per-file version rows (the concurrency
-  anchor), or (c) best-effort recovery COPIES of `meta/` objects
-  (published after COMMIT; losing them loses nothing — the object store
-  is the recovery source, never the reverse). One correctness authority,
-  one rebuildable cache.
+- **SQLite is the ONLY logical metadata and version-state authority.**
+  refs, commits, COW trees, file_versions and the object ledger update
+  atomically inside one `BEGIN IMMEDIATE` transaction per commit.
+  Optimistic per-file CAS (`(file_id, version)` unique) makes writer
+  conflicts explicit; ref heads advance by CAS.
+- **The object store is PAYLOAD-ONLY**: immutable data objects
+  (`objects/{fid}/w-{uniq}.data`, envelope v1: magic, format version,
+  kind, encoder, cipher, logical length, sha256) plus backend-internal
+  physical structures. Normal commits write NOTHING else — no
+  `meta/refs`, no `meta/commits`, no `meta/trees` (the S4.19
+  per-commit recovery copies are gone, not deferred or batched).
+- The ONLY non-payload object is `namespace/marker` (envelope kind
+  `Namespace`): written ONCE at initialization, re-verified on every
+  open. It carries a random namespace id that SQLite holds in its
+  `model` table. Rules:
+  - fresh database + no marker → write SQLite id, then the marker;
+    a failure between the two steps fails the NEXT open closed.
+  - fresh database + existing marker → REFUSED (a different namespace
+    owns this bucket; never co-rooted).
+  - known database + matching marker → normal open.
+  - known database + missing marker → REFUSED fail-closed (bucket may
+    have been cleared; restoring or re-rooting is an explicit operator
+    decision).
+  - id mismatch → REFUSED.
+  Scope: this is a per-bucket ownership declaration checked at open —
+  NOT multi-server coordination (there is none, by design; a second
+  live server on the same database is impossible — kernel-held engine
+  lock — and a second DATABASE on the same bucket is refused at ITS
+  open, not policed on the wire).
+- Object-store access goes through the `ObjectStore` trait
+  (put/put_stream/get/get_stream/head/list/delete/presign). The core
+  holds logical references (the persisted `o`/`e` entry fields carry
+  the physical locator + etag), never S3 semantics: no LIST
+  consistency, no multipart state, no bucket addressing inside the
+  commit protocol. S4.20 runs ONE configured backend; nothing here
+  precludes per-class backend routing later, because routing would be
+  a write-time decision recorded in the reference — never a read-time
+  recomputation.
 
 ## 2. Commit protocol
 
 ```
-1. PUT data object            envelope v1: "LF1\n" magic, format version,
-                              kind, encoder=raw, cipher=none, logical len,
-                              sha256 digest over the whole object
-2. ledger the object key      (durable "this key exists" row)
-3. BEGIN IMMEDIATE            walk base trees INSIDE the tx (a stale walk
-                              cannot revert another writer's commit),
-                              COW the touched directory chain, insert
-                              file_version, CAS entry version, append
-                              commit, advance ref — all in ONE tx
-4. COMMIT
-5. publish_recovery           trees + commit + ref projections to meta/
-                              keys, best-effort (their loss is invisible)
+1. PUT data object   (envelope v1, immutable key)
+2. ledger the key    (durable SQLite row)
+3. BEGIN IMMEDIATE   walk base trees INSIDE the tx (no stale-snapshot
+                     lost updates), COW the touched chain, insert
+                     file_version, CAS entry version, append commit,
+                     advance ref — one transaction
+4. COMMIT            ← the commit is durable HERE; nothing follows
 ```
 
 Crash decomposition:
@@ -62,69 +65,66 @@ Crash decomposition:
 |---|---|
 | during 1 / before 2 | raw object, no ledger row: gc can NOT prove it dead → kept (fail-safe; salvage can read it) |
 | during 2 / before 3 | ledgered, unreferenced → reachability gc reclaims |
-| during 3 | one `BEGIN IMMEDIATE` tx → SQLite rolls back; the object is ledgered-orphaned as above |
-| after 4, during 5 | commit is durable; projections re-publishable; recovery view unaffected |
+| during 3 | one transaction → SQLite rolls back; ledgered-orphan as above |
+| after 4 | done — there IS no post-commit publication step to lose |
 
-Concurrent semantics: per-FILE optimistic concurrency
-(`(file_id, version)` unique — a stale base gets an explicit
-`Conflict{expected, actual}`), explicit `advance_ref` CAS for branch
-heads, and one engine per database (kernel-held `fslock`, cross-process).
-A fresh store that meets a bucket already carrying a DIFFERENT root
-fails closed (`publish_initial_commit`); there is no cross-server
-coordination, by design (S4.18).
+## 3. Recovery
 
-## 3. Recovery layers (metadata disaster recovery is a first-class goal)
+**A. Normal transaction recovery (SQLite intact or recoverable).**
+WAL + synchronous=FULL; a killed or crashed process recovers the full,
+consistent namespace from SQLite alone (covered by graceful-restart and
+SIGKILL integration tests). GC keeps its fail-closed gate: the model
+marker row AND at least one ref row must be readable IN SQLITE, or gc
+refuses; unreachable-provable objects only; `objects/` keys without a
+ledger row are NEVER deleted (they cannot be proven dead). Corrupted or
+missing SQLite fails the store open, so gc has no entry point at all.
 
-| layer | owner | mechanism |
-|---|---|---|
-| data-block salvage | objects/ prefix | list + envelope verification (`salvage_all_data`) |
-| file reassembly | vnext slice | one object = one file version (chunking is a FUTURE encoding layer; the core holds stable `(file_id, version)` references and never parses payload formats) |
-| namespace folding | meta/ trees+commits | fold trees via entries' `w` (child content hash) down the parent chain of the ref (`namespace_view`) |
-| latest trusted commit | meta/ refs projection | highest seq reachable ref; commits present but unreachable from any ref = unpublished transactions (reported, not applied) |
+**B. Database lost: content salvage, READ-ONLY.**
+`vnext::recover::salvage_all_data` enumerates the data prefix (a
+DECLARED capability of this salvage path — a backend without
+enumeration cannot offer it, explicitly), verifies each object's
+envelope (magic, format version, kind, encoder/cipher, logical length,
+sha256) and exports byte-exact payloads with their original keys, the
+stable file id parsed from the key layout, and per-object status:
+corrupt, unknown-format, unknown-type and unreadable objects are
+REPORTED individually, never served, never fatal to the pass. The pass
+writes/deletes NOTHING. It does NOT recover paths, directory
+structure, deletion state or latest-version identity, and does NOT
+pretend to distinguish committed from orphan objects — everything
+verified is a restoration CANDIDATE. Salvage and GC are separate,
+non-composable operations. Historical S4.19 `meta/` objects, where
+they exist, are legacy: never scanned for deletion by this task;
+removal belongs to a future, separately-owned cleanup flow that must
+first prove ownership.
 
-Failure boundaries are explicit: SQLite lost → layers 3–4 rebuild
-everything; a meta/ object corrupted → the envelope digest refuses it
-(`ObjectCorrupt`, never silent wrong bytes); an unknown format version,
-encoder or cipher is refused, never interpreted; the object store being
-unreachable is reported as `Storage`. What vnext does NOT yet have: a
-tool that ADOPTS a recovered view as a new writable database (recovery
-today is a read-only view + salvage listing).
+What vnext does NOT have: a tool that adopts salvaged content as a new
+writable database (`adopt` is future work); namespace reconstruction
+is explicitly out of the guarantee.
 
-## 4. Object envelope (format boundary)
+## 4. Known limitations (deliberate, this slice)
 
-`envelope v1`: 52-byte header — magic `LF1\n`, u32 format version, u8
-object kind (Data/Tree/Commit/Ref), u8 encoder (0 = raw), u8 cipher
-(0 = none), u64 logical length, sha256 over the whole object. The core
-validates ONLY the header (kind + version + length + digest presence);
-encoder/cipher interpretation belongs to a future encoding layer.
-Compression (Zstandard per object) and AEAD encryption are RESERVED
-FIELDS, not implemented; nothing assumes "payload = raw bytes forever".
+- Write-back (commit.mode = "writeback") is refused at config time.
+- No FUSE/WinFsp kernel-level mount test in this slice's suites
+  (adapters compile for both; the restart check exercises the server).
+- Per-commit metadata cost is SQLite-only now; the COW chain still
+  serializes every touched directory (measured separately in the S4.20
+  performance report — the removal of per-commit meta/ PUTs is
+  reported separately from the remaining COW cost).
+- The namespace marker is checked at open. Two databases initialized
+  CONCURRENTLY on the same empty bucket is a deployment violation the
+  marker cannot referee after the fact (last writer wins the marker;
+  the loser refuses at its NEXT open). Single-writer-per-database is
+  enforced by the kernel lock; one-database-per-bucket is enforced at
+  open, not continuously.
+- Power-loss durability (as opposed to process crash) remains untested.
 
-## 5. Known limitations (deliberate, this slice)
+## 5. Relation to earlier rounds
 
-- Write-back (commit.mode = "writeback") is refused at config time; the
-  v0.1 WB machinery is frozen on main. Strict commit only.
-- Offline `gc` / `fsck` / `backup` CLIs are gone with the v0.1 core;
-  reachability GC exists as a library call (`vnext::gc::collect`,
-  fail-closed gate: refuses to run without the model marker and at least
-  one readable ref; `meta/` keys are never candidates).
-- FUSE/WinFsp adapters are wired to the new core but not exercised on a
-  real mount in this slice's tests (kernel-level gate only).
-- Per-commit cost is O(tree depth) small writes + O(width of each
-  touched directory) serialization — measured +20% on a 300×8 KiB
-  serial import vs v0.1 (same machine, same MinIO,
-  `scripts/s419-perf-compare.sh`); reads are at parity (±10%, n=1 runs).
-- Recovery is read-only (see §3); no branch-management UI, no merge,
-  no leases, no notifications — out of scope by task definition.
-
-## 6. Relation to S4.18
-
-S4.18 (design) named the durable commit chain as the single next task
-and asked the question "is the mutable nodes projection an authority, a
-view, or a migration aid?" This slice answers it by ELIMINATION: the
-projection does not exist; the ref→commit→tree chain is the only
-authority and SQLite is its anchored execution layer. The five S4.18
-concepts map 1:1: Namespace = the `main` ref's folded tree, Branch Ref =
-a named ref row, Immutable Commit = commits table + meta/commits
-object, Immutable Object = data objects, Local Workspace = not
-implemented (no client-local state in this slice).
+S4.18 (design) asked whether a mutable node projection should be
+authority, view or migration aid — S4.19 answered by elimination and
+additionally published per-commit meta/ recovery copies; S4.20 removes
+those copies (the commit chain lives only in SQLite) and narrows the
+database-loss guarantee to content salvage. The COW tree, CAS, ref and
+envelope model is unchanged. Legacy `meta/` objects from S4.19-era
+deployments may exist in old buckets; nothing in vnext reads them
+anymore, and nothing deletes them automatically.

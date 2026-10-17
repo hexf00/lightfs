@@ -4,14 +4,15 @@ A shared filesystem backed by S3-compatible object storage, written in Rust
 with a fully synchronous core: Tokio is not used anywhere in the dependency
 graph (enforced by `scripts/check-no-tokio.sh` in CI).
 
-- S3-compatible object storage holds file bytes AND the metadata
-  authority: immutable commits, content-addressed COW trees and
-  self-describing envelopes (`meta/` keys), so the namespace survives the
-  loss of any single machine's database (see `docs/vnext-model.md`).
-- SQLite is the execution layer (refs/commits/trees/file_versions): every
-  commit is one `BEGIN IMMEDIATE` transaction guarded by optimistic
-  compare-and-swap, so concurrent writers can never silently overwrite
-  each other. Legacy v0.1 databases are refused, never touched.
+- SQLite is the ONLY logical metadata authority: refs, commits, COW
+  trees and file versions update in one transaction per commit with
+  optimistic compare-and-swap, so concurrent writers can never silently
+  overwrite each other. Legacy v0.1 databases are refused, never touched.
+- The object store is PAYLOAD-ONLY: immutable self-describing data
+  objects plus one ownership marker written at initialization. Normal
+  commits write no logical metadata to the store — if the database is
+  lost, the guarantee is byte-exact CONTENT salvage (read-only), not
+  namespace reconstruction. See `docs/vnext-model.md`.
 - One `lightfs server` owns the metadata in multi-client mode; clients
   speak JSON-RPC over HTTP plus binary data endpoints.
 - `lightfs mount` (Linux, FUSE) exposes the namespace to existing Unix
@@ -47,17 +48,20 @@ CLI: `lightfs {server|mount|create-bucket [--insecure-public-rw]|version}` plus 
 
 ## The vnext model (this branch)
 
-The authority is an immutable commit chain in the object store:
-`refs → commits → COW trees → file versions → data objects`, every meta
-object a self-describing envelope (format version, kind, logical length,
-integrity digest). SQLite is a rebuildable execution layer anchored to it
-by content hashes. A crash anywhere in a commit leaves either a fully
-visible commit or nothing; reachability GC deletes only objects proven
-unreachable (unledgered objects are never deleted — fail-safe), and a
-fresh store refuses to co-root a bucket that already carries a different
-chain. `docs/vnext-model.md` is the authoritative description, including
-the recovery layers and the known limitations (no write-back mode in this
-slice, offline salvage is a read-only view, single-server execution).
+SQLite owns the namespace: refs → commits → COW trees → file versions,
+updated atomically per commit. The object store holds immutable,
+self-describing data objects (format version, kind, logical length,
+sha256 envelope) and NOTHING else from the commit path — bucket
+identity rests on one ownership marker written at init and verified on
+every open (a second database on the same bucket is refused). If the
+database is lost, the guarantee is READ-ONLY content salvage: verified,
+byte-exact payloads with their stable ids, per-object rejection
+reports for anything corrupt — no paths, no structure, no
+committed-vs-orphan judgment. Reachability GC runs only with SQLite
+intact and deletes only objects proven unreachable. `docs/vnext-model.md`
+is the authoritative description, including crash decomposition and
+known limitations (no write-back mode in this slice, single-server
+execution, concurrent-init caveat).
 
 The v0.1-era offline `gc` / `fsck` / `backup` CLIs and their docs are gone
 from this branch (frozen on `main`, tag `v0.1.0-experimental`).
