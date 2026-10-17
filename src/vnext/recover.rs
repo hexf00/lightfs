@@ -15,14 +15,21 @@
 //! Every object under the data prefix is verified (envelope magic,
 //! format version, kind, encoder/cipher ids, logical length, sha256
 //! digest). Valid payloads are exported verbatim with their original
-//! key, the stable file identity parsed from the key layout, and their
-//! verification status. Anything invalid, unknown-format or unreadable
-//! is REPORTED per object — a bad object never aborts the pass and
-//! never reaches the caller as content. No distinction is drawn between
-//! "committed" and "orphan" objects: without the ledger there is no
-//! authority to make that call, so every recovered object is a
-//! restoration CANDIDATE. Paths, directory structure, deletion state
-//! and latest-version selection are NOT recoverable here.
+//! physical LOCATOR (diagnostic information only) and their verification
+//! status. Anything invalid, unknown-format or unreadable is REPORTED per
+//! object — a bad object never aborts the pass and never reaches the
+//! caller as content. No distinction is drawn between "committed" and
+//! "orphan" objects: without the ledger there is no authority to make
+//! that call, so every recovered object is a restoration CANDIDATE.
+//! Paths, directory structure, deletion state and latest-version
+//! selection are NOT recoverable here.
+//!
+//! Identity rule (S4.21): the locator is NOT parsed for logical identity.
+//! The core's own reference model never derives a File ID from a storage
+//! key, and salvage holds to the same rule — a key that happens to embed
+//! a file id confers no authority. Recovered content is matched to files
+//! by integrity (etag/digest) through whatever adoption tooling consumes
+//! this report, never by key shape.
 
 use crate::error::{Error, Result};
 use crate::object_store::ObjectStore;
@@ -36,12 +43,10 @@ pub const DATA_PREFIX: &str = "objects/";
 /// One verifiably intact data payload.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SalvagedObject {
-    /// Original object-store key (the physical locator as written).
-    pub key: String,
-    /// Stable logical file identity parsed from the key layout
-    /// (`objects/{fid}/w-{uniq}.data`); `None` when a key does not
-    /// follow the layout (still salvageable as content).
-    pub file_id: Option<i64>,
+    /// Original physical locator, verbatim as the backend reported it.
+    /// DIAGNOSTIC ONLY — carries no logical identity and must never be
+    /// parsed to guess one.
+    pub locator: String,
     pub logical_len: u64,
     /// Payload bytes, byte-exact as committed (digest-verified).
     pub content: Vec<u8>,
@@ -51,7 +56,8 @@ pub struct SalvagedObject {
 /// error-level failure of the whole pass.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RejectedObject {
-    pub key: String,
+    /// Physical locator, verbatim (diagnostic only, see SalvagedObject).
+    pub locator: String,
     pub reason: String,
 }
 
@@ -71,7 +77,7 @@ impl SalvageReport {
     pub fn contents(&self) -> impl Iterator<Item = (&str, &[u8])> {
         self.recovered
             .iter()
-            .map(|o| (o.key.as_str(), o.content.as_slice()))
+            .map(|o| (o.locator.as_str(), o.content.as_slice()))
     }
 }
 
@@ -90,7 +96,7 @@ pub fn salvage_all_data(objects: &dyn ObjectStore) -> Result<SalvageReport> {
             let key = info.key.clone();
             match salvage_one(objects, &key) {
                 Ok(obj) => report.recovered.push(obj),
-                Err(reason) => report.rejected.push(RejectedObject { key, reason }),
+                Err(reason) => report.rejected.push(RejectedObject { locator: key, reason }),
             }
         }
         token = page.next_token;
@@ -103,10 +109,6 @@ pub fn salvage_all_data(objects: &dyn ObjectStore) -> Result<SalvageReport> {
 
 /// Read and verify one object. `Err` carries the PER-OBJECT reason.
 fn salvage_one(objects: &dyn ObjectStore, key: &str) -> std::result::Result<SalvagedObject, String> {
-    let file_id = key
-        .strip_prefix(DATA_PREFIX)
-        .and_then(|rest| rest.split('/').next())
-        .and_then(|fid| fid.parse::<i64>().ok());
     let obj = objects.get(key, None).map_err(|e| match e {
         Error::ObjectMissing(_) => "object listed but missing on read".to_string(),
         Error::Storage(m) => format!("unreadable: {m}"),
@@ -119,8 +121,7 @@ fn salvage_one(objects: &dyn ObjectStore, key: &str) -> std::result::Result<Salv
         return Err(format!("not a data object (kind {})", kind as u8));
     }
     Ok(SalvagedObject {
-        key: key.to_string(),
-        file_id,
+        locator: key.to_string(),
         logical_len: content.len() as u64,
         content,
     })
@@ -138,7 +139,7 @@ mod tests {
         m.put("objects/1/w-a.data", &envelope::seal(ObjKind::Data, b"good-one"))
             .unwrap();
         // 60 junk bytes: parses far enough to fail on the magic
-        m.put("objects/2/w-b.data", &vec![0x00u8; 60]).unwrap();
+        m.put("objects/2/w-b.data", &[0x00u8; 60]).unwrap();
         // unknown format version
         let mut unknown = envelope::seal(ObjKind::Data, b"x");
         unknown[4] = 99;
@@ -153,7 +154,9 @@ mod tests {
         assert_eq!(before, after, "salvage must not mutate the store");
         assert_eq!(report.scanned, 4);
         assert_eq!(report.recovered.len(), 1);
-        assert_eq!(report.recovered[0].file_id, Some(1));
+        // The locator is echoed verbatim (diagnostic) — never parsed into
+        // a logical identity.
+        assert_eq!(report.recovered[0].locator, "objects/1/w-a.data");
         assert_eq!(report.recovered[0].content, b"good-one");
         assert_eq!(report.rejected.len(), 3, "{:?}", report.rejected);
         assert!(report.rejected.iter().any(|r| r.reason.contains("bad magic")));

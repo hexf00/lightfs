@@ -1,6 +1,8 @@
 # The vnext model — SQLite authority, payload-only object store
 
-Status: S4.20 (branch `vnext`, supersedes the S4.19 recovery-copy design).
+Status: S4.21 (branch `vnext`; S4.20 removed per-commit meta/ publication,
+S4.21 merged the new-file write into one transaction, split the three
+object identities and made the namespace claim atomic).
 This document is the authoritative description: what is authoritative,
 what the object store holds, how crashes decompose, what disaster
 recovery guarantees (and explicitly does NOT guarantee), and where the
@@ -14,17 +16,48 @@ backend-neutrality boundaries sit.
   Optimistic per-file CAS (`(file_id, version)` unique) makes writer
   conflicts explicit; ref heads advance by CAS.
 - **The object store is PAYLOAD-ONLY**: immutable data objects
-  (`objects/{fid}/w-{uniq}.data`, envelope v1: magic, format version,
+  (`objects/{object-id}.data`, envelope v1: magic, format version,
   kind, encoder, cipher, logical length, sha256) plus backend-internal
   physical structures. Normal commits write NOTHING else — no
   `meta/refs`, no `meta/commits`, no `meta/trees` (the S4.19
   per-commit recovery copies are gone, not deferred or batched).
+- **Three identities, never conflated (S4.21)**:
+  - **File ID** — the logical file's stable identity (SQLite `files`
+    AUTOINCREMENT, carried in tree entries as `fid`). Allocated inside
+    the commit transaction.
+  - **Object ID** — the immutable data object's own identity: a fresh
+    random token per write, embedded in the locator `objects/{oid}.data`
+    and integrity-checked via the envelope. Independent of the File ID:
+    one file has many objects over its history; an object outlives path
+    and identity changes; the PUT happens BEFORE the File ID exists on
+    the merged create path.
+  - **Storage Locator** — the backend's physical reference for the
+    object (for S3, the key), persisted inside a `StorageRef
+    {backend, locator}` (tree entries) and `file_versions
+    (object_backend, object_key)`. The persisted reference NAMES the
+    backend instance it was written through (`ObjectStore::backend_id`,
+    stable per configuration).
+  - The core NEVER parses a locator to recover logical identity — not
+    in the read path, not in gc (reachability keys on locators), and
+    not in salvage (the locator is echoed as diagnostics only; a key
+    that once embedded a file id conferred no authority even then).
+    Every read checks the reference's backend against the bound store
+    and refuses fail-closed on mismatch (routing changed without
+    migration → loud error, never a silent cross-backend read).
 - The ONLY non-payload object is `namespace/marker` (envelope kind
   `Namespace`): written ONCE at initialization, re-verified on every
   open. It carries a random namespace id that SQLite holds in its
-  `model` table. Rules:
-  - fresh database + no marker → write SQLite id, then the marker;
-    a failure between the two steps fails the NEXT open closed.
+  `model` table. Rules (S4.21: the claim is ATOMIC):
+  - fresh database + no marker → write SQLite id, then ATOMICALLY
+    claim the marker via `ObjectStore::put_if_absent` (S3: conditional
+    PUT `If-None-Match: *`). Two databases racing on one unclaimed
+    bucket yield exactly one winner; the loser reads the winner's
+    marker and refuses. A failure between the local id and the claim
+    fails the NEXT open closed (marker missing, database owns an id).
+  - a backend WITHOUT the atomic-claim capability (`supports_atomic_
+    claim() == false`) refuses namespace initialization outright — the
+    core never degrades to check-then-put, whose double-claim race is
+    exactly what this closes.
   - fresh database + existing marker → REFUSED (a different namespace
     owns this bucket; never co-rooted).
   - known database + matching marker → normal open.
@@ -38,26 +71,43 @@ backend-neutrality boundaries sit.
   lock — and a second DATABASE on the same bucket is refused at ITS
   open, not policed on the wire).
 - Object-store access goes through the `ObjectStore` trait
-  (put/put_stream/get/get_stream/head/list/delete/presign). The core
-  holds logical references (the persisted `o`/`e` entry fields carry
-  the physical locator + etag), never S3 semantics: no LIST
+  (put/put_if_absent/get/get_stream/head/list/delete/presign +
+  backend_id + supports_atomic_claim). The core holds logical
+  references (`StorageRef` + etag), never S3 semantics: no LIST
   consistency, no multipart state, no bucket addressing inside the
-  commit protocol. S4.20 runs ONE configured backend; nothing here
-  precludes per-class backend routing later, because routing would be
-  a write-time decision recorded in the reference — never a read-time
-  recomputation.
+  commit protocol. S4.21 runs ONE configured backend; nothing here
+  precludes per-class backend routing later — the reference already
+  names its backend, so routing would be a write-time decision
+  recorded in the reference and a read-time backend dispatch on the
+  named name (refusing when absent), never a recomputation.
+  Capability boundaries are explicit: enumeration is a salvage-path
+  capability, presign is optional, atomic claim is REQUIRED for
+  namespace initialization and absent-capability backends refuse that
+  path instead of degrading.
 
 ## 2. Commit protocol
 
 ```
-1. PUT data object   (envelope v1, immutable key)
+1. PUT data object   (envelope v1, immutable Object-ID key) — NO SQLite
+                     write lock is held across the upload
 2. ledger the key    (durable SQLite row)
 3. BEGIN IMMEDIATE   walk base trees INSIDE the tx (no stale-snapshot
-                     lost updates), COW the touched chain, insert
-                     file_version, CAS entry version, append commit,
-                     advance ref — one transaction
+                     lost updates); for a NEW file, allocate the File
+                     ID and create the directory entry HERE (S4.21: no
+                     separate empty-file create commit); for an
+                     existing file, judge the caller's CAS against the
+                     in-transaction entry; insert file_version, bind
+                     the StorageRef, COW the touched chain, append
+                     commit, advance ref — one transaction
 4. COMMIT            ← the commit is durable HERE; nothing follows
 ```
+
+Every decision (path conflict, CAS, kind) is judged INSIDE the
+transaction; the pre-transaction lookup is advisory only (it saves
+wasted uploads). The independent POSIX `create` keeps its own
+semantics: it still creates an empty file in its own commit, and
+`create=true` meeting an existing file still means overwrite (last
+committed write wins, versions advance, no metadata lost).
 
 Crash decomposition:
 
@@ -65,7 +115,7 @@ Crash decomposition:
 |---|---|
 | during 1 / before 2 | raw object, no ledger row: gc can NOT prove it dead → kept (fail-safe; salvage can read it) |
 | during 2 / before 3 | ledgered, unreferenced → reachability gc reclaims |
-| during 3 | one transaction → SQLite rolls back; ledgered-orphan as above |
+| during 3 | one transaction → SQLite rolls back; ledgered-orphan as above — a committed upload whose logical commit failed is NEVER risk-deleted for cleanup convenience |
 | after 4 | done — there IS no post-commit publication step to lose |
 
 ## 3. Recovery
@@ -84,8 +134,10 @@ missing SQLite fails the store open, so gc has no entry point at all.
 DECLARED capability of this salvage path — a backend without
 enumeration cannot offer it, explicitly), verifies each object's
 envelope (magic, format version, kind, encoder/cipher, logical length,
-sha256) and exports byte-exact payloads with their original keys, the
-stable file id parsed from the key layout, and per-object status:
+sha256) and exports byte-exact payloads with their original physical
+LOCATORS — diagnostic information only, never parsed into a logical
+identity (S4.21 rule: no File ID is claimed from key shape) — and
+per-object status:
 corrupt, unknown-format, unknown-type and unreadable objects are
 REPORTED individually, never served, never fatal to the pass. The pass
 writes/deletes NOTHING. It does NOT recover paths, directory
@@ -110,12 +162,15 @@ is explicitly out of the guarantee.
   serializes every touched directory (measured separately in the S4.20
   performance report — the removal of per-commit meta/ PUTs is
   reported separately from the remaining COW cost).
-- The namespace marker is checked at open. Two databases initialized
-  CONCURRENTLY on the same empty bucket is a deployment violation the
-  marker cannot referee after the fact (last writer wins the marker;
-  the loser refuses at its NEXT open). Single-writer-per-database is
-  enforced by the kernel lock; one-database-per-bucket is enforced at
-  open, not continuously.
+- One-database-per-bucket is enforced by the ATOMIC CLAIM at
+  initialization (S4.21) and re-verified at every open; it is not
+  policed continuously on the wire (no leases, no heartbeats — that
+  would be multi-server coordination, which stays out of scope).
+  Single-writer-per-database remains the kernel lock.
+- The namespace-init crash window (local id committed, claim lost)
+  leaves a database that refuses closed until an operator either
+  restores/deletes the state; this is fail-closed by design, not
+  self-healing.
 - Power-loss durability (as opposed to process crash) remains untested.
 
 ## 5. Relation to earlier rounds

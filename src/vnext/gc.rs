@@ -65,8 +65,11 @@ pub fn collect(core: &Core) -> Result<GcReport> {
             match (e.k.as_str(), e.tid) {
                 ("dir", Some(child)) => tree_stack.push(child),
                 _ => {
-                    if let Some(key) = &e.o {
-                        live_objects.insert(key.clone());
+                    // Reachability is judged on the LOCATOR (the backend's
+                    // physical key); the backend tag is routing metadata,
+                    // not part of the reachability identity.
+                    if let Some(r) = &e.o {
+                        live_objects.insert(r.locator.clone());
                     }
                 }
             }

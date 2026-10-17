@@ -55,9 +55,10 @@ sha256 envelope) and NOTHING else from the commit path — bucket
 identity rests on one ownership marker written at init and verified on
 every open (a second database on the same bucket is refused). If the
 database is lost, the guarantee is READ-ONLY content salvage: verified,
-byte-exact payloads with their stable ids, per-object rejection
-reports for anything corrupt — no paths, no structure, no
-committed-vs-orphan judgment. Reachability GC runs only with SQLite
+byte-exact payloads with their physical locators (diagnostic only — no
+identity is parsed out of key shapes), per-object rejection reports for
+anything corrupt — no paths, no structure, no committed-vs-orphan
+judgment. Reachability GC runs only with SQLite
 intact and deletes only objects proven unreachable. `docs/vnext-model.md`
 is the authoritative description, including crash decomposition and
 known limitations (no write-back mode in this slice, single-server

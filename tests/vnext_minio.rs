@@ -62,6 +62,23 @@ fn child_main(mode: &str, db: String, bucket: String) -> ! {
         std::env::var("LIGHTFS_S3_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".into());
     cfg.s3.bucket = bucket;
     cfg.metadata.path = db;
+    // The claim racer must open the engine only AFTER the barrier: the
+    // namespace claim runs inside open_engine, and that claim IS the race.
+    if mode == "claim" {
+        let go = std::env::var("LIGHTFS_VNEXT_GO").expect("go file");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !std::path::Path::new(&go).exists() {
+            assert!(std::time::Instant::now() < deadline, "go file never appeared");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        match lightfs::engine::open_engine(&cfg) {
+            Ok(_eng) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("claim racer refused: {e}");
+                std::process::exit(9);
+            }
+        }
+    }
     let eng = lightfs::engine::open_engine(&cfg).expect("child engine");
     let core = &eng.core;
     match mode {
@@ -100,6 +117,7 @@ fn child_main(mode: &str, db: String, bucket: String) -> ! {
             core.write(&h, 0, b"alpha-v2").unwrap();
             core.commit_write(&h).unwrap();
         }
+
         other => panic!("unknown child mode {other}"),
     }
     std::process::exit(0);
@@ -165,7 +183,6 @@ fn normal_writes_leave_meta_prefix_empty() {
     eng.core.write(&h, 0, b"payload-0-v2").unwrap();
     eng.core.commit_write(&h).unwrap();
 
-    use lightfs::object_store::ObjectStore as _;
     let objects = eng.core.objects();
     let meta = list_all_keys(objects.as_ref())
         .into_iter()
@@ -246,9 +263,10 @@ fn salvage_with_unusable_backend_errors_loudly() {
     let mut bad = cfg.clone();
     bad.s3.access_key = "not-a-valid-key".into();
     let store = lightfs::object_store::s3::S3ObjectStore::new(bad.s3_config()).unwrap();
-    let err = lightfs::vnext::recover::salvage_all_data(&store)
-        .err()
-        .expect("list with bad credentials must error, not return empty");
+    let err = match lightfs::vnext::recover::salvage_all_data(&store) {
+        Err(e) => e,
+        Ok(_) => panic!("list with bad credentials must error, not return empty"),
+    };
     let _ = format!("{err}"); // explicit failure; shape owned by the backend
 }
 
@@ -368,7 +386,7 @@ fn crash_between_data_and_metadata_recovers() {
     let mut keep_payloads: Vec<Vec<u8>> = report
         .recovered
         .iter()
-        .filter(|o| o.key.starts_with("objects/999/") == false)
+        .filter(|o| !o.locator.starts_with("objects/999/"))
         .map(|o| o.content.clone())
         .collect();
     keep_payloads.sort();
@@ -377,7 +395,7 @@ fn crash_between_data_and_metadata_recovers() {
     // exactly one rejection: the RAW orphan (gc already reclaimed the
     // ledgered one — envelopes it never had are reported, never served)
     assert_eq!(report.rejected.len(), 1, "{:?}", report.rejected);
-    assert_eq!(report.rejected[0].key, "objects/999/orphan-raw.data");
+    assert_eq!(report.rejected[0].locator, "objects/999/orphan-raw.data");
     assert!(report.rejected[0].reason.contains("unreadable"));
     // salvage does NOT judge committed vs orphan: everything verified is
     // a candidate (the five keeps + nothing else — inflight never PUT)
@@ -435,4 +453,90 @@ fn branch_isolation_and_full_restart_workflow() {
         eng.core.unlink(p).unwrap();
     }
     eng.core.rmdir("/wf").unwrap();
+}
+
+/// S4.21 §四: TWO real processes, TWO independent SQLite databases, ONE
+/// unclaimed bucket, released simultaneously through a file barrier. The
+/// atomic namespace claim (S3 conditional PUT, If-None-Match: *) must
+/// yield exactly one owner; the loser is refused, never co-rooted.
+#[test]
+fn namespace_claim_race_two_processes_exactly_one_winner() {
+    let cfg = fresh("claimrace");
+    let endpoint =
+        std::env::var("LIGHTFS_S3_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".into());
+    let go = std::env::temp_dir().join(format!(
+        "lightfs-go-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&go);
+    let dbs: Vec<String> = (0..2)
+        .map(|i| format!("{}-claim{i}", cfg.metadata.path))
+        .collect();
+    for d in &dbs {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{d}{suffix}"));
+        }
+    }
+    let exe = std::env::current_exe().unwrap();
+    let mut kids: Vec<(std::process::Child, usize)> = Vec::new();
+    for (i, db) in dbs.iter().enumerate() {
+        let errlog = std::fs::File::create(
+            std::env::temp_dir().join(format!("lightfs-claim-{}-{i}.log", std::process::id())),
+        )
+        .expect("racer log");
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.env("LIGHTFS_VNEXT_CHILD", format!("claim:{db}:{}", cfg.s3.bucket))
+            .env("LIGHTFS_VNEXT_GO", &go)
+            .env("LIGHTFS_S3_ENDPOINT", &endpoint)
+            .arg("--exact")
+            .arg("zz_child_harness")
+            .arg("--nocapture")
+            .stdout(std::process::Stdio::null())
+            .stderr(errlog);
+        kids.push((cmd.spawn().expect("spawn racer"), i));
+    }
+    // Release both racers at the same instant.
+    std::fs::write(&go, b"go").unwrap();
+    let mut outcome: Vec<(usize, i32)> = Vec::new();
+    for (kid, i) in &mut kids {
+        let st = kid.wait().expect("racer wait");
+        let code = st.code().unwrap_or(-1);
+        outcome.push((*i, code));
+        assert!(
+            code == 0 || code == 9,
+            "racer {i} exited {code}: neither winner nor clean loser (see lightfs-claim log)"
+        );
+    }
+    let winners: Vec<usize> = outcome.iter().filter(|(_, c)| *c == 0).map(|(i, _)| *i).collect();
+    assert_eq!(
+        winners.len(),
+        1,
+        "exactly one process may claim the namespace: {outcome:?}"
+    );
+    let winner_db = &dbs[winners[0]];
+    let loser_db = &dbs[1 - winners[0]];
+
+    // The winner's database reopens against the same bucket and writes.
+    let mut wcfg = cfg.clone();
+    wcfg.metadata.path = winner_db.clone();
+    let eng = lightfs::engine::open_engine(&wcfg).expect("winner reopens");
+    write_file(&eng.core, "/claimed", b"by-the-winner");
+    assert_eq!(eng.core.read("/claimed", 0, 64).unwrap(), b"by-the-winner");
+    drop(eng);
+    // The loser's database stays refused (marker mismatch or foreign
+    // marker), on EVERY subsequent open.
+    let mut lcfg = cfg.clone();
+    lcfg.metadata.path = loser_db.clone();
+    let err = lightfs::engine::open_engine(&lcfg)
+        .map(|_| ())
+        .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("namespace mismatch") || msg.contains("another namespace's marker"),
+        "{msg}"
+    );
 }

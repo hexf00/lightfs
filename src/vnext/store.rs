@@ -13,14 +13,43 @@ use rusqlite::Connection;
 
 use crate::error::{Error, Result};
 
-pub const MODEL_MARKER: &str = "vnext-1";
+pub const MODEL_MARKER: &str = "vnext-2";
+
+/// A persisted object reference: the LOGICAL binding of an immutable data
+/// object to the backend that holds it. `backend` names the configured
+/// store instance the bytes were written through (opaque, stable per
+/// configuration — see `ObjectStore::backend_id`); `locator` is that
+/// backend's opaque physical reference (for S3, the object key).
+///
+/// Identity rules (S4.21): the locator is NOT a logical identity and the
+/// core never parses it. A locator that happens to embed a file id (legacy
+/// layout) confers no authority — the logical identities are File ID
+/// (rows) and the object's own id carried inside the envelope-verified
+/// payload reference; this struct only records WHERE the bytes live.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StorageRef {
+    #[serde(rename = "b")]
+    pub backend: String,
+    #[serde(rename = "l")]
+    pub locator: String,
+}
+
+impl StorageRef {
+    pub fn new(backend: &str, locator: &str) -> StorageRef {
+        StorageRef {
+            backend: backend.to_string(),
+            locator: locator.to_string(),
+        }
+    }
+}
 
 /// One serialized directory entry inside an immutable tree row.
 /// JSON shape (serde): name/kind always present; the rest optional and
 /// omitted when absent. A FILE entry is self-contained for disaster
 /// recovery: it carries its stable identity (`fid`), content version
-/// (`fv`) and the immutable object reference (`o` + `e`), so a tree
-/// object copied out of band can locate file bytes without SQLite.
+/// (`fv`) and the immutable object reference (`o` = StorageRef + `e` =
+/// etag), so a tree object copied out of band can locate file bytes
+/// without SQLite — and can tell WHICH backend they live on.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Entry {
     pub n: String, // name (single component)
@@ -40,7 +69,7 @@ pub struct Entry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fv: Option<i64>, // file: content version
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub o: Option<String>, // file: immutable object key
+    pub o: Option<StorageRef>, // file: immutable object reference (backend + locator)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub e: Option<String>, // file: object etag
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -74,6 +103,9 @@ pub struct FileVersionRow {
     pub size: i64,
     pub mtime: i64,
     pub mode: u32,
+    /// Which backend holds the bytes (persisted reference, see StorageRef).
+    pub object_backend: String,
+    /// The backend's opaque locator for the object (NOT a logical id).
     pub object_key: String,
     pub etag: String,
 }
@@ -144,13 +176,14 @@ impl Store {
                 id INTEGER PRIMARY KEY AUTOINCREMENT
             );
             CREATE TABLE IF NOT EXISTS file_versions (
-                file_id    INTEGER NOT NULL,
-                version    INTEGER NOT NULL,
-                size       INTEGER NOT NULL,
-                mtime      INTEGER NOT NULL,
-                mode       INTEGER NOT NULL,
-                object_key TEXT NOT NULL,
-                etag       TEXT NOT NULL,
+                file_id        INTEGER NOT NULL,
+                version        INTEGER NOT NULL,
+                size           INTEGER NOT NULL,
+                mtime          INTEGER NOT NULL,
+                mode           INTEGER NOT NULL,
+                object_backend TEXT NOT NULL,
+                object_key     TEXT NOT NULL,
+                etag           TEXT NOT NULL,
                 PRIMARY KEY (file_id, version)
             );
             CREATE TABLE IF NOT EXISTS commits (
@@ -573,9 +606,11 @@ impl Store {
     pub fn insert_file_version_tx(conn: &Connection, v: &FileVersionRow) -> Result<()> {
         let inserted = conn
             .execute(
-                "INSERT INTO file_versions(file_id, version, size, mtime, mode, object_key, etag)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![v.file_id, v.version, v.size, v.mtime, v.mode, v.object_key, v.etag],
+                "INSERT INTO file_versions(file_id, version, size, mtime, mode, object_backend, object_key, etag)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    v.file_id, v.version, v.size, v.mtime, v.mode, v.object_backend, v.object_key, v.etag
+                ],
             )
             .map_err(|e| match &e {
                 rusqlite::Error::SqliteFailure(err, _)
@@ -610,7 +645,7 @@ impl Store {
         version: i64,
     ) -> Result<FileVersionRow> {
         conn.query_row(
-            "SELECT file_id, version, size, mtime, mode, object_key, etag
+            "SELECT file_id, version, size, mtime, mode, object_backend, object_key, etag
              FROM file_versions WHERE file_id=?1 AND version=?2",
             rusqlite::params![file_id, version],
             |r| {
@@ -620,8 +655,9 @@ impl Store {
                     size: r.get(2)?,
                     mtime: r.get(3)?,
                     mode: r.get(4)?,
-                    object_key: r.get(5)?,
-                    etag: r.get(6)?,
+                    object_backend: r.get(5)?,
+                    object_key: r.get(6)?,
+                    etag: r.get(7)?,
                 })
             },
         )

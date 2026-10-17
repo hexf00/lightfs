@@ -16,6 +16,9 @@ struct Entry {
 }
 
 pub struct MemObjectStore {
+    /// Stable backend identity (persisted references name it; distinct
+    /// instances in one test use `new_named` to exercise misrouting).
+    id: String,
     objects: Mutex<BTreeMap<String, Entry>>,
     counter: std::sync::atomic::AtomicU64,
     /// Test-only failure injection: deletes of a key present here error
@@ -39,7 +42,14 @@ impl Default for MemObjectStore {
 
 impl MemObjectStore {
     pub fn new() -> Self {
+        Self::new_named("mem")
+    }
+
+    /// A named instance: same behavior, distinct backend identity (used to
+    /// drive the persisted-reference misrouting refusal in tests).
+    pub fn new_named(id: &str) -> Self {
         Self {
+            id: id.to_string(),
             objects: Mutex::new(BTreeMap::new()),
             counter: std::sync::atomic::AtomicU64::new(1),
             delete_failures: Mutex::new(std::collections::HashSet::new()),
@@ -86,6 +96,10 @@ impl MemObjectStore {
 }
 
 impl ObjectStore for MemObjectStore {
+    fn backend_id(&self) -> String {
+        self.id.clone()
+    }
+
     fn put(&self, key: &str, data: &[u8]) -> Result<ObjectInfo> {
         let version = self
             .counter
@@ -100,6 +114,30 @@ impl ObjectStore for MemObjectStore {
         let info = self.info(key, &e);
         objs.insert(key.to_string(), e);
         Ok(info)
+    }
+
+    fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<bool> {
+        // One critical section: check-and-insert is atomic under the map
+        // lock, so concurrent claims yield exactly one true.
+        let version = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let etag = crate::sigv4::sha256_hex(data)[..32].to_string();
+        let mut objs = self.objects.lock().unwrap();
+        if objs.contains_key(key) {
+            return Ok(false);
+        }
+        let e = Entry {
+            data: data.to_vec(),
+            etag: etag.clone(),
+            version,
+        };
+        objs.insert(key.to_string(), e);
+        Ok(true)
+    }
+
+    fn supports_atomic_claim(&self) -> bool {
+        true
     }
 
     fn get(&self, key: &str, range: Option<Range>) -> Result<ObjectData> {

@@ -46,11 +46,40 @@ pub struct ListPage {
 }
 
 pub trait ObjectStore: Send + Sync {
+    /// Stable identity of THIS configured backend instance (e.g. derived
+    /// from endpoint + bucket). Persisted object references name the
+    /// backend they were written through, so a read against a different
+    /// backend can be refused fail-closed instead of silently mis-read.
+    /// The value is opaque to the core; it must be stable across process
+    /// restarts for the same configuration.
+    fn backend_id(&self) -> String;
     /// Store full content for `key`. Overwrites atomically: once `put`
     /// returns Ok, every later `get`/`head` observes the new content in
     /// full — never a mix of generations. The returned info carries the
     /// stored key, the exact size and a NON-EMPTY etag (see ObjectInfo).
     fn put(&self, key: &str, data: &[u8]) -> Result<ObjectInfo>;
+    /// Store `data` at `key` ONLY IF `key` does not exist (an atomic
+    /// create-if-absent claim). `Ok(true)` = this call created the object;
+    /// `Ok(false)` = the key already existed and this call changed
+    /// nothing; `Err` = the outcome is UNKNOWN (transport/remote error).
+    /// The atomicity contract is absolute: two concurrent claims on the
+    /// same key yield exactly one `Ok(true)`.
+    ///
+    /// CAPABILITY: only meaningful when [`ObjectStore::supports_atomic_claim`]
+    /// is true. The default implementation refuses — core must NEVER
+    /// degrade to a check-then-put fallback, which has a claim race.
+    fn put_if_absent(&self, _key: &str, _data: &[u8]) -> Result<bool> {
+        Err(Error::Storage(
+            "backend does not implement atomic put-if-absent".into(),
+        ))
+    }
+    /// True when [`ObjectStore::put_if_absent`] is a REAL atomic claim on
+    /// this backend. Capability declaration: core refuses unsafe
+    /// initialization paths on backends where this is false, instead of
+    /// silently falling back to check-then-put.
+    fn supports_atomic_claim(&self) -> bool {
+        false
+    }
     /// Store content for `key` streaming exactly `len` bytes from `reader`.
     /// Bounded memory: the backend must not buffer the whole object (a
     /// plain-PUT path for small `len` is fine — the contract bounds

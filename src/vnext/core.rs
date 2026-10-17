@@ -19,12 +19,23 @@ use crate::error::{Error, Result};
 use crate::metadata::{Node, NodeKind};
 use crate::object_store::{ListPage, ObjectData, ObjectInfo, ObjectStore, Range};
 use crate::vnext::envelope::{self, ObjKind};
-use crate::vnext::store::{CommitRow, Entry, FileVersionRow, Store};
+use crate::vnext::store::{CommitRow, Entry, FileVersionRow, StorageRef, Store};
 
 pub(crate) const MAIN_REF: &str = "main";
 
-fn data_key(file_id: i64, uniq: &str) -> String {
-    format!("objects/{file_id}/w-{uniq}.data")
+/// Object keys carry NO logical identity: `objects/<object-id>.data`.
+/// The object id is a fresh random token per immutable object — it is
+/// the Object ID, independent of the writing file's File ID (which does
+/// not exist yet at PUT time on the merged create path) and independent
+/// of any backend routing. The core never parses this key back.
+fn data_key(oid: &str) -> String {
+    format!("objects/{oid}.data")
+}
+
+/// A fresh Object ID: 32 hex chars folded from pid + wall nanos + a
+/// process counter (uniqueness is the requirement, not secrecy).
+fn new_object_id() -> String {
+    crate::sigv4::sha256_hex(&uuid_bytes()).chars().take(32).collect()
 }
 /// Loop bound for trailing-symlink resolution (POSIX ELOOP shape).
 const MAX_SYMLINK_RESOLUTIONS: usize = 40;
@@ -54,6 +65,9 @@ struct CountedObjects {
 }
 
 impl ObjectStore for CountedObjects {
+    fn backend_id(&self) -> String {
+        self.inner.backend_id()
+    }
     fn put(&self, key: &str, data: &[u8]) -> Result<ObjectInfo> {
         self.m.s3_put.fetch_add(1, Ordering::Relaxed);
         self.m.bytes_written.fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -63,6 +77,14 @@ impl ObjectStore for CountedObjects {
         self.m.s3_put.fetch_add(1, Ordering::Relaxed);
         self.m.bytes_written.fetch_add(len, Ordering::Relaxed);
         self.inner.put_stream(key, reader, len)
+    }
+    fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<bool> {
+        self.m.s3_put.fetch_add(1, Ordering::Relaxed);
+        self.m.bytes_written.fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.inner.put_if_absent(key, data)
+    }
+    fn supports_atomic_claim(&self) -> bool {
+        self.inner.supports_atomic_claim()
     }
     fn get(&self, key: &str, range: Option<Range>) -> Result<ObjectData> {
         self.m.s3_get.fetch_add(1, Ordering::Relaxed);
@@ -145,15 +167,6 @@ fn uuid_bytes() -> [u8; 16] {
     out
 }
 
-fn uniq_suffix() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{}-{nanos:x}", std::process::id())
-}
-
-
 
 impl Core {
     pub fn new(store: Store, objects: Arc<dyn ObjectStore>) -> Result<Core> {
@@ -185,10 +198,18 @@ impl Core {
     /// object store is payload-only — no per-commit logical metadata — so
     /// bucket ownership rests on ONE namespace marker written at
     /// initialization and re-verified here. SQLite holds the same id.
-    /// Order: SQLite row first, marker second — a crash between the two
-    /// fails the NEXT open closed (marker missing) instead of silently
-    /// re-rooting. A fresh store that meets a marker it does not hold is
-    /// a DIFFERENT namespace: refused, never co-rooted.
+    ///
+    /// S4.21 atomic claim: the marker lands via a REAL create-if-absent
+    /// (`ObjectStore::put_if_absent`) — two fresh databases initializing
+    /// the same unclaimed namespace race, and exactly one put_if_absent
+    /// returns `true`; the loser reads the winner's marker and refuses.
+    /// Backends WITHOUT the atomic-claim capability refuse the unsafe
+    /// initialization path outright — the core never degrades to
+    /// check-then-put (its claim race is exactly what this closes).
+    /// Order: SQLite row first, claim second — a crash between the two
+    /// fails the NEXT open closed (marker missing, database owns an id)
+    /// instead of silently re-rooting. A fresh store that meets a marker
+    /// it does not hold is a DIFFERENT namespace: refused, never co-rooted.
     fn init_namespace(&self) -> Result<()> {
         const MARKER_KEY: &str = "namespace/marker";
         let local = self.store.namespace_id()?;
@@ -209,15 +230,36 @@ impl Core {
         };
         match (local.as_deref(), remote.as_deref()) {
             (None, None) => {
-                let id = crate::sigv4::sha256_hex(&uuid_bytes()).chars().take(32).collect::<String>();
-                self.store.with_tx(|conn| Store::set_namespace_id_tx(conn, &id))?;
-                // commit point reached: from here a marker write failure
-                // leaves (Some(id), None) — the next open refuses closed.
-                self.objects.put(
+                if !self.objects.supports_atomic_claim() {
+                    return Err(Error::Storage(format!(
+                        "vnext: refusing namespace initialization — backend {:?} cannot \
+                         atomically claim a namespace (put-if-absent unsupported); an \
+                         init there could double-claim under concurrency",
+                        self.objects.backend_id()
+                    )));
+                }
+                let id = crate::sigv4::sha256_hex(&uuid_bytes())
+                    .chars()
+                    .take(32)
+                    .collect::<String>();
+                self.store
+                    .with_tx(|conn| Store::set_namespace_id_tx(conn, &id))?;
+                // commit point reached: from here a failed CLAIM leaves
+                // (Some(id), None) — the next open refuses closed rather
+                // than silently re-rooting (documented crash window).
+                let claimed = self.objects.put_if_absent(
                     MARKER_KEY,
                     &envelope::seal(ObjKind::Namespace, id.as_bytes()),
                 )?;
-                Ok(())
+                if claimed {
+                    Ok(())
+                } else {
+                    Err(Error::Db(format!(
+                        "vnext: namespace was claimed concurrently — the marker on {} \
+                         belongs to another database; this store is not the namespace owner",
+                        MARKER_KEY
+                    )))
+                }
             }
             (None, Some(_)) => Err(Error::Db(format!(
                 "vnext: bucket already carries another namespace's marker ({MARKER_KEY}); \
@@ -283,7 +325,7 @@ impl Core {
             size: entry.s,
             mtime: entry.mt,
             mode: entry.m,
-            object_key: entry.o.clone(),
+            object_key: entry.o.as_ref().map(|r| r.locator.clone()),
             version: entry.fv.unwrap_or(0),
             etag: entry.e.clone().unwrap_or_default(),
             target: entry.tgt.clone(),
@@ -424,6 +466,9 @@ impl Core {
                 step(conn, &mut leaf.entries)?
             };
             Self::cow_and_commit(conn, &mut chain)?;
+            self.metrics
+                .metadata_tx
+                .fetch_add(1, Ordering::Relaxed);
             Ok(result)
         })
     }
@@ -681,7 +726,7 @@ impl Core {
             if kind != ObjKind::Data {
                 return Err(Error::ObjectCorrupt(format!("{key}: not a data object")));
             }
-            if (logical as u64) < want {
+            if logical < want {
                 return Err(Error::ObjectCorrupt(format!(
                     "{key}: logical length {logical} shorter than the requested read"
                 )));
@@ -747,11 +792,12 @@ impl Core {
                 actual: entry.k,
             });
         }
-        let key = entry
+        let r = entry
             .o
             .ok_or_else(|| Error::ObjectMissing(format!("{path}: file has no content yet")))?;
+        let key = self.check_ref(&r)?;
         self.read_range_verified(
-            &key,
+            key,
             entry.e.as_deref().unwrap_or(""),
             entry.s.max(0) as u64,
             offset,
@@ -761,16 +807,36 @@ impl Core {
 
     pub fn read_by_id(&self, file_id: i64, offset: u64, size: u64) -> Result<Vec<u8>> {
         let entry = self.locate_by_id(file_id, "")?;
-        let key = entry
+        let r = entry
             .o
             .ok_or_else(|| Error::ObjectMissing(format!("file {file_id}: no content yet")))?;
+        let key = self.check_ref(&r)?;
         self.read_range_verified(
-            &key,
+            key,
             entry.e.as_deref().unwrap_or(""),
             entry.s.max(0) as u64,
             offset,
             size,
         )
+    }
+
+    /// Resolve a persisted reference against THIS engine's backend. A
+    /// reference bound to a different backend is refused fail-closed —
+    /// handing it to the wrong store would either miss or (worse) hit a
+    /// same-named foreign locator. This is the seam a future router plugs
+    /// into; today there is exactly one store, so any mismatch is an
+    /// unrecoverable configuration change and must be loud.
+    fn check_ref<'a>(&self, r: &'a StorageRef) -> Result<&'a str> {
+        let bound = self.objects.backend_id();
+        if r.backend != bound {
+            return Err(Error::Storage(format!(
+                "object reference belongs to backend {:?} but this engine is bound to \
+                 {bound:?}; refusing to read across backends (routing changed without \
+                 migration?)",
+                r.backend
+            )));
+        }
+        Ok(&r.locator)
     }
 
     pub fn open_read(
@@ -1110,7 +1176,9 @@ impl Core {
                 slot.tid = Some(id);
                 slot.w = Some(sha);
             }
-            Self::cow_and_commit(conn, &mut old_chain[..split_at])
+            let out = Self::cow_and_commit(conn, &mut old_chain[..split_at]);
+            self.metrics.metadata_tx.fetch_add(1, Ordering::Relaxed);
+            out
         })
     }
 
@@ -1157,7 +1225,7 @@ impl Core {
     /// Conflict; the orphaned object stays ledgered for reachability gc.
     pub fn commit_write(&self, handle: &WriteHandle) -> Result<Node> {
         let content = handle.snapshot();
-        let key = data_key(handle.file_id, &uniq_suffix());
+        let key = data_key(&new_object_id());
         let sealed = envelope::seal(ObjKind::Data, &content);
         let info = self.objects.put(&key, &sealed)?;
         self.store.ledger_object(&key)?;
@@ -1171,6 +1239,7 @@ impl Core {
         let expected = handle.expected_version;
         let version = expected + 1;
         let (mtime, size, etag) = (now_secs(), content.len() as i64, info.etag.clone());
+        let backend = self.objects.backend_id();
         let key2 = key.clone();
         self.mutate(&comps[..comps.len() - 1], |conn, entries| {
             Store::insert_file_version_tx(conn, &FileVersionRow {
@@ -1179,6 +1248,7 @@ impl Core {
                 size,
                 mtime,
                 mode: 0o644,
+                object_backend: backend.clone(),
                 object_key: key2.clone(),
                 etag: etag.clone(),
             })?;
@@ -1205,7 +1275,7 @@ impl Core {
                 });
             }
             entry.fv = Some(version);
-            entry.o = Some(key);
+            entry.o = Some(StorageRef::new(&backend, &key));
             entry.e = Some(info.etag);
             entry.s = size;
             entry.mt = mtime;
@@ -1214,10 +1284,23 @@ impl Core {
         self.lookup(&handle.path)
     }
 
-    /// Server streaming write. `create=true` first-creates the identity
-    /// via a real `create` commit when the file doesn't exist. The reader
-    /// must be seekable (the server spools to a temp file first) so the
-    /// envelope digest can be computed without buffering.
+    /// Server streaming write (S4.21 merged path): a new-file write is
+    /// ONE upload plus ONE SQLite transaction — create, File ID
+    /// allocation, file version and object reference all land in the same
+    /// BEGIN IMMEDIATE window as the COW commit. The old shape committed
+    /// an empty-file `create` first (a second fsync'd transaction and an
+    /// extra tree per logical write); that separate commit is gone.
+    ///
+    /// Ordering contract: the data PUT completes BEFORE the transaction
+    /// opens, so SQLite never holds its write lock across an upload. A
+    /// crash after the PUT leaves an unregistered (or ledgered) object
+    /// that reachability gc handles fail-closed — never a half-created
+    /// file. Path conflicts (the entry changed between the advisory
+    /// pre-check and the transaction) are re-judged INSIDE the
+    /// transaction; the pre-check only avoids wasted uploads.
+    ///
+    /// The reader must be seekable (the server spools to a temp file
+    /// first) so the envelope digest can be computed without buffering.
     pub fn write_stream(
         &self,
         path: &str,
@@ -1231,63 +1314,98 @@ impl Core {
             .last()
             .cloned()
             .ok_or_else(|| Error::InvalidPath(path.to_string()))?;
-        let entry = self.resolve_entry(path).ok();
-        let (file_id, base_version) = match &entry {
-            Some(e) if e.k == "file" => (
-                e.fid.ok_or_else(|| Error::Db("file without identity".into()))?,
-                e.fv.unwrap_or(0),
-            ),
-            Some(e) => {
+        // Advisory pre-check ONLY (fewer wasted uploads, early kind and
+        // NotFound errors): every real decision is re-made inside the
+        // transaction.
+        match self.resolve_entry(path).ok().map(|e| e.k) {
+            Some(k) if k != "file" => {
                 return Err(Error::KindMismatch {
                     path: path.to_string(),
                     expected: "file",
-                    actual: e.k.clone(),
-                })
-            }
-            None if create => {
-                let node = self.create(path, 0o644)?;
-                let fid = node.id;
-                (fid, 0)
-            }
-            None => return Err(Error::NotFound(path.to_string())),
-        };
-        if let Some(exp) = expected_version {
-            if exp != base_version {
-                return Err(Error::Conflict {
-                    path: path.to_string(),
-                    expected: exp,
-                    actual: base_version,
+                    actual: k,
                 });
             }
+            Some(_) => {}
+            None if !create => return Err(Error::NotFound(path.to_string())),
+            None => {}
         }
-        let key = data_key(file_id, &uniq_suffix());
-        {
-            let mut spooled = Vec::new();
-            envelope::seal_stream(ObjKind::Data, reader, len, &mut spooled)
-                .map_err(|e| Error::Storage(format!("seal stream: {e}")))?;
-            self.objects.put(&key, &spooled)?;
-        }
+        let key = data_key(&new_object_id());
+        let mut spooled = Vec::new();
+        envelope::seal_stream(ObjKind::Data, reader, len, &mut spooled)
+            .map_err(|e| Error::Storage(format!("seal stream: {e}")))?;
+        // Upload completes BEFORE the transaction opens (no SQLite write
+        // lock is ever held across an upload). The PUT response already
+        // carries the etag — the old separate HEAD per write is gone.
+        let info = self.objects.put(&key, &spooled)?;
+        let backend = self.objects.backend_id();
+        let etag = info.etag;
         self.store.ledger_object(&key)?;
-        let version = base_version + 1;
-        let etag = {
-            self.objects
-                .head(&key)?
-                .etag
-        };
         self.mutate(&comps[..comps.len() - 1], |conn, entries| {
+            let entry = entries.iter_mut().find(|e| e.n == name);
+            let (file_id, base_version) = match entry {
+                // EXISTING file: overwrite, caller's CAS condition judged
+                // in-transaction against the CURRENT entry.
+                Some(e) if e.k == "file" => {
+                    let fid = e
+                        .fid
+                        .ok_or_else(|| Error::Db("file without identity".into()))?;
+                    if let Some(exp) = expected_version {
+                        if exp != e.fv.unwrap_or(0) {
+                            return Err(Error::Conflict {
+                                path: path.to_string(),
+                                expected: exp,
+                                actual: e.fv.unwrap_or(0),
+                            });
+                        }
+                    }
+                    (fid, e.fv.unwrap_or(0))
+                }
+                Some(e) => {
+                    return Err(Error::KindMismatch {
+                        path: path.to_string(),
+                        expected: "file",
+                        actual: e.k.clone(),
+                    });
+                }
+                // NEW file: allocate the File ID inside THIS transaction —
+                // the separate create commit no longer exists.
+                None if create => (Store::alloc_file_id_tx(conn)?, 0),
+                None => return Err(Error::NotFound(path.to_string())),
+            };
+            let version = base_version + 1;
             Store::insert_file_version_tx(conn, &FileVersionRow {
                 file_id,
                 version,
                 size: len as i64,
                 mtime: now_secs(),
                 mode: 0o644,
+                object_backend: backend.clone(),
                 object_key: key.clone(),
                 etag: etag.clone(),
             })?;
-            let e = entries
-                .iter_mut()
-                .find(|e| e.n == name)
-                .ok_or_else(|| Error::NotFound(path.to_string()))?;
+            // The entry was created (in-tx) or already existed (overwrite):
+            // either way it is THIS file now, and every condition below is
+            // judged against the transaction's own read.
+            let e = match entries.iter_mut().find(|e| e.n == name) {
+                Some(e) => e,
+                None => {
+                    entries.push(Entry {
+                        n: name.clone(),
+                        k: "file".into(),
+                        m: 0o644,
+                        s: 0,
+                        mt: now_secs(),
+                        tid: None,
+                        w: None,
+                        fid: Some(file_id),
+                        fv: None,
+                        o: None,
+                        e: None,
+                        tgt: None,
+                    });
+                    entries.last_mut().expect("just pushed")
+                }
+            };
             if e.fid != Some(file_id) {
                 return Err(Error::IdentityGone(format!("file {file_id}")));
             }
@@ -1299,7 +1417,7 @@ impl Core {
                 });
             }
             e.fv = Some(version);
-            e.o = Some(key);
+            e.o = Some(StorageRef::new(&backend, &key));
             e.e = Some(etag);
             e.s = len as i64;
             e.mt = now_secs();
@@ -1373,13 +1491,14 @@ impl Core {
                 actual: entry.k.clone(),
             });
         }
-        let key = entry
+        let r = entry
             .o
             .clone()
             .ok_or_else(|| Error::ObjectMissing(format!("{path}: no content at this commit")))?;
+        let key = self.check_ref(&r)?;
         // Full verified read, then slice: pinned history must be
         // byte-exact, so the digest is always checked here.
-        let full = self.read_full_verified(&key, entry.e.as_deref().unwrap_or(""))?;
+        let full = self.read_full_verified(key, entry.e.as_deref().unwrap_or(""))?;
         let start = (offset as usize).min(full.len());
         let end = (start + size as usize).min(full.len());
         Ok(full[start..end].to_vec())

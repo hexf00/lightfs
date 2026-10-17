@@ -175,7 +175,8 @@ fn slice5_crash_window_leaves_recoverable_state() {
                     size: 1,
                     mtime: 0,
                     mode: 0o644,
-                    object_key: "objects/1/w-crash.data".into(),
+                    object_backend: "mem".into(),
+                    object_key: "objects/crashtest.data".into(),
                     etag: "x".into(),
                 },
             )?;
@@ -252,20 +253,30 @@ fn slice7_payload_only_writes_and_content_salvage() {
     let h = core.open_write("/dir/f", None).unwrap();
     core.write(&h, 0, b"recoverable-bytes").unwrap();
     core.commit_write(&h).unwrap();
+    let live_locator = core.lookup("/dir/f").unwrap().object_key.unwrap();
     core.unlink("/dir/f").unwrap();
 
     let meta: Vec<String> = list_keys(objects.as_ref(), "meta/");
     assert!(meta.is_empty(), "no per-commit meta/ objects may exist: {meta:?}");
     let payload = list_keys(objects.as_ref(), "objects/");
     assert_eq!(payload.len(), 1, "exactly the v1 payload object: {payload:?}");
+    // The locator is a bare Object ID — no File ID, no path, none of the
+    // legacy objects/<fid>/ layout (three-identity rule).
+    let oid = live_locator
+        .strip_prefix("objects/")
+        .and_then(|r| r.strip_suffix(".data"))
+        .unwrap_or_else(|| panic!("locator shape: {live_locator}"));
+    assert_eq!(oid.len(), 32);
+    assert!(oid.chars().all(|c| c.is_ascii_hexdigit()), "{oid}");
 
     // SQLite is GONE from this point: content salvage (read-only) is the
-    // whole recovery guarantee — bytes, key and stable id, no namespace.
+    // whole recovery guarantee — bytes plus the diagnostic locator, no
+    // namespace and no identity claims parsed out of key shapes.
     let report = recover::salvage_all_data(objects.as_ref()).unwrap();
     assert_eq!(report.scanned, 1);
     assert!(report.rejected.is_empty(), "{:?}", report.rejected);
     let obj = &report.recovered[0];
-    assert_eq!(obj.file_id, Some(1), "stable id parses from the key");
+    assert_eq!(obj.locator, live_locator, "locator echoed verbatim");
     assert_eq!(obj.content, b"recoverable-bytes");
     assert_eq!(report.contents().count(), 1);
 }
@@ -339,3 +350,285 @@ fn slice8_legacy_db_refused_never_cleared() {
     assert!(store.head("main").unwrap().is_some());
 }
 
+
+// ---- S4.21: merged atomic write path, three-identity references,
+// ---- atomic namespace claim ----
+
+/// The high-level create-or-write path is ONE upload + ONE metadata
+/// transaction. The empty-file create commit is gone: the first version
+/// of a new file is born inside the same BEGIN IMMEDIATE window that
+/// allocates its File ID and binds the object reference.
+#[test]
+fn s421_merged_create_write_is_single_transaction() {
+    let (core, _objects) = mk_core("s421-merged");
+    core.mkdir("/d", 0o755).unwrap();
+    let tx_after_dirs = core.metrics.metadata_tx.load(std::sync::atomic::Ordering::Relaxed);
+
+    let data = b"atomic-create-bytes".to_vec();
+    let mut cur = std::io::Cursor::new(data.clone());
+    let node = core
+        .write_stream("/d/new-file", None, true, &mut cur, data.len() as u64)
+        .unwrap();
+    let tx_after_write = core.metrics.metadata_tx.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(tx_after_write - tx_after_dirs, 1, "one transaction per new-file write");
+    assert_eq!(node.version, 1);
+    assert!(node.id > 0, "File ID allocated inside the transaction");
+    assert_eq!(core.read("/d/new-file", 0, 128).unwrap(), data);
+
+    // Overwrite through the same merged path: still one transaction, CAS
+    // judged in-transaction.
+    let mut cur = std::io::Cursor::new(b"v2".to_vec());
+    let node2 = core
+        .write_stream("/d/new-file", Some(1), true, &mut cur, 2)
+        .unwrap();
+    assert_eq!(node2.version, 2);
+    let tx3 = core.metrics.metadata_tx.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(tx3 - tx_after_write, 1);
+
+    // CAS violation: explicit Conflict, judged inside the transaction.
+    let mut cur = std::io::Cursor::new(b"v3".to_vec());
+    let err = core
+        .write_stream("/d/new-file", Some(1), true, &mut cur, 2)
+        .unwrap_err();
+    assert!(format!("{err}").contains("conflict"), "{err}");
+
+    // create=false on a missing path stays NotFound (independent POSIX
+    // create keeps its own semantics — untouched).
+    let mut cur = std::io::Cursor::new(b"x".to_vec());
+    let err = core
+        .write_stream("/d/absent", None, false, &mut cur, 1)
+        .unwrap_err();
+    assert!(format!("{err}").contains("not found"), "{err}");
+}
+
+/// A backend without the atomic-claim capability must refuse the unsafe
+/// namespace initialization path — never fall back to check-then-put.
+#[test]
+fn s421_unsupported_claim_backend_refuses_init() {
+    use crate::object_store::{ListPage, ObjectData, ObjectInfo, Range};
+    struct NoClaim(Arc<MemObjectStore>);
+    impl crate::object_store::ObjectStore for NoClaim {
+        fn backend_id(&self) -> String {
+            self.0.backend_id()
+        }
+        fn put(&self, k: &str, d: &[u8]) -> crate::error::Result<ObjectInfo> {
+            self.0.put(k, d)
+        }
+        fn put_stream(
+            &self,
+            k: &str,
+            r: &mut dyn std::io::Read,
+            l: u64,
+        ) -> crate::error::Result<ObjectInfo> {
+            self.0.put_stream(k, r, l)
+        }
+        fn get(&self, k: &str, r: Option<Range>) -> crate::error::Result<ObjectData> {
+            self.0.get(k, r)
+        }
+        fn get_stream(
+            &self,
+            k: &str,
+            r: Option<Range>,
+        ) -> crate::error::Result<(Box<dyn std::io::Read + Send>, u64)> {
+            self.0.get_stream(k, r)
+        }
+        fn head(&self, k: &str) -> crate::error::Result<ObjectInfo> {
+            self.0.head(k)
+        }
+        fn delete(&self, k: &str) -> crate::error::Result<()> {
+            self.0.delete(k)
+        }
+        fn list(&self, p: &str, t: Option<&str>, m: usize) -> crate::error::Result<ListPage> {
+            self.0.list(p, t, m)
+        }
+        fn ping(&self) -> crate::error::Result<()> {
+            self.0.ping()
+        }
+        // put_if_absent + supports_atomic_claim: intentionally the trait
+        // DEFAULTS (refusing / false).
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "lfs-vnext-s421-noclaim-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = Store::open(&dir.join("meta.db").to_string_lossy()).unwrap();
+    let objects = Arc::new(NoClaim(Arc::new(MemObjectStore::new())));
+    let err = Core::new(store, objects).map(|_| ()).unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("atomically claim"), "{msg}");
+    // Nothing was written to the store during the refused init.
+    assert!(msg.contains("refusing namespace initialization"), "{msg}");
+}
+
+/// Two fresh databases racing on ONE unclaimed in-memory namespace:
+/// the claim is atomic, so exactly one Core wins and the other refuses.
+#[test]
+fn s421_namespace_claim_race_threads_exactly_one_winner() {
+    let objects = Arc::new(MemObjectStore::new_named("mem:race"));
+    let dir = std::env::temp_dir().join(format!(
+        "lfs-vnext-s421-race-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dbs: Vec<String> = (0..2)
+        .map(|i| dir.join(format!("db{i}.sqlite")).to_string_lossy().to_string())
+        .collect();
+    let objs1 = objects.clone();
+    let objs2 = objects.clone();
+    let db1 = dbs[0].clone();
+    let db2 = dbs[1].clone();
+    let h1 = std::thread::spawn(move || {
+        Core::new(Store::open(&db1).unwrap(), objs1).is_ok()
+    });
+    let h2 = std::thread::spawn(move || {
+        Core::new(Store::open(&db2).unwrap(), objs2).is_ok()
+    });
+    let winners = [h1.join().unwrap(), h2.join().unwrap()];
+    assert_eq!(
+        winners.iter().filter(|w| **w).count(),
+        1,
+        "exactly one database may claim the namespace: {winners:?}"
+    );
+    // The marker carries the winner's id; the loser's database stays
+    // unusable against this namespace (mismatch on every later open).
+    let marker = objects.get("namespace/marker", None).unwrap();
+    let (_, id) = crate::vnext::envelope::open(&marker.data).unwrap();
+    let winner_id = String::from_utf8(id).unwrap();
+    let loser_db = if winners[0] { &dbs[1] } else { &dbs[0] };
+    let err = Core::new(Store::open(loser_db).unwrap(), objects.clone())
+        .map(|_| ())
+        .unwrap_err();
+    // Either refusal is correct: the loser saw the winner's marker before
+    // writing its own local id ((None, Some) arm) or after (mismatch arm).
+    // What matters: it is refused, never co-rooted.
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("namespace mismatch") || msg.contains("another namespace's marker"),
+        "{msg}"
+    );
+    // The winner reopens cleanly.
+    let winner_db = if winners[0] { &dbs[0] } else { &dbs[1] };
+    assert!(Core::new(Store::open(winner_db).unwrap(), objects.clone()).is_ok());
+    assert_eq!(
+        Store::open(winner_db).unwrap().namespace_id().unwrap().as_deref(),
+        Some(winner_id.as_str())
+    );
+}
+
+/// Concurrent create-or-writes of the SAME path: writers serialize in
+/// BEGIN IMMEDIATE, every commit builds on the committed head — no lost
+/// updates, no corruption; final version == number of winners.
+#[test]
+fn s421_concurrent_same_path_writes_serialize() {
+    let (core, _objects) = mk_core("s421-racepath");
+    core.mkdir("/c", 0o755).unwrap();
+    let core = std::sync::Arc::new(core);
+    let mut handles = Vec::new();
+    for i in 0..8 {
+        let c = core.clone();
+        handles.push(std::thread::spawn(move || {
+            let data = format!("writer-{i}").into_bytes();
+            let mut cur = std::io::Cursor::new(data.clone());
+            c.write_stream("/c/hot", None, true, &mut cur, data.len() as u64)
+                .map(|_| ())
+        }));
+    }
+    let mut oks = 0usize;
+    let mut conflicts = 0usize;
+    for h in handles {
+        match h.join().unwrap() {
+            Ok(()) => oks += 1,
+            Err(e) => {
+                let m = format!("{e}");
+                assert!(m.contains("conflict"), "unexpected error: {m}");
+                conflicts += 1;
+            }
+        }
+    }
+    assert_eq!(oks + conflicts, 8);
+    assert!(oks >= 1);
+    let node = core.lookup("/c/hot").unwrap();
+    assert_eq!(node.version as usize, oks, "every winner committed exactly one version");
+    // Read-your-bytes: the head content is one of the writers' payloads.
+    let content = core.read("/c/hot", 0, 128).unwrap();
+    let valid: Vec<Vec<u8>> = (0..8).map(|i| format!("writer-{i}").into_bytes()).collect();
+    assert!(valid.contains(&content), "head content is some writer's bytes: {content:?}");
+    assert_eq!(core.metrics.conflicts.load(std::sync::atomic::Ordering::Relaxed) as usize, conflicts);
+}
+
+/// Object identity is independent of File ID: the locator never embeds
+/// it, and a reference bound to another backend is refused on read
+/// (fail-closed misrouting) instead of silently mis-read.
+#[test]
+fn s421_reference_names_backend_and_refuses_misroute() {
+    let src = Arc::new(MemObjectStore::new_named("mem:alpha"));
+    let dir = std::env::temp_dir().join(format!(
+        "lfs-vnext-s421-ref-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("meta.db").to_string_lossy().to_string();
+    {
+        let store = Store::open(&db).unwrap();
+        let core = Core::new(store, src.clone()).unwrap();
+        let data = b"located-elsewhere".to_vec();
+        let mut cur = std::io::Cursor::new(data.clone());
+        core.write_stream("/f", None, true, &mut cur, data.len() as u64)
+            .unwrap();
+        let locator = core.lookup("/f").unwrap().object_key.unwrap();
+        let oid = locator
+            .strip_prefix("objects/")
+            .and_then(|r| r.strip_suffix(".data"))
+            .unwrap_or_else(|| panic!("locator shape: {locator}"));
+        assert_eq!(oid.len(), 32);
+        assert!(oid.chars().all(|c| c.is_ascii_hexdigit()), "{oid}");
+    }
+    // A DIFFERENT backend instance receives a byte-copy of everything
+    // (marker included) — the namespace check passes, but every persisted
+    // reference names mem:alpha, and reads must refuse.
+    let dst = Arc::new(MemObjectStore::new_named("mem:beta"));
+    let mut token = None;
+    loop {
+        let page = src.list("", token.as_deref(), 1000).unwrap();
+        for i in &page.items {
+            let obj = src.get(&i.key, None).unwrap();
+            dst.put(&i.key, &obj.data).unwrap();
+        }
+        match page.next_token {
+            Some(t) => token = Some(t),
+            None => break,
+        }
+    }
+    let store = Store::open(&db).unwrap();
+    let core = Core::new(store, dst).unwrap();
+    let err = core.read("/f", 0, 64).unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("mem:alpha") && msg.contains("mem:beta"), "{msg}");
+    assert!(msg.contains("refusing to read across backends"), "{msg}");
+}
+
+/// put_if_absent claim semantics on a real atomic backend.
+#[test]
+fn s421_put_if_absent_claim_semantics() {
+    use crate::object_store::ObjectStore as _;
+    let s = MemObjectStore::new_named("mem:claim");
+    assert!(s.supports_atomic_claim());
+    assert!(s.put_if_absent("ns/marker", b"one").unwrap());
+    assert!(!s.put_if_absent("ns/marker", b"two").unwrap());
+    // The loser changed nothing.
+    assert_eq!(s.get("ns/marker", None).unwrap().data, b"one");
+}

@@ -732,6 +732,17 @@ fn resolve_xml_entity(name: &str) -> Option<String> {
 }
 
 impl ObjectStore for S3ObjectStore {
+    fn backend_id(&self) -> String {
+        // Stable for a given configuration: endpoint + bucket. The core
+        // persists this string inside object references and compares it on
+        // every read; it is opaque beyond that.
+        format!(
+            "s3://{}/{}",
+            self.cfg.endpoint.trim_end_matches('/'),
+            self.cfg.bucket
+        )
+    }
+
     fn put(&self, key: &str, data: &[u8]) -> Result<ObjectInfo> {
         let _g = crate::metrics::scope("s3.put");
         // Same key + same content on retry: idempotent.
@@ -755,6 +766,37 @@ impl ObjectStore for S3ObjectStore {
                 version_id: header_str(&resp, "x-amz-version-id"),
             })
         })
+    }
+
+    /// Atomic create-if-absent via `If-None-Match: *` (S3/MinIO conditional
+    /// PUT). A 412 precondition failure maps to `Ok(false)` INSIDE the
+    /// retry closure — the outcome is deterministic, so a losing claim
+    /// must never be retried. Transport and other remote failures stay
+    /// errors: the claim outcome is then UNKNOWN and the caller refuses.
+    fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<bool> {
+        let _g = crate::metrics::scope("s3.put_if_absent");
+        with_retry(|| {
+            let (url, headers) = self.signed("PUT", Some(key), "", data);
+            let mut resp = self
+                .apply_headers(self.agent.put(&url), &headers)
+                .header("Content-Type", "application/octet-stream")
+                .header("If-None-Match", "*")
+                .send(data)
+                .map_err(map_transport)?;
+            let status = resp.status().as_u16();
+            if status == 412 {
+                return Ok(false);
+            }
+            if !(200..300).contains(&status) {
+                let body = Self::read_body(&mut resp);
+                return Err(Self::map_status(status, &body, key));
+            }
+            Ok(true)
+        })
+    }
+
+    fn supports_atomic_claim(&self) -> bool {
+        true
     }
 
     fn get(&self, key: &str, range: Option<Range>) -> Result<ObjectData> {
