@@ -222,6 +222,27 @@ impl Core {
                 "vnext: initial commit hash does not match its canonical record".into(),
             ));
         }
+        // A FRESH local store opening a bucket that already carries a
+        // ref means a DIFFERENT engine's commit chain lives there.
+        // Co-rooting silently would let two chains interleave under one
+        // ref (no cross-server coordination exists — S4.18), so this
+        // fails closed. Reopens skip the check: their local DB has a
+        // main ref of its own.
+        if self.store.head(MAIN_REF)?.is_none() {
+            if let Ok(obj) = self.objects.get(&ref_key(MAIN_REF), None) {
+                let (kind, body) = envelope::open(&obj.data)?;
+                if kind == ObjKind::Ref {
+                    let remote: serde_json::Value =
+                        serde_json::from_slice(&body).map_err(|e| Error::Db(e.to_string()))?;
+                    let remote_commit = remote["commit"].as_str().unwrap_or("");
+                    if remote_commit != crate::sigv4::sha256_hex(&record) {
+                        return Err(Error::Db(format!(
+                            "vnext: bucket already holds a different root (ref commit                              {remote_commit}); a fresh store must not co-root with it"
+                        )));
+                    }
+                }
+            }
+        }
         match self.objects.head(&commit_key(&sha)) {
             Ok(_) => {} // already published
             Err(Error::ObjectMissing(_)) => {
