@@ -741,10 +741,14 @@ fn truncate_impl(path: Result<&str, c_int>, new_size: i64) -> c_int {
     if new_size < 0 {
         return -EINVAL;
     }
+    eprintln!("lightfs-winfsp: truncate {path} -> {new_size}");
     let fs = state();
     let node_now = match fs.lookup(path) {
         Ok(n) => n,
-        Err(e) => return -errno(&e),
+        Err(e) => {
+            eprintln!("lightfs-winfsp: truncate lookup failed for {path}: {e}");
+            return -errno(&e);
+        }
     };
     let cur_len = (node_now.size as u64).min(new_size as u64);
     let commit = fs.read(path, 0, cur_len).and_then(|mut content| {
@@ -775,7 +779,10 @@ fn truncate_impl(path: Result<&str, c_int>, new_size: i64) -> c_int {
             PENDING.drop_path(path);
             0
         }
-        Err(e) => -errno(&e),
+        Err(e) => {
+            eprintln!("lightfs-winfsp: truncate commit failed for {path}: {e}");
+            -errno(&e)
+        }
     }
 }
 
