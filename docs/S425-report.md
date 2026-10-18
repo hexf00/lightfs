@@ -1,6 +1,6 @@
 # S4.25 交付报告:挂载写有界内存 + 真实文件系统验收
 
-任务书六节全部执行完毕。最终 HEAD = `9a9a9c6`(vnext 分支已推送,未合 main,等评审);**Windows mount-smoke 全绿:`=== ACCEPTANCE PASSED in 7.9s ===`**(run 39177824923)。
+任务书六节全部执行完毕。**最终代码 HEAD = `9a9a9c6`**(vnext 分支已推送,未合 main,等评审;报告/文档类纯 docs 提交跟随其后,不影响代码面);**Windows mount-smoke 全绿:`=== ACCEPTANCE PASSED in 7.9s ===`**(run 39177824923)。
 
 ## 一、最终 SHA 与摘要
 
