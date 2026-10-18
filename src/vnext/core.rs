@@ -928,10 +928,19 @@ impl Core {
                 actual: entry.k,
             });
         }
-        // A zero-length range is always empty (POSIX read of 0 bytes
-        // returns 0): a file created but never written has no object yet,
-        // and truncate-extend of such a file must not fail its base read.
+        // An explicitly zero-length request stays request-free (pinned by
+        // s425_empty_file...: it succeeds even with the object gone).
         if size == 0 {
+            return Ok(Vec::new());
+        }
+        // A file created but never written has NO object at all: reading
+        // it is end-of-file (POSIX), not ObjectMissing (WinFsp accept A9:
+        // std::fs::read drives read_to_end, which always requests >= 32
+        // bytes, so a request-size short-circuit never fires for it).
+        // Files WITH an object fall through to the verified path — §一:
+        // an empty object is verified, never assumed.
+        let fsize = entry.s.max(0) as u64;
+        if offset >= fsize && entry.o.is_none() {
             return Ok(Vec::new());
         }
         let r = entry
@@ -941,7 +950,7 @@ impl Core {
         self.read_range_verified(
             key,
             entry.e.as_deref().unwrap_or(""),
-            entry.s.max(0) as u64,
+            fsize,
             offset,
             size,
         )
@@ -950,6 +959,8 @@ impl Core {
     /// Streaming by-id whole-file read (S4.25 §三, FsApi commit merge):
     /// the SAME verified path as `open_read` (footer checked before
     /// publication, staging admitted against the budget), by stable id.
+    /// Deliberately WITHOUT the EOF short-circuit: ObjectMissing here is
+    /// the commit-merge "no base" signal (see commit_write_merged).
     pub fn read_stream_by_id(
         &self,
         file_id: i64,
@@ -971,6 +982,17 @@ impl Core {
 
     pub fn read_by_id(&self, file_id: i64, offset: u64, size: u64) -> Result<Vec<u8>> {
         let entry = self.locate_by_id(file_id, "")?;
+        // By-id reads serve adapter application reads (fuse cb_read): a
+        // fresh create holds an id but no content object yet, and reading
+        // it is EOF (see `read`). An object present keeps the verified
+        // path (its own past-EOF arm stays empty without a request).
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let fsize = entry.s.max(0) as u64;
+        if offset >= fsize && entry.o.is_none() {
+            return Ok(Vec::new());
+        }
         let r = entry
             .o
             .ok_or_else(|| Error::ObjectMissing(format!("file {file_id}: no content yet")))?;
@@ -978,7 +1000,7 @@ impl Core {
         self.read_range_verified(
             key,
             entry.e.as_deref().unwrap_or(""),
-            entry.s.max(0) as u64,
+            fsize,
             offset,
             size,
         )
@@ -1024,8 +1046,13 @@ impl Core {
                 actual: entry.k,
             });
         }
-        // Zero-length ranges are always empty (see `read`).
+        // An explicitly zero-length request stays request-free (see
+        // `read`); a never-written file (no object at all) reads as EOF.
         if size == 0 {
+            return Ok((Box::new(std::io::empty()), 0));
+        }
+        let fsize = entry.s.max(0) as u64;
+        if offset >= fsize && entry.o.is_none() {
             return Ok((Box::new(std::io::empty()), 0));
         }
         let r = entry
@@ -1035,7 +1062,7 @@ impl Core {
         self.open_read_ref(
             key,
             entry.e.as_deref().unwrap_or(""),
-            entry.s.max(0) as u64,
+            fsize,
             offset,
             size,
         )
@@ -1048,8 +1075,13 @@ impl Core {
         size: u64,
     ) -> Result<(Box<dyn std::io::Read + Send>, u64)> {
         let entry = self.locate_by_id(file_id, "")?;
-        // Zero-length ranges are always empty (see `read`).
+        // Zero-length requests stay request-free; never-written files (no
+        // object at all) read as EOF (see `read`).
         if size == 0 {
+            return Ok((Box::new(std::io::empty()), 0));
+        }
+        let fsize = entry.s.max(0) as u64;
+        if offset >= fsize && entry.o.is_none() {
             return Ok((Box::new(std::io::empty()), 0));
         }
         let r = entry
@@ -1059,7 +1091,7 @@ impl Core {
         self.open_read_ref(
             key,
             entry.e.as_deref().unwrap_or(""),
-            entry.s.max(0) as u64,
+            fsize,
             offset,
             size,
         )

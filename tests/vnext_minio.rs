@@ -462,12 +462,16 @@ fn crash_between_data_and_metadata_recovers() {
         );
     }
     // The create itself committed (an empty v0 is legal metadata); what
-    // must NOT be visible is the buffered CONTENT: read refuses (no
-    // object was ever referenced) — no half-published version.
+    // must NOT be visible is the buffered CONTENT: no object was ever
+    // referenced, so the read is POSIX end-of-file (S4.25 A9: EOF, not
+    // ObjectMissing) — and must never be the uncommitted bytes.
     let node = eng.core.lookup("/inflight").unwrap();
     assert_eq!(node.version, 0, "no content version may exist");
-    assert!(eng.core.read("/inflight", 0, 64).is_err(),
-        "uncommitted content must not be visible after restart");
+    match eng.core.read("/inflight", 0, 64) {
+        Err(_) => {}
+        Ok(bytes) => assert!(bytes.is_empty(),
+            "uncommitted content must not be visible after restart"),
+    }
 
     // reachability GC: the LEDGERED orphan (provably unreachable) goes,
     // the raw one stays (gc never deletes what it cannot prove dead),
@@ -1399,28 +1403,45 @@ fn s425_write_session_refuses_past_budget_without_corruption() {
     assert_eq!(eng.core.staging.stats().used, 0);
 }
 
-/// S4.25: a ZERO-length read never requires content. A file created but
-/// never written has no object at all (empty files that WERE committed
-/// get a real empty object — see s424_empty_file...), and truncate-extend
-/// of such a file (the WinFsp A4 discovery) must not fail its base read.
-/// Nonzero reads keep the ObjectMissing contract untouched.
+/// S4.25: a read at/past the committed EOF never requires content. A file
+/// created but never written has no object at all (empty files that WERE
+/// committed get a real empty object — see s424_empty_file...), and every
+/// application read of it is end-of-file, not ObjectMissing. WinFsp accept
+/// A9: std::fs::read drives read_to_end, which always requests >= 32
+/// bytes, so the earlier request-size-only short-circuit never fired and
+/// the read died on the missing object. read_stream_by_id stays STRICT
+/// (ObjectMissing is the commit-merge "no base" signal) and is pinned by
+/// the s425 commit tests.
 #[test]
-fn zero_length_read_needs_no_content() {
+fn eof_read_needs_no_content() {
     let cfg = fresh("zerolen");
     let eng = lightfs::engine::open_engine(&cfg).unwrap();
     eng.core.create("/z.bin", 0o644).unwrap();
+    // Zero-length requests (the S4.25 §一 original contract).
     assert_eq!(eng.core.read("/z.bin", 0, 0).unwrap(), Vec::<u8>::new());
-    let (mut r, len) = eng.core.open_read("/z.bin", 0, 0).unwrap();
+    // Nonzero requests at/past EOF: EMPTY, on all four read entries.
+    assert_eq!(eng.core.read("/z.bin", 0, 4096).unwrap(), Vec::<u8>::new());
+    assert_eq!(eng.core.read("/z.bin", 8, 16).unwrap(), Vec::<u8>::new());
+    let (mut r, len) = eng.core.open_read("/z.bin", 0, 4096).unwrap();
     assert_eq!(len, 0);
     let mut buf = Vec::new();
     std::io::Read::read_to_end(&mut r, &mut buf).unwrap();
     assert!(buf.is_empty());
     let node = eng.core.lookup("/z.bin").unwrap();
-    let (mut r, len) = eng.core.open_read_by_id(node.id, 0, 0).unwrap();
+    assert_eq!(
+        eng.core.read_by_id(node.id, 0, 4096).unwrap(),
+        Vec::<u8>::new()
+    );
+    let (mut r, len) = eng.core.open_read_by_id(node.id, 0, 4096).unwrap();
     assert_eq!(len, 0);
     buf.clear();
     std::io::Read::read_to_end(&mut r, &mut buf).unwrap();
     assert!(buf.is_empty());
-    let e = eng.core.read("/z.bin", 0, 1).unwrap_err();
-    assert!(matches!(e, lightfs::error::Error::ObjectMissing(_)));
+    // The gate must not dull real reads: after a write the bytes come
+    // back, and reads past the NEW EOF are still empty.
+    let h = eng.core.open_write("/z.bin", None).unwrap();
+    eng.core.write(&h, 0, b"hello").unwrap();
+    eng.core.commit_write(&h).unwrap();
+    assert_eq!(eng.core.read("/z.bin", 0, 4096).unwrap(), b"hello".to_vec());
+    assert_eq!(eng.core.read("/z.bin", 5, 64).unwrap(), Vec::<u8>::new());
 }

@@ -485,7 +485,7 @@ fn commit_write(fh: u64) -> Result<(), Error> {
     // take the FRESH spool (the attempt's data was moved out at entry)
     // and merge nothing (WinFsp accept A7: retry flush landed at h1's
     // 4 bytes with a silent Ok).
-    let fail = |e: Error, observed: Option<i64>, mut drained: crate::staging::WriteSpool| -> Error {
+    let fail = |e: Error, observed: Option<i64>, drained: crate::staging::WriteSpool| -> Error {
         let mut writes = WRITES.lock().unwrap();
         if let Some(sess) = writes.get_mut(&fh) {
             let fresh = match crate::staging::WriteSpool::open(&STAGING) {
