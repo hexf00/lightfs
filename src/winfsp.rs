@@ -598,6 +598,7 @@ unsafe extern "system" fn cb_open(path: *const c_char, fi: *mut FuseFileInfo) ->
             return -EINVAL;
         };
         let write_intent = (*fi).flags & 3 != 0; // O_WRONLY | O_RDWR
+        eprintln!("lightfs-winfsp: cb_open path={} write_intent={} flags={:#x}", path, write_intent, (*fi).flags);
         if write_intent {
             match start_write(state().as_ref(), path) {
                 Ok(fh) => {
@@ -710,6 +711,9 @@ unsafe extern "system" fn cb_write(
     offset: i64,
     fi: *mut FuseFileInfo,
 ) -> c_int {
+    unsafe {
+        eprintln!("lightfs-winfsp: cb_write fh={} off={} size={}", (*fi).fh, offset, size);
+    }
     // SAFETY: inputs validated above; raw FFI surface isolated here.
     unsafe {
         let Ok(path) = path_of(path) else {
@@ -821,8 +825,10 @@ unsafe extern "system" fn cb_flush(path: *const c_char, fi: *mut FuseFileInfo) -
     // SAFETY: inputs validated above; raw FFI surface isolated here.
     unsafe {
         let Ok(path) = path_of(path) else {
+            eprintln!("lightfs-winfsp: cb_flush path_of REJECTED");
             return -EINVAL;
         };
+        eprintln!("lightfs-winfsp: cb_flush path={} fh={}", path, (*fi).fh);
         match commit_write((*fi).fh) {
             Ok(()) => 0,
             Err(e) => {
@@ -873,9 +879,11 @@ unsafe extern "system" fn cb_fsync(
 ) -> c_int {
     // SAFETY: inputs validated above; raw FFI surface isolated here.
     unsafe {
-        let Ok(_path) = path_of(path) else {
+        let Ok(p) = path_of(path) else {
+            eprintln!("lightfs-winfsp: cb_fsync path_of REJECTED");
             return -EINVAL;
         };
+        eprintln!("lightfs-winfsp: cb_fsync path={} fh={}", p, (*fi).fh);
         match commit_write((*fi).fh) {
             Ok(()) => 0,
             Err(e) => -errno(&e),
