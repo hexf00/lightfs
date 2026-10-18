@@ -294,7 +294,14 @@ pub struct PendingWrite {
     pub node_id: i64,
     /// Version captured when write intent started; the CAS anchor.
     pub expected_version: i64,
-    pub chunks: ChunkMap,
+    /// S4.25 §三: the session's unflushed bytes live in a private DISK
+    /// spool inside the adapter's managed staging directory (bounded by
+    /// the process staging budget) — random writes, holes, read-your-
+    /// writes overlay, and a streamed commit. The commit swaps the spool
+    /// out wholesale (kernel writes during the commit land in a FRESH
+    /// spool), and a failed commit merges the drained batch back with
+    /// `merge_under` (window writes stay newer, nothing is lost).
+    pub spool: crate::staging::WriteSpool,
     /// True once a commit succeeded AND no newer chunks arrived after it.
     pub committed: bool,
     /// The name this session was opened under no longer exists (the file
@@ -319,17 +326,22 @@ pub struct PendingWrite {
 }
 
 impl PendingWrite {
-    pub fn new(path: String, node_id: i64, expected_version: i64) -> Self {
-        Self {
+    pub fn new(
+        path: String,
+        node_id: i64,
+        expected_version: i64,
+        staging: &std::sync::Arc<crate::staging::StagingBudget>,
+    ) -> std::result::Result<Self, crate::error::Error> {
+        Ok(Self {
             path,
             node_id,
             expected_version,
-            chunks: ChunkMap::new(),
+            spool: crate::staging::WriteSpool::open(staging)?,
             committed: false,
             orphaned: false,
             detached_ino: None,
             flush_failed: false,
-        }
+        })
     }
 
     /// Record a successful commit. Returns true when the session is fully
@@ -339,7 +351,7 @@ impl PendingWrite {
     pub fn note_commit_success(&mut self, new_version: i64) -> bool {
         self.expected_version = new_version;
         self.flush_failed = false;
-        if self.chunks.is_empty() {
+        if !self.spool.is_dirty() {
             self.committed = true;
             true
         } else {
@@ -461,51 +473,68 @@ mod tests {
         assert!(c.is_empty());
     }
 
+    fn test_budget() -> std::sync::Arc<crate::staging::StagingBudget> {
+        crate::staging::StagingBudget::headless(crate::staging::StagingLimits::default())
+    }
+
     #[test]
-    fn commit_success_with_new_chunks_stays_uncommitted() {
-        let mut s = PendingWrite::new("/f".into(), 77, 1);
-        s.chunks.insert(0, b"old".to_vec());
-        let drained = s.chunks.drain();
-        // a write lands while the commit is in flight
-        s.chunks.insert(0, b"NEW".to_vec());
+    fn commit_success_with_new_writes_stays_uncommitted() {
+        let b = test_budget();
+        let mut s = PendingWrite::new("/f".into(), 77, 1, &b).unwrap();
+        s.spool.write(0, b"old").unwrap();
+        // the commit swaps the spool out; a write lands in the FRESH spool
+        // while the commit is in flight
+        let fresh = crate::staging::WriteSpool::open(&b).unwrap();
+        let drained = std::mem::replace(&mut s.spool, fresh);
+        s.spool.write(0, b"NEW").unwrap();
         let fully = s.note_commit_success(2);
-        assert!(!fully, "new chunks arrived during commit - not done");
+        assert!(!fully, "new writes arrived during commit - not done");
         assert_eq!(s.expected_version, 2);
         assert!(!s.committed);
         // the next flush commits exactly the new batch
-        let next = s.chunks.drain();
-        assert_eq!(next.get(&0).unwrap(), b"NEW");
+        assert_eq!(s.spool.dirty_end(), 3);
+        let mut next_buf = [0u8; 3];
+        s.spool.read_at(0, &mut next_buf).unwrap();
+        assert_eq!(&next_buf, b"NEW");
+        // the second commit uploads the fresh spool and resets it
+        s.spool.reset().unwrap();
         assert!(s.note_commit_success(3));
         assert!(s.committed);
-        let _ = drained;
+        drop(drained);
     }
 
     #[test]
-    fn restore_under_lets_newer_writes_win() {
-        let mut s = PendingWrite::new("/f".into(), 77, 1);
-        s.chunks.insert(0, vec![b'O'; 8192]); // old batch [0, 8192)
-        let drained = s.chunks.drain();
+    fn merge_under_lets_newer_writes_win() {
+        let b = test_budget();
+        let mut s = PendingWrite::new("/f".into(), 77, 1, &b).unwrap();
+        s.spool.write(0, vec![b'O'; 8192].as_slice()).unwrap(); // old batch [0, 8192)
+        let fresh = crate::staging::WriteSpool::open(&b).unwrap();
+        let mut drained = std::mem::replace(&mut s.spool, fresh);
         // during the (failing) commit, a new write lands at [4096, 4196)
-        s.chunks.insert(4096, vec![b'N'; 100]);
-        s.chunks.restore_under(&drained);
-        let got = content_after(&s.chunks, b"");
-        assert_eq!(got.len(), 8192);
+        s.spool.write(4096, vec![b'N'; 100].as_slice()).unwrap();
+        s.spool.merge_under(drained).unwrap();
+        let mut got = vec![0u8; 8192];
+        s.spool.read_at(0, &mut got).unwrap();
         assert!(got[..4096].iter().all(|&b| b == b'O'));
-        assert!(got[4096..4196].iter().all(|&b| b == b'N'));
+        assert!(got[4096..4196].iter().all(|&b| b == b'N'), "window write must win");
         // bytes around the new write on both sides are restored old data
         assert_eq!(got[4095], b'O', "byte just before the new range");
         assert_eq!(got[4196], b'O', "byte just after the new range");
+        assert_eq!(s.spool.dirty_end(), 8192);
     }
 
     #[test]
-    fn restore_under_covers_tail_beyond_new_write() {
-        let mut s = PendingWrite::new("/f".into(), 77, 1);
-        s.chunks.insert(0, b"OLDOLDOLD".to_vec()); // [0, 9)
-        let drained = s.chunks.drain();
-        s.chunks.insert(0, b"new".to_vec()); // [0, 3) newer
-        s.chunks.restore_under(&drained);
-        let got = content_after(&s.chunks, b"");
-        assert_eq!(got, b"newOLDOLD");
+    fn merge_under_covers_tail_beyond_new_write() {
+        let b = test_budget();
+        let mut s = PendingWrite::new("/f".into(), 77, 1, &b).unwrap();
+        s.spool.write(0, b"OLDOLDOLD").unwrap(); // [0, 9)
+        let fresh = crate::staging::WriteSpool::open(&b).unwrap();
+        let drained = std::mem::replace(&mut s.spool, fresh);
+        s.spool.write(0, b"new").unwrap(); // [0, 3) newer
+        s.spool.merge_under(drained).unwrap();
+        let mut got = vec![0u8; 9];
+        s.spool.read_at(0, &mut got).unwrap();
+        assert_eq!(&got, b"newOLDOLD");
     }
 
     #[test]

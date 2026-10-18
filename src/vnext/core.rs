@@ -927,6 +927,28 @@ impl Core {
         )
     }
 
+    /// Streaming by-id whole-file read (S4.25 §三, FsApi commit merge):
+    /// the SAME verified path as `open_read` (footer checked before
+    /// publication, staging admitted against the budget), by stable id.
+    pub fn read_stream_by_id(
+        &self,
+        file_id: i64,
+        path_hint: &str,
+    ) -> Result<(Box<dyn std::io::Read + Send>, u64)> {
+        let entry = self.locate_by_id(file_id, path_hint)?;
+        let r = entry
+            .o
+            .ok_or_else(|| Error::ObjectMissing(format!("file {file_id}: no content yet")))?;
+        let key = self.check_ref(&r)?;
+        self.open_read_ref(
+            key,
+            entry.e.as_deref().unwrap_or(""),
+            entry.s.max(0) as u64,
+            0,
+            u64::MAX,
+        )
+    }
+
     pub fn read_by_id(&self, file_id: i64, offset: u64, size: u64) -> Result<Vec<u8>> {
         let entry = self.locate_by_id(file_id, "")?;
         let r = entry
@@ -1381,7 +1403,7 @@ impl Core {
             .fid
             .ok_or_else(|| Error::Db("file entry without identity".into()))?;
         let expected = expected_version.unwrap_or_else(|| entry.fv.unwrap_or(0));
-        Ok(WriteHandle::new(file_id, path, expected))
+        Ok(WriteHandle::new(file_id, path, expected, &self.staging)?)
     }
 
     pub fn open_write_id(
@@ -1392,7 +1414,7 @@ impl Core {
     ) -> Result<WriteHandle> {
         let entry = self.locate_by_id(file_id, path)?;
         let expected = expected_version.unwrap_or_else(|| entry.fv.unwrap_or(0));
-        Ok(WriteHandle::new(file_id, path, expected))
+        Ok(WriteHandle::new(file_id, path, expected, &self.staging)?)
     }
 
     pub fn write(&self, handle: &WriteHandle, offset: u64, data: &[u8]) -> Result<usize> {
@@ -1415,14 +1437,26 @@ impl Core {
         // O(file size) — this is the interactive-write path; the bounded
         // path is server spool + write_stream (documented, not hidden).
         let key = data_key(&new_object_id());
-        let buf = handle.buf.lock().expect("write buffer");
-        let len = buf.len();
-        let mut src = std::io::Cursor::new(&buf[..]);
-        let mut enc = envelope::seal_reader(ObjKind::Data, &mut src, len as u64);
-        let info = self
-            .objects
-            .put_stream(&key, &mut enc, envelope::encoded_len(len as u64))?;
-        drop(buf);
+        let mut spool = handle.spool.lock().expect("write spool");
+        let len = spool.size();
+        // S4.25 §三: the envelope is streamed straight out of the disk
+        // spool — no full-content snapshot, no envelope Vec. On success
+        // with no concurrent writes the spool resets (bytes AND budget
+        // released); on failure it stays intact for the retry.
+        let ops_at_commit = spool.write_ops();
+        let put_result = (|| -> Result<crate::object_store::ObjectInfo> {
+            spool.rewind()?;
+            let mut enc = envelope::seal_reader(ObjKind::Data, spool.reader(), len);
+            self.objects
+                .put_stream(&key, &mut enc, envelope::encoded_len(len))
+        })();
+        // a concurrent write during the PUT window means the spool holds
+        // uncommitted bytes again — keep them for the next flush
+        if put_result.is_ok() && spool.write_ops() == ops_at_commit {
+            spool.reset()?;
+        }
+        let info = put_result?;
+        drop(spool);
 
         let comps = Self::split_path(&handle.path)?;
         let name = comps
@@ -1765,29 +1799,38 @@ pub struct WriteHandle {
     pub file_id: i64,
     pub path: String,
     pub(crate) expected_version: i64,
-    buf: Mutex<Vec<u8>>,
+    /// S4.25 §三: session bytes live in a private DISK spool inside the
+    /// core's managed staging directory (bounded by the same budget as
+    /// the read path), never in the heap. Random writes, sparse holes,
+    /// two-sided truncate, read-your-writes; the commit streams the
+    /// envelope straight out of the spool file.
+    pub(crate) spool: Mutex<crate::staging::WriteSpool>,
 }
 
 impl WriteHandle {
-    fn new(file_id: i64, path: &str, expected_version: i64) -> WriteHandle {
-        WriteHandle {
+    fn new(
+        file_id: i64,
+        path: &str,
+        expected_version: i64,
+        staging: &std::sync::Arc<crate::staging::StagingBudget>,
+    ) -> Result<WriteHandle> {
+        Ok(WriteHandle {
             file_id,
             path: path.to_string(),
             expected_version,
-            buf: Mutex::new(Vec::new()),
-        }
+            spool: Mutex::new(crate::staging::WriteSpool::open(staging)?),
+        })
     }
 
     pub fn write(&self, offset: u64, data: &[u8]) -> Result<usize> {
-        let mut buf = self.buf.lock().unwrap();
-        let end = (offset as usize).saturating_add(data.len());
-        if end > buf.len() {
-            buf.resize(end, 0);
-        }
-        buf[offset as usize..end].copy_from_slice(data);
+        self.spool.lock().expect("write spool").write(offset, data)?;
         Ok(data.len())
     }
 
+    /// The uncommitted session size (visible-EOF contribution).
+    pub fn spool_size(&self) -> u64 {
+        self.spool.lock().expect("write spool").size()
+    }
 }
 
 /// A footer-verified full object staged in a private temp file (S4.24).

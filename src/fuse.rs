@@ -56,8 +56,13 @@ fn secs_env(name: &str, default: u64) -> u64 {
 /// uploaded: the name is gone and must not resurrect, fsync succeeds
 /// because the data is held (in memory, like any anonymous inode).
 struct Detached {
-    base: Vec<u8>,
-    chunks: crate::writeback::ChunkMap,
+    /// S4.25 §三: the detached inode's bytes live in ONE disk spool
+    /// (base snapshot streamed in at detach, every surviving handle's
+    /// writes merged on top) — never a whole-file heap buffer.
+    spool: crate::staging::WriteSpool,
+    /// Whether the base snapshot has been streamed in yet (the entry is
+    /// created by the FIRST detaching session; later ones only merge).
+    base_loaded: bool,
     refs: usize,
 }
 
@@ -104,6 +109,10 @@ pub struct FuseAdapter {
     /// In-flight EOF per path (see writeback::PendingEof): appends derive
     /// their offset from our view of the file size, and stat coherence.
     pending: std::sync::LazyLock<crate::writeback::PendingEof>,
+    /// S4.25 §三: THIS process's staging budget — mounted write sessions
+    /// and detached inodes spool under it. Shared with the client (one
+    /// budget per mount process).
+    staging: std::sync::Arc<crate::staging::StagingBudget>,
     next_fh: AtomicU64,
     uid: u32,
     gid: u32,
@@ -181,7 +190,10 @@ fn attr_for(node: &Node, uid: u32, gid: u32) -> FileAttr {
 }
 
 impl FuseAdapter {
-    pub fn new(fs: std::sync::Arc<dyn FsApi>) -> Self {
+    pub fn new(
+        fs: std::sync::Arc<dyn FsApi>,
+        staging: std::sync::Arc<crate::staging::StagingBudget>,
+    ) -> Self {
         let mut inodes = HashMap::new();
         inodes.insert(1u64, PathBuf::from("/"));
         // SAFETY: plain uid/gid queries; no invariants beyond Linux's own.
@@ -206,6 +218,7 @@ impl FuseAdapter {
             dirent_ttl: Duration::from_secs(secs_env("LIGHTFS_FUSE_DIRENT_CACHE_SECS", 0)),
             attr_cache: Mutex::new(HashMap::new()),
             pending: std::sync::LazyLock::new(crate::writeback::PendingEof::new),
+            staging,
             next_fh: AtomicU64::new(1),
             uid,
             gid,
@@ -311,7 +324,7 @@ impl FuseAdapter {
         let mut end = committed_size;
         for st in writes.values() {
             if st.path == path {
-                end = end.max(st.chunks.max_end());
+                end = end.max(st.spool.dirty_end());
             }
         }
         end
@@ -345,7 +358,7 @@ impl FuseAdapter {
         let writes = self.writes.lock().unwrap();
         for st in writes.values() {
             if st.path == path {
-                st.chunks.overlay_range(&mut data, offset);
+                st.spool.overlay_range(&mut data, offset)?;
             }
         }
         Ok(data)
@@ -366,7 +379,7 @@ impl FuseAdapter {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         self.writes.lock().unwrap().insert(
             fh,
-            PendingWrite::new(path.to_string(), node.id, node.version),
+            PendingWrite::new(path.to_string(), node.id, node.version, &self.staging)?,
         );
         Ok(fh)
     }
@@ -378,11 +391,11 @@ impl FuseAdapter {
     /// sessions orphaned+detached. Subsequent reads/writes on those
     /// handles are served from the detached entry until the last close.
     fn detach_sessions(&self, path: &str, ino: u64) {
-        // Take each victim's unflushed chunks NOW: after the name dies they
+        // Take each victim's unflushed spool NOW: after the name dies they
         // would never be committed, and dropping them would be exactly the
         // silent loss K2 forbids. fh order keeps the merge deterministic
         // (last write wins on an overlapping offset, matching fd order).
-        let mut folded: Vec<std::collections::BTreeMap<u64, Vec<u8>>> = Vec::new();
+        let mut folded: Vec<crate::staging::WriteSpool> = Vec::new();
         let victims = {
             let mut writes = self.writes.lock().unwrap();
             let mut fhs: Vec<u64> = writes
@@ -396,7 +409,10 @@ impl FuseAdapter {
                     st.orphaned = true;
                     st.path.clear();
                     st.detached_ino = Some(ino);
-                    folded.push(st.chunks.drain());
+                    let fresh = crate::staging::WriteSpool::open(&self.staging)
+                        .map_err(|_| ())
+                        .expect("fresh detached-session spool");
+                    folded.push(std::mem::replace(&mut st.spool, fresh));
                 }
             }
             fhs.len()
@@ -411,21 +427,24 @@ impl FuseAdapter {
             .unwrap()
             .entry(ino)
             .or_insert_with(|| Detached {
-                base: Vec::new(),
-                chunks: crate::writeback::ChunkMap::new(),
+                spool: crate::staging::WriteSpool::open(&self.staging)
+                    .expect("detached spool"),
+                base_loaded: false,
                 refs: 0,
             });
         let size = self.fs.lookup(path).map(|n| n.size as u64).unwrap_or(0);
         let base = self.fs.read(path, 0, size).unwrap_or_default();
         let mut det = self.detached.lock().unwrap();
         if let Some(d) = det.get_mut(&ino) {
-            if d.base.is_empty() {
-                d.base = base;
+            if !d.base_loaded {
+                let mut cur = std::io::Cursor::new(base);
+                d.spool
+                    .overlay_base(&mut cur, size)
+                    .expect("detached base overlay");
+                d.base_loaded = true;
             }
             for batch in folded {
-                for (off, data) in batch {
-                    d.chunks.insert(off, data);
-                }
+                d.spool.merge_from(batch).expect("detached spool merge");
             }
             d.refs += victims;
         }
@@ -458,11 +477,12 @@ impl FuseAdapter {
             .unwrap()
             .entry(ino)
             .or_insert_with(|| Detached {
-                base: Vec::new(),
-                chunks: crate::writeback::ChunkMap::new(),
+                spool: crate::staging::WriteSpool::open(&self.staging)
+                    .expect("detached spool"),
+                base_loaded: false,
                 refs: 0,
             });
-        let mut folded: Vec<std::collections::BTreeMap<u64, Vec<u8>>> = Vec::new();
+        let mut folded: Vec<crate::staging::WriteSpool> = Vec::new();
         let victims = {
             let mut writes = self.writes.lock().unwrap();
             let mut fhs: Vec<u64> = writes
@@ -476,7 +496,10 @@ impl FuseAdapter {
                     st.orphaned = true;
                     st.path.clear();
                     st.detached_ino = Some(ino);
-                    folded.push(st.chunks.drain());
+                    let fresh = crate::staging::WriteSpool::open(&self.staging)
+                        .map_err(|_| ())
+                        .expect("fresh detached-session spool");
+                    folded.push(std::mem::replace(&mut st.spool, fresh));
                 }
             }
             fhs.len()
@@ -484,13 +507,14 @@ impl FuseAdapter {
         let mut det = self.detached.lock().unwrap();
         match det.get_mut(&ino) {
             Some(d) => {
-                if d.base.is_empty() {
-                    d.base = base;
+                if !d.base_loaded {
+                    let len = base.len() as u64;
+                    let mut cur = std::io::Cursor::new(base);
+                    d.spool.overlay_base(&mut cur, len).expect("detached base overlay");
+                    d.base_loaded = true;
                 }
                 for batch in folded {
-                    for (off, data) in batch {
-                        d.chunks.insert(off, data);
-                    }
+                    d.spool.merge_from(batch).expect("detached spool merge");
                 }
                 d.refs += victims;
             }
@@ -503,7 +527,7 @@ impl FuseAdapter {
     fn detached_read(&self, ino: u64, offset: u64, size: u64) -> Option<Vec<u8>> {
         let det = self.detached.lock().unwrap();
         let d = det.get(&ino)?;
-        let eof = (d.base.len() as u64).max(d.chunks.max_end());
+        let eof = d.spool.size();
         let want = if eof > offset {
             ((eof - offset) as usize).min(size as usize)
         } else {
@@ -512,12 +536,9 @@ impl FuseAdapter {
         if want == 0 {
             return Some(Vec::new());
         }
-        let mut full = d.base.clone();
-        full.resize(eof as usize, 0);
-        d.chunks.overlay_range(&mut full, offset);
-        let from = (offset as usize).min(full.len());
-        let to = (from + want).min(full.len());
-        Some(full[from..to].to_vec())
+        let mut out = vec![0u8; want];
+        d.spool.read_at(offset, &mut out).ok()?;
+        Some(out)
     }
 
     /// Stat a detached inode: EOF = base snapshot size vs any surviving
@@ -525,7 +546,7 @@ impl FuseAdapter {
     fn detached_attr(&self, ino: INodeNo) -> Option<FileAttr> {
         let det = self.detached.lock().unwrap();
         let d = det.get(&ino.0)?;
-        let size = (d.base.len() as u64).max(d.chunks.max_end());
+        let size = d.spool.size();
         Some(FileAttr {
             ino,
             size,
@@ -559,24 +580,28 @@ impl FuseAdapter {
 
     /// Commit a buffered write (flush/release). Idempotent per handle.
     ///
-    /// Chunk lifecycle (drain-on-commit): the pending chunks are TAKEN out
-    /// of the session for the duration of the I/O, so chunks written by the
-    /// kernel during the commit land in a fresh map instead of being
-    /// silently merged with already-uploading data.
+    /// Spool lifecycle (S4.25 §三, drain-on-commit equivalent): the
+    /// session's spool is swapped out WHOLESALE for the duration of the
+    /// I/O — writes the kernel issues during the commit land in a FRESH
+    /// spool instead of being silently merged with already-uploading
+    /// data. The drained spool is never a heap buffer: the base streams
+    /// into it around its dirty ranges (`FsApi::commit_write_merged`)
+    /// and the merged whole uploads straight out of the spool file.
     ///
-    /// Failure recovery: EVERY error after the drain puts the drained
-    /// chunks back (writeback::ChunkMap::restore_under - chunks that
-    /// arrived during the failed commit are newer and win) and re-bases
-    /// the session's CAS anchor to the version observed at attempt start,
-    /// so a retry flush can succeed. Without this a failed flush would
-    /// drop the drained data and the next flush would "succeed" on an
-    /// empty batch - silent data loss.
+    /// Failure recovery: EVERY error after the swap merges the drained
+    /// spool back (`WriteSpool::merge_under` — writes that arrived during
+    /// the failed commit are newer and keep their bytes; the drained
+    /// batch fills the gaps) and re-bases the session's CAS anchor to the
+    /// version observed at attempt start, so a retry flush can succeed.
+    /// Without this a failed flush would drop the drained data and the
+    /// next flush would "succeed" on an empty batch - silent data loss.
     ///
-    /// Success: the session becomes committed ONLY when no new chunks
+    /// Success: the session becomes committed ONLY when no new writes
     /// arrived during the commit window; a write-during-commit batch is
-    /// left for the next flush, CAS-anchored on the fresh version.
+    /// left in the fresh spool for the next flush, CAS-anchored on the
+    /// fresh version.
     fn commit_write(&self, fh: u64) -> Result<(), Error> {
-        let snapshot = {
+        let (path, node_id, expected, mut drained, dirty_at_start) = {
             let mut writes = self.writes.lock().unwrap();
             let Some(state) = writes.get_mut(&fh) else {
                 return Ok(()); // read-only handle: nothing to do
@@ -587,30 +612,39 @@ impl FuseAdapter {
             if state.orphaned {
                 // Detached: the bytes are held in the shared detached entry
                 // until the last handle closes - nothing to upload (the name
-                // is gone and must not resurrect), nothing to drop. Draining
+                // is gone and must not resurrect), nothing to drop. Resetting
                 // here would silently discard writes that already succeeded,
                 // which K2 forbids. Idempotent like every flush.
                 return Ok(());
             }
-            let drained = state.chunks.drain();
-            if drained.is_empty() {
+            let dirty_at_start = state.spool.is_dirty();
+            if !dirty_at_start {
                 // A write-intent open that never wrote: commit nothing, or
                 // every such open+close would re-upload the whole file.
                 state.committed = true;
                 return Ok(());
             }
+            let fresh = crate::staging::WriteSpool::open(&self.staging)?;
+            let drained = std::mem::replace(&mut state.spool, fresh);
             (
                 state.path.clone(),
                 state.node_id,
                 state.expected_version,
                 drained,
+                dirty_at_start,
             )
         };
-        let (path, node_id, expected, drained) = snapshot;
         let fail = |e: Error, observed: Option<i64>| -> Error {
             let mut writes = self.writes.lock().unwrap();
             if let Some(state) = writes.get_mut(&fh) {
-                state.chunks.restore_under(&drained);
+                let fresh = match crate::staging::WriteSpool::open(&self.staging) {
+                    Ok(f) => f,
+                    Err(e2) => return e2,
+                };
+                let drained = std::mem::replace(&mut state.spool, fresh);
+                if let Err(e3) = state.spool.merge_under(drained) {
+                    return e3;
+                }
                 if let Some(v) = observed {
                     state.rebase(v);
                 }
@@ -622,72 +656,56 @@ impl FuseAdapter {
             }
             e
         };
-        // Write-back overlay: final content = the file's CURRENT committed
-        // content with the drained chunks overlaid at their offsets (the
-        // kernel only sends dirty pages - chunks alone would zero-fill the
-        // base and destroy existing data). Everything routes by the
-        // session's STABLE node id: a rename by another client cannot
-        // detach this commit from its file, and a deleted identity fails
-        // with IdentityGone instead of touching the path successor.
-        let node_now = match self.fs.lookup_by_id(node_id, &path) {
+        // Merged commit (S4.25): the CURRENT committed content streams in
+        // around the drained dirty ranges and the whole uploads from the
+        // spool. Everything routes by the session's STABLE node id: a
+        // rename by another client cannot detach this commit from its
+        // file, and a deleted identity fails with IdentityGone instead of
+        // touching the path successor.
+        let observed = self.fs.lookup_by_id(node_id, &path).ok().map(|n| n.version);
+        let commit_result = self
+            .fs
+            .commit_write_merged(node_id, &path, expected, &mut drained);
+        let committed_node = match commit_result {
             Ok(n) => n,
-            Err(e) => return Err(fail(e, None)),
-        };
-        // Authoritative base read (Phase Q): the overlay assembly is the
-        // commit chain - it must observe the store directly, never a cache
-        // entry (K3 doctrine, now structural via read_by_id_authoritative).
-        let mut content =
-            match self
-                .fs
-                .read_by_id_authoritative(node_id, &path, 0, node_now.size as u64)
-            {
-                Ok(c) => c,
-                Err(Error::ObjectMissing(_)) => Vec::new(),
-                Err(e) => return Err(fail(e, Some(node_now.version))),
-            };
-        drained_overlay(&drained, &mut content);
-        let mut session = match self.fs.open_write_by_id(node_id, &path, Some(expected)) {
-            Ok(s) => s,
-            Err(e) => return Err(fail(e, Some(node_now.version))),
-        };
-        if let Err(e) = session.write(0, &content) {
-            return Err(fail(e, Some(node_now.version)));
-        }
-        match session.commit() {
-            Ok(committed_node) => {
-                let end = {
-                    let mut writes = self.writes.lock().unwrap();
-                    if let Some(state) = writes.get_mut(&fh) {
-                        // chunks stay drained; a fresh kernel write starts a
-                        // new batch - but if one ALREADY arrived during the
-                        // commit, the session is NOT done (next flush commits
-                        // it against the re-based version).
-                        state.note_commit_success(committed_node.version);
-                    }
-                    // Inline scan: visible_eof would re-lock `writes` (a
-                    // std Mutex is not reentrant) and deadlock this very
-                    // flush - the exact bug fixed on the Windows adapter
-                    // first; do not "simplify" this back into the helper.
-                    let mut e = committed_node.size as u64;
-                    for st in writes.values() {
-                        if st.path == path {
-                            e = e.max(st.chunks.max_end());
-                        }
-                    }
-                    e
-                };
-                self.pending.rebase(&path, end);
-                // The commit produced the freshest possible node: refresh
-                // the readdirplus cache so the next stat does not pay an
-                // RPC (and never sees the pre-write size).
-                self.attr_cache
-                    .lock()
-                    .unwrap()
-                    .insert(path.clone(), (committed_node, std::time::Instant::now()));
-                Ok(())
+            Err(e) => {
+                drop(drained);
+                return Err(fail(e, observed));
             }
-            Err(e) => Err(fail(e, Some(node_now.version))),
-        }
+        };
+        // success: release the drained spool (its content is committed)
+        drop(drained);
+        let end = {
+            let mut writes = self.writes.lock().unwrap();
+            if let Some(state) = writes.get_mut(&fh) {
+                // the drained batch is uploaded; the FRESH spool holds any
+                // writes that arrived during the commit - if it is dirty,
+                // the session is NOT done (next flush commits it against
+                // the re-based version).
+                state.note_commit_success(committed_node.version);
+            }
+            // Inline scan: visible_eof would re-lock `writes` (a std Mutex
+            // is not reentrant) and deadlock this very flush - the exact
+            // bug fixed on the Windows adapter first; do not "simplify"
+            // this back into the helper.
+            let mut e = committed_node.size as u64;
+            for st in writes.values() {
+                if st.path == path {
+                    e = e.max(st.spool.dirty_end());
+                }
+            }
+            e
+        };
+        self.pending.rebase(&path, end);
+        // The commit produced the freshest possible node: refresh the
+        // readdirplus cache so the next stat does not pay an RPC (and
+        // never sees the pre-write size).
+        self.attr_cache
+            .lock()
+            .unwrap()
+            .insert(path.clone(), (committed_node, std::time::Instant::now()));
+        let _ = dirty_at_start;
+        Ok(())
     }
 }
 
@@ -873,12 +891,17 @@ impl Filesystem for FuseAdapter {
                             st.expected_version = new_node.version;
                             // ftruncate semantics: the kernel discards dirty
                             // pages beyond the new EOF and will NOT resend
-                            // them. Pending chunks beyond new_size must be
-                            // dropped, and chunks STRADDLING the new EOF
-                            // trimmed to their pre-EOF prefix, or the next
-                            // flush resurrects truncated-away data (review
-                            // round 8 finding; straddle case review round 9).
-                            st.chunks.trim_truncate(new_size);
+                            // them. Pending writes beyond new_size must be
+                            // dropped, and dirty ranges STRADDLING the new
+                            // EOF trimmed to their pre-EOF prefix, or the
+                            // next flush resurrects truncated-away data
+                            // (review round 8; straddle case round 9).
+                            if st.spool.truncate(new_size).is_err() {
+                                // shrinking never fails admission; a grow
+                                // refused by the budget leaves the session
+                                // unshrunk and the flush will surface it
+                                eprintln!("lightfs: WARNING spool truncate admission refused");
+                            }
                         }
                     }
                     // the committed size is authoritative from now on
@@ -1214,7 +1237,9 @@ impl Filesystem for FuseAdapter {
                     let mut det = self.detached.lock().unwrap();
                     match det.get_mut(&dino) {
                         Some(d) => {
-                            d.chunks.insert(offset, data.to_vec());
+                            if d.spool.write(offset, data).is_err() {
+                                return reply.error(Errno::ENOSPC);
+                            }
                             return reply.written(data.len() as u32);
                         }
                         None => return reply.error(Errno::EIO),
@@ -1230,7 +1255,9 @@ impl Filesystem for FuseAdapter {
             }
             state.committed = false;
         }
-        state.chunks.insert(offset, data.to_vec());
+        if state.spool.write(offset, data).is_err() {
+            return reply.error(Errno::ENOSPC);
+        }
         self.pending
             .advance(&state.path, offset + data.len() as u64);
         reply.written(data.len() as u32);
@@ -1588,8 +1615,17 @@ pub fn mount(
     mountpoint: &str,
     allow_other: bool,
 ) -> crate::error::Result<()> {
+    // S4.25: the mount process owns its own bounded staging budget (the
+    // FsApi layer owns one too when it is a Client — shared below when
+    // available). Write sessions and detached inodes spool under it.
+    let staging = fs
+        .client_staging()
+        .unwrap_or_else(|| {
+            crate::staging::StagingBudget::open(crate::staging::StagingLimits::default())
+                .expect("mount staging dir")
+        });
     crate::metrics::init_from_env();
-    let adapter = FuseAdapter::new(fs);
+    let adapter = FuseAdapter::new(fs, staging);
     // fuser 0.18: Config is non_exhaustive (mutate the default), and
     // allow_other moved from a mount option into SessionACL.
     let mut config = fuser::Config::default();

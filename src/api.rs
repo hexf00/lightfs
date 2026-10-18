@@ -3,7 +3,7 @@
 //! implements it over the LightFS protocol. Adapters (shell, FUSE) never
 //! see SQLite or S3.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::metadata::Node;
 use crate::vnext::core::{Core, WriteHandle};
 
@@ -12,6 +12,51 @@ use crate::vnext::core::{Core, WriteHandle};
 pub trait WriteSession: Send {
     fn write(&mut self, offset: u64, data: &[u8]) -> Result<usize>;
     fn commit(self: Box<Self>) -> Result<Node>;
+
+    // ---- S4.25 spool-aware hooks (default impls keep simple sessions
+    // working; spool-backed sessions override) ----
+
+    /// Merge authoritative BASE content into the session spool for the
+    /// commit: non-dirty ranges stream in from `base` (never materialized
+    /// whole), dirty ranges keep the session's own bytes. Sessions without
+    /// spool semantics refuse explicitly.
+    fn overlay_base(&mut self, _base: &mut dyn std::io::Read, _base_len: u64) -> Result<()> {
+        Err(Error::InvalidArgument(
+            "this write session does not support base overlay".into(),
+        ))
+    }
+    /// Highest dirty byte end (the session's visible-EOF contribution).
+    fn session_dirty_end(&self) -> u64 {
+        0
+    }
+    /// The session's high-water size (visible EOF lower bound).
+    fn session_size(&self) -> u64 {
+        0
+    }
+    /// Cumulative writes since open/reset — the commit window compares
+    /// against this to detect concurrent writes.
+    fn session_write_ops(&self) -> u64 {
+        0
+    }
+    /// Release the session's staged bytes after a fully-consumed commit.
+    fn session_reset(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Commit exactly `len` bytes streamed from `reader` as this session's
+    /// content (S4.25 §三: the merged-commit upload — no whole-file
+    /// materialization on a spool-backed session). The default degrades to
+    /// an in-memory write+commit for sessions without a streaming path.
+    fn commit_from(
+        mut self: Box<Self>,
+        reader: &mut dyn std::io::Read,
+        len: u64,
+    ) -> Result<Node> {
+        let mut data = Vec::with_capacity(len.min(64 * 1024 * 1024) as usize);
+        reader.read_to_end(&mut data)?;
+        self.write(0, &data)?;
+        self.commit()
+    }
 }
 
 pub trait FsApi: Send + Sync {
@@ -82,6 +127,49 @@ pub trait FsApi: Send + Sync {
         self.read_by_id(node_id, path_hint, offset, size)
     }
 
+    /// S4.25 §三: the file's CURRENT committed content as a STREAM, for
+    /// the commit merge (base streams into the session spool; it is never
+    /// materialized whole). The default materializes via the ranged read —
+    /// correct, but not bounded-memory; the core and the network client
+    /// override with true streaming. `ObjectMissing` propagates (a file
+    /// with no committed content yet has no base).
+    fn read_by_id_authoritative_stream(
+        &self,
+        node_id: i64,
+        path_hint: &str,
+    ) -> Result<(Box<dyn std::io::Read + Send>, u64)> {
+        let data = self.read_by_id_authoritative(node_id, path_hint, 0, u64::MAX)?;
+        let len = data.len() as u64;
+        Ok((Box::new(std::io::Cursor::new(data)), len))
+    }
+
+    /// S4.25 §三: the mount adapter shares the FsApi layer's staging
+    /// budget when one exists (one budget per process); None = the adapter
+    /// opens its own with the bounded defaults.
+    fn client_staging(&self) -> Option<std::sync::Arc<crate::staging::StagingBudget>> {
+        None
+    }
+
+    /// S4.25 §三: the mounted-write COMMIT. `spool` holds the session's
+    /// dirty bytes; the base streams in around them and the merged whole
+    /// uploads straight out of the spool. CAS anchors on
+    /// `expected_version`. The default composes the streaming read with a
+    /// session commit_from; the core commits directly by id.
+    fn commit_write_merged(
+        &self,
+        node_id: i64,
+        path: &str,
+        expected_version: i64,
+        spool: &mut crate::staging::WriteSpool,
+    ) -> Result<Node> {
+        let (mut base, base_len) = self.read_by_id_authoritative_stream(node_id, path)?;
+        spool.overlay_base(&mut *base, base_len)?;
+        let len = spool.size();
+        spool.rewind()?;
+        let session = self.open_write_by_id(node_id, path, Some(expected_version))?;
+        session.commit_from(spool.reader(), len)
+    }
+
     /// start a buffered write session anchored on the id (the session's
     /// commit must then carry the id end-to-end).
     fn open_write_by_id(
@@ -106,6 +194,20 @@ impl WriteSession for CoreWriteSession<'_> {
     }
     fn commit(self: Box<Self>) -> Result<Node> {
         self.core.commit_write(&self.handle)
+    }
+    // S4.25 §三: streamed merged-commit upload (the spool is the source;
+    // this commits it through the same PUT + one-transaction path).
+    fn commit_from(
+        self: Box<Self>,
+        reader: &mut dyn std::io::Read,
+        len: u64,
+    ) -> Result<Node> {
+        self.core.write_stream_by_id(
+            self.handle.file_id,
+            Some(self.handle.expected_version),
+            reader,
+            len,
+        )
     }
 }
 
@@ -184,5 +286,35 @@ impl FsApi for Core {
         // gate do the CAS (path stays for error messages only).
         let handle = Core::open_write_id(self, node_id, path, expected_version)?;
         Ok(Box::new(CoreWriteSession { core: self, handle }))
+    }
+    fn read_by_id_authoritative_stream(
+        &self,
+        node_id: i64,
+        path_hint: &str,
+    ) -> Result<(Box<dyn std::io::Read + Send>, u64)> {
+        // The core has no cache; this is the SAME verified streaming read
+        // the whole-file path serves (footer checked before publication,
+        // staging admitted against the budget).
+        Core::read_stream_by_id(self, node_id, path_hint)
+    }
+    fn commit_write_merged(
+        &self,
+        node_id: i64,
+        path: &str,
+        expected_version: i64,
+        spool: &mut crate::staging::WriteSpool,
+    ) -> Result<Node> {
+        // Base streams in around the session's dirty bytes; the merged
+        // whole uploads straight out of the spool through the SAME
+        // write_stream_by_id commit any streamed write takes (PUT, then
+        // ONE SQLite transaction; failure re-registers fail-closed).
+        match self.read_by_id_authoritative_stream(node_id, path) {
+            Ok((mut base, base_len)) => spool.overlay_base(&mut *base, base_len)?,
+            Err(Error::ObjectMissing(_)) => {} // never-committed file: no base
+            Err(e) => return Err(e),
+        }
+        let len = spool.size();
+        spool.rewind()?;
+        self.write_stream_by_id(node_id, Some(expected_version), spool.reader(), len)
     }
 }

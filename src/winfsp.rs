@@ -316,6 +316,21 @@ fn state() -> Arc<dyn FsApi> {
 
 static WRITES: LazyLock<Mutex<std::collections::HashMap<u64, PendingWrite>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+/// S4.25 §三: the WinFsp process's staging budget — write sessions spool
+/// under it (bounded like every other process).
+static STAGING: LazyLock<std::sync::Arc<crate::staging::StagingBudget>> =
+    LazyLock::new(|| {
+        match crate::staging::StagingBudget::open(crate::staging::StagingLimits::default()) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "lightfs: WARNING managed staging directory unavailable ({e}); \
+                     write sessions fall back to the raw temp dir (budget still enforced)"
+                );
+                crate::staging::StagingBudget::headless(crate::staging::StagingLimits::default())
+            }
+        }
+    });
 static PENDING: std::sync::LazyLock<crate::writeback::PendingEof> =
     std::sync::LazyLock::new(crate::writeback::PendingEof::new);
 static NEXT_FH: AtomicU64 = AtomicU64::new(1);
@@ -327,7 +342,7 @@ fn visible_eof(path: &str, committed_size: u64) -> u64 {
     let mut end = committed_size;
     for sess in writes.values() {
         if sess.path == path {
-            end = end.max(sess.chunks.max_end());
+            end = end.max(sess.spool.dirty_end());
         }
     }
     end
@@ -412,7 +427,7 @@ fn start_write(fs: &dyn FsApi, path: &str) -> Result<u64, Error> {
     let fh = NEXT_FH.fetch_add(1, Ordering::Relaxed);
     WRITES.lock().unwrap().insert(
         fh,
-        PendingWrite::new(path.to_string(), node.id, node.version),
+        PendingWrite::new(path.to_string(), node.id, node.version, &STAGING)?,
     );
     Ok(fh)
 }
@@ -423,7 +438,12 @@ fn start_write(fs: &dyn FsApi, path: &str) -> Result<u64, Error> {
 /// A session with no buffered data commits nothing (a write-intent open
 /// that never wrote must not re-upload the file).
 fn commit_write(fh: u64) -> Result<(), Error> {
-    let snapshot = {
+    // S4.25 §三: the session spool is swapped out WHOLESALE for the
+    // commit (writes during the commit land in a FRESH spool); the base
+    // streams in around the drained dirty ranges and the merged whole
+    // uploads straight out of the spool file — no whole-file heap buffer
+    // on the Windows adapter either.
+    let (path, expected, mut drained) = {
         let mut writes = WRITES.lock().unwrap();
         let Some(sess) = writes.get_mut(&fh) else {
             return Ok(()); // read-only handle
@@ -435,31 +455,38 @@ fn commit_write(fh: u64) -> Result<(), Error> {
             // The name died while the handle was open (unlink, or the
             // rename that overwrote it). K2-B: writes to this handle were
             // already REFUSED at the write boundary, so the batch is empty
-            // by construction; draining is defensive. Success - nothing
+            // by construction; resetting is defensive. Success - nothing
             // was ever accepted that could be silently lost. Mirrors
             // fuse.rs::commit_write (which implements full detached
             // semantics instead).
-            sess.chunks.drain();
+            sess.spool.reset()?;
             sess.committed = true;
             return Ok(());
         }
-        let drained = sess.chunks.drain();
-        if drained.is_empty() {
+        if !sess.spool.is_dirty() {
             sess.committed = true;
             return Ok(());
         }
+        let fresh = crate::staging::WriteSpool::open(&STAGING)?;
+        let drained = std::mem::replace(&mut sess.spool, fresh);
         (sess.path.clone(), sess.expected_version, drained)
     };
-    let (path, expected, drained) = snapshot;
     let fs = state();
-    // Every error after the drain restores the chunks (newer writes win)
-    // and re-bases the CAS anchor to the version observed at attempt
-    // start, so a retry flush can succeed instead of silently dropping
-    // the drained data.
+    // Every error after the swap merges the drained spool back (window
+    // writes stay newer — WriteSpool::merge_under) and re-bases the CAS
+    // anchor to the version observed at attempt start, so a retry flush
+    // can succeed instead of silently dropping the drained data.
     let fail = |e: Error, observed: Option<i64>| -> Error {
         let mut writes = WRITES.lock().unwrap();
         if let Some(sess) = writes.get_mut(&fh) {
-            sess.chunks.restore_under(&drained);
+            let fresh = match crate::staging::WriteSpool::open(&STAGING) {
+                Ok(f) => f,
+                Err(e2) => return e2,
+            };
+            let drained = std::mem::replace(&mut sess.spool, fresh);
+            if let Err(e3) = sess.spool.merge_under(drained) {
+                return e3;
+            }
             if let Some(v) = observed {
                 sess.rebase(v);
             }
@@ -471,52 +498,40 @@ fn commit_write(fh: u64) -> Result<(), Error> {
     };
     let node_now = match fs.lookup(&path) {
         Ok(n) => n,
-        Err(e) => return Err(fail(e, None)),
-    };
-    let mut content = match fs.read(&path, 0, node_now.size as u64) {
-        Ok(c) => c,
-        Err(Error::ObjectMissing(_)) => Vec::new(),
-        Err(e) => return Err(fail(e, Some(node_now.version))),
-    };
-    for (&off, data) in drained.iter() {
-        let end = off as usize + data.len();
-        if end > content.len() {
-            content.resize(end, 0);
+        Err(e) => {
+            drop(drained);
+            return Err(fail(e, None));
         }
-        content[off as usize..end].copy_from_slice(data);
-    }
-    let mut session = match fs.open_write(&path, Some(expected)) {
-        Ok(s) => s,
-        Err(e) => return Err(fail(e, Some(node_now.version))),
     };
-    if let Err(e) = session.write(0, &content) {
-        return Err(fail(e, Some(node_now.version)));
-    }
-    match session.commit() {
-        Ok(committed_node) => {
-            let end = {
-                let mut writes = WRITES.lock().unwrap();
-                if let Some(sess) = writes.get_mut(&fh) {
-                    // Fully done only when no new chunks arrived during the
-                    // commit window; a write-during-commit batch is committed
-                    // by the next flush against the re-based version.
-                    sess.note_commit_success(committed_node.version);
-                }
-                // Inline scan: visible_eof would re-lock WRITES (not
-                // reentrant) and deadlock the flush that is holding it.
-                let mut e = committed_node.size as u64;
-                for sess in writes.values() {
-                    if sess.path == path {
-                        e = e.max(sess.chunks.max_end());
-                    }
-                }
-                e
-            };
-            PENDING.rebase(&path, end);
-            Ok(())
+    let committed_node =
+        match fs.commit_write_merged(node_now.id, &path, expected, &mut drained) {
+            Ok(n) => n,
+            Err(e) => {
+                drop(drained);
+                return Err(fail(e, Some(node_now.version)));
+            }
+        };
+    drop(drained);
+    let end = {
+        let mut writes = WRITES.lock().unwrap();
+        if let Some(sess) = writes.get_mut(&fh) {
+            // Fully done only when no new writes arrived during the commit
+            // window; a write-during-commit batch is committed by the next
+            // flush against the re-based version.
+            sess.note_commit_success(committed_node.version);
         }
-        Err(e) => Err(fail(e, Some(node_now.version))),
-    }
+        // Inline scan: visible_eof would re-lock WRITES (not reentrant)
+        // and deadlock the flush that is holding it.
+        let mut e = committed_node.size as u64;
+        for sess in writes.values() {
+            if sess.path == path {
+                e = e.max(sess.spool.dirty_end());
+            }
+        }
+        e
+    };
+    PENDING.rebase(&path, end);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -654,7 +669,12 @@ unsafe extern "system" fn cb_read(
                     let writes = WRITES.lock().unwrap();
                     for sess in writes.values() {
                         if sess.path == path {
-                            sess.chunks.overlay_range(&mut data, offset as u64);
+                            // spool overlay failure is an IO error at the
+                            // FFI boundary (a dirty range read cannot
+                            // happen — the range exists if marked dirty)
+                            if sess.spool.overlay_range(&mut data, offset as u64).is_err() {
+                                return -EIO;
+                            }
                         }
                     }
                 }
@@ -704,7 +724,9 @@ unsafe extern "system" fn cb_write(
             }
             sess.committed = false;
         }
-        sess.chunks.insert(offset as u64, data);
+        if sess.spool.write(offset as u64, &data).is_err() {
+            return -ENOSPC;
+        }
         PENDING.advance(path, offset as u64 + size as u64);
         size as c_int
     }
@@ -740,12 +762,13 @@ fn truncate_impl(path: Result<&str, c_int>, new_size: i64) -> c_int {
                 for st in writes.values_mut() {
                     if st.path == path {
                         st.expected_version = new_node.version;
-                        // Drop chunks beyond the new EOF, trim chunks
-                        // straddling it to their pre-EOF prefix (the kernel
-                        // discards those dirty pages and will not resend
-                        // them; a straddling chunk left whole would
-                        // re-extend the file on the next flush).
-                        st.chunks.trim_truncate(new_size as u64);
+                        // Drop pending writes beyond the new EOF, trim
+                        // dirty ranges straddling it to their pre-EOF
+                        // prefix (the kernel discards those dirty pages
+                        // and will not resend them; a straddling range
+                        // left whole would re-extend the file on the
+                        // next flush).
+                        let _ = st.spool.truncate(new_size as u64);
                     }
                 }
             }

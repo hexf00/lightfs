@@ -31,6 +31,8 @@ pub struct Client {
     agent: ureq::Agent,
     cache: MetaCache,
     ttl: Option<Duration>,
+    /// S4.25: this process's write-session spool budget.
+    staging: std::sync::Arc<crate::staging::StagingBudget>,
 }
 
 /// TTL metadata cache. Never authoritative: losing it, expiring it, or a
@@ -111,34 +113,61 @@ struct ClientWriteSession<'a> {
     node_id: i64,
     path: String,
     expected_version: i64,
-    chunks: BTreeMap<u64, Vec<u8>>,
+    /// S4.25 §三: session bytes live in a private disk spool inside the
+    /// client process's managed staging directory (bounded by the client
+    /// staging budget) — random writes, holes, read-your-writes, streamed
+    /// commit upload. Never a whole-file heap buffer.
+    spool: crate::staging::WriteSpool,
 }
 
 impl WriteSession for ClientWriteSession<'_> {
     fn write(&mut self, offset: u64, data: &[u8]) -> Result<usize> {
-        if !data.is_empty() {
-            self.chunks.insert(offset, data.to_vec());
-        }
+        self.spool.write(offset, data)?;
         Ok(data.len())
     }
-    fn commit(self: Box<Self>) -> Result<Node> {
-        let mut content: Vec<u8> = Vec::new();
-        for (&off, data) in self.chunks.iter() {
-            if off > content.len() as u64 {
-                content.resize(off as usize, 0);
-            }
-            let end = (off as usize + data.len()).max(content.len());
-            content.resize(end, 0);
-            content[off as usize..off as usize + data.len()].copy_from_slice(data);
-        }
-        let node = self.client.write_node_by_id(
+    fn commit(mut self: Box<Self>) -> Result<Node> {
+        let len = self.spool.size();
+        self.spool.rewind()?;
+        let node = self.client.write_from_reader_by_id(
             self.node_id,
             &self.path,
-            &content,
+            self.spool.reader(),
+            len,
             Some(self.expected_version),
         )?;
         self.client.after_mutation(&self.path);
         Ok(node)
+    }
+    fn commit_from(
+        self: Box<Self>,
+        reader: &mut dyn std::io::Read,
+        len: u64,
+    ) -> Result<Node> {
+        let node = self.client.write_from_reader_by_id(
+            self.node_id,
+            &self.path,
+            reader,
+            len,
+            Some(self.expected_version),
+        )?;
+        self.client.after_mutation(&self.path);
+        Ok(node)
+    }
+    // S4.25 spool-aware hooks (see api::WriteSession defaults)
+    fn overlay_base(&mut self, base: &mut dyn std::io::Read, base_len: u64) -> Result<()> {
+        self.spool.overlay_base(base, base_len)
+    }
+    fn session_dirty_end(&self) -> u64 {
+        self.spool.dirty_end()
+    }
+    fn session_size(&self) -> u64 {
+        self.spool.size()
+    }
+    fn session_write_ops(&self) -> u64 {
+        self.spool.write_ops()
+    }
+    fn session_reset(&mut self) -> Result<()> {
+        self.spool.reset()
     }
 }
 
@@ -149,12 +178,33 @@ impl Client {
             .http_status_as_error(false)
             .build()
             .new_agent();
+        // S4.25: the client process owns its OWN staging budget (same
+        // bounded defaults as the server; a mount client is bounded too).
+        let staging = match crate::staging::StagingBudget::open(
+            crate::staging::StagingLimits::default(),
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "lightfs: WARNING managed staging directory unavailable ({e}); \
+                     write sessions fall back to the raw temp dir (budget still enforced)"
+                );
+                crate::staging::StagingBudget::headless(crate::staging::StagingLimits::default())
+            }
+        };
         Self {
             url: cfg.url.trim_end_matches('/').to_string(),
             agent,
             cache: MetaCache::default(),
             ttl: cfg.metadata_ttl,
+            staging,
         }
+    }
+
+    /// The client's staging budget (S4.25): mounted write sessions spool
+    /// under it; read-side staging lives server-side. Observation only.
+    pub fn staging(&self) -> std::sync::Arc<crate::staging::StagingBudget> {
+        self.staging.clone()
     }
 
     /// Phase 11 honesty check: the data cache is specified as optional and
@@ -487,7 +537,7 @@ impl FsApi for Client {
             node_id: node.id,
             path: path.to_string(),
             expected_version: expected_version.unwrap_or(node.version),
-            chunks: BTreeMap::new(),
+            spool: crate::staging::WriteSpool::open(&self.staging)?,
         }))
     }
 
@@ -534,6 +584,50 @@ impl FsApi for Client {
             .map_err(|e| Error::Io(e.to_string()))
     }
 
+    fn client_staging(&self) -> Option<std::sync::Arc<crate::staging::StagingBudget>> {
+        Some(self.staging.clone())
+    }
+
+    fn read_by_id_authoritative_stream(
+        &self,
+        node_id: i64,
+        path_hint: &str,
+    ) -> Result<(Box<dyn std::io::Read + Send>, u64)> {
+        // True streaming: the response body (the server's verified whole
+        // file, or its bounded staging of it) flows to the caller as a
+        // reader — the commit merge never materializes the base.
+        let _ = path_hint;
+        let mut resp = crate::metrics::time("client.data.read", || {
+            self.agent
+                .post(format!("{}/data/read", self.url))
+                .header("Content-Type", "application/json")
+                .send(
+                    json!({"node_id": node_id, "offset": 0, "size": u64::MAX})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .map_err(|e| Error::Io(format!("data/read transport: {e}")))
+        })?;
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            let text = resp
+                .body_mut()
+                .with_config()
+                .limit(MAX_RESPONSE_BODY)
+                .read_to_string()
+                .unwrap_or_default();
+            return Err(error_from_body(status, &text));
+        }
+        let len: u64 = resp
+            .headers()
+            .get("x-lightfs-length")
+            .or_else(|| resp.headers().get("content-length"))
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| Error::Io("missing X-LightFS-Length".into()))?;
+        Ok((Box::new(resp.into_body().into_reader()), len))
+    }
+
     fn open_write_by_id(
         &self,
         node_id: i64,
@@ -555,7 +649,7 @@ impl FsApi for Client {
             node_id,
             path: path.to_string(),
             expected_version: expected_version.unwrap_or(node.version),
-            chunks: BTreeMap::new(),
+            spool: crate::staging::WriteSpool::open(&self.staging)?,
         }))
     }
 
@@ -652,6 +746,51 @@ impl Client {
     /// Single-pass streaming write: bytes stream from `reader` through the
     /// server into a version object, then one CAS commit. No whole-file
     /// buffering on client or server.
+    /// S4.25 §三: by-id streamed commit upload (POST /data/write with the
+    /// Node-Id anchor). The reader streams exactly `len` bytes; the server
+    /// stages to ITS OWN bounded staging (never RAM) and commits under the
+    /// CAS anchor. Zero protocol additions — the endpoint already speaks
+    /// Node-Id + Expected-Version + Length.
+    pub fn write_from_reader_by_id(
+        &self,
+        node_id: i64,
+        path_hint: &str,
+        reader: &mut dyn std::io::Read,
+        len: u64,
+        expected_version: Option<i64>,
+    ) -> Result<Node> {
+        let encoded_path = crate::sigv4::uri_encode(path_hint, true);
+        let mut builder = self
+            .agent
+            .post(format!("{}/data/write", self.url))
+            .header("X-LightFS-Path", &encoded_path)
+            .header("X-LightFS-Node-Id", node_id.to_string())
+            .header("X-LightFS-Create", "0")
+            .header("X-LightFS-Length", len.to_string());
+        if let Some(v) = expected_version {
+            builder = builder.header("X-LightFS-Expected-Version", v.to_string());
+        }
+        let body = ureq::SendBody::from_reader(reader);
+        let mut resp = builder
+            .send(body)
+            .map_err(|e| Error::Io(format!("data/write transport: {e}")))?;
+        let status = resp.status().as_u16();
+        let text = resp
+            .body_mut()
+            .with_config()
+            .limit(MAX_RESPONSE_BODY)
+            .read_to_string()
+            .map_err(|e| Error::Io(e.to_string()))?;
+        if !(200..300).contains(&status) {
+            return Err(error_from_body(status, &text));
+        }
+        let v: Value =
+            serde_json::from_str(&text).map_err(|e| Error::Io(format!("node json: {e}")))?;
+        let node = node_from_json(&v)?;
+        self.after_mutation(path_hint);
+        Ok(node)
+    }
+
     pub fn write_from_reader(
         &self,
         path: &str,

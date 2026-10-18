@@ -176,7 +176,8 @@ impl StagingBudget {
         self.admits(want)?;
         if want == 0 {
             // zero-byte reservations still observe session liveness
-            return Ok(StagingReservation::new(self.clone(), 0, kind));
+            self.admitted_total.fetch_add(1, Ordering::Relaxed);
+            return Ok(self.materialize(0, kind));
         }
         loop {
             let cur = self.used.load(Ordering::Relaxed);
@@ -371,6 +372,11 @@ pub(crate) struct TempFileGuard {
 }
 
 impl TempFileGuard {
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub(crate) fn create_in(dir: &Path) -> std::io::Result<TempFileGuard> {
         for _ in 0..8 {
             let p = dir.join(format!(
@@ -397,9 +403,6 @@ impl TempFileGuard {
         Err(std::io::Error::other("could not create staging file"))
     }
 
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
 }
 
 impl Drop for TempFileGuard {
@@ -412,6 +415,393 @@ impl Drop for TempFileGuard {
                 );
             }
         }
+    }
+}
+
+/// A mounted-write session spool (S4.25 §三): the session's bytes live in
+/// ONE private file (0600, managed staging dir), never in the heap. Random
+/// writes, sparse extension (holes read as zero), truncate in both
+/// directions, range reads (read-your-writes), and a base-content overlay
+/// for the commit merge (committed bytes come from the authoritative base
+/// stream; dirty ranges keep the spool's own bytes — always newer than
+/// the base). The reservation tracks the spool's high-water mark and
+/// releases on reset/drop. Crash residue: the file is inside the managed
+/// directory and dies with the sweep; the reservation dies with the
+/// process either way.
+pub struct WriteSpool {
+    file: std::fs::File,
+    _guard: TempFileGuard,
+    /// High-water logical size (POSIX size of the uncommitted file).
+    size: u64,
+    res: StagingReservation,
+    /// Merged, sorted dirty ranges — the bytes this session wrote. The
+    /// commit overlay never overwrites these from the base (spool bytes
+    /// are strictly newer than the base snapshot being merged).
+    dirty: Vec<(u64, u64)>,
+    /// Total writes since open/reset; the commit window uses it to tell
+    /// "nothing new arrived" from "new writes need another commit".
+    write_ops: u64,
+}
+
+impl WriteSpool {
+    /// Open an empty spool under `budget` (Spool kind: counted in the
+    /// active-write-session gauges). Admission for the first write is
+    /// taken lazily — an opened-but-never-written session reserves 0.
+    pub fn open(budget: &Arc<StagingBudget>) -> Result<WriteSpool> {
+        let res = budget.try_reserve(0, StagingKind::Spool, "write session")?;
+        let mut guard = TempFileGuard::create_in(budget.dir())
+            .map_err(|e| Error::Storage(format!("write spool file: {e}")))?;
+        let file = guard
+            .file
+            .take()
+            .expect("fresh guard holds a file")
+            .try_clone()
+            .map_err(|e| Error::Storage(format!("write spool handle: {e}")))?;
+        Ok(WriteSpool { file, _guard: guard, size: 0, res, dirty: Vec::new(), write_ops: 0 })
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Highest dirty byte end — the session's contribution to the visible
+    /// EOF (same role ChunkMap::max_end played).
+    pub fn dirty_end(&self) -> u64 {
+        self.dirty.last().map(|(_, e)| *e).unwrap_or(0)
+    }
+
+    pub fn write_ops(&self) -> u64 {
+        self.write_ops
+    }
+
+    /// Is any byte dirty (uncommitted session content present)?
+    pub fn is_dirty(&self) -> bool {
+        !self.dirty.is_empty()
+    }
+
+    /// Random write with POSIX sparse semantics: a seek past EOF creates
+    /// a hole (reads return zeros there), growth admits the new high-water
+    /// mark BEFORE the file grows (Error::Capacity refusal = nothing
+    /// written, no growth, no eviction of existing bytes).
+    pub fn write(&mut self, offset: u64, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let end = offset.saturating_add(data.len() as u64);
+        if end > self.size {
+            self.grow_to(end)?;
+        }
+        use std::io::{Seek, SeekFrom, Write as _};
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_all(data)?;
+        self.mark_dirty(offset, end);
+        self.write_ops += 1;
+        Ok(())
+    }
+
+    /// Truncate/extend to `new_size` (zero-filling an extension), with the
+    /// same grow-admission contract as [`Self::write`]; shrinking releases
+    /// the difference back to the budget and discards dirty ranges past
+    /// the new end.
+    pub fn truncate(&mut self, new_size: u64) -> Result<()> {
+        if new_size > self.size {
+            self.grow_to(new_size)?;
+            self.write_ops += 1;
+            return Ok(());
+        }
+        if new_size < self.size {
+            self.res.shrink(new_size);
+            self.file.set_len(new_size)?;
+            self.size = new_size;
+            self.dirty.retain(|(_, e)| *e <= new_size);
+            for (_, e) in self.dirty.iter_mut() {
+                *e = (*e).min(new_size);
+            }
+            self.write_ops += 1;
+        }
+        Ok(())
+    }
+
+    fn grow_to(&mut self, end: u64) -> Result<()> {
+        if end > self.res.bytes() {
+            self.res.grow(end - self.res.bytes(), "write session")?;
+        } else {
+            self.res.shrink(end);
+        }
+        self.file.set_len(end)?;
+        self.size = end;
+        Ok(())
+    }
+
+    fn mark_dirty(&mut self, from: u64, to: u64) {
+        // merge into the sorted, disjoint range list
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.dirty.len() + 1);
+        let mut s = from;
+        let mut e = to;
+        for &(rs, re) in &self.dirty {
+            if re < s {
+                merged.push((rs, re));
+            } else if e < rs {
+                merged.push((s, e));
+                s = rs;
+                e = re;
+            } else {
+                s = s.min(rs);
+                e = e.max(re);
+            }
+        }
+        merged.push((s, e));
+        self.dirty = merged;
+    }
+
+    /// Read-your-writes range read: holes (never-written bytes below the
+    /// size) read as zeros, exactly like the old in-memory overlay.
+    /// Positioned reads (pread semantics) — readers never disturb the
+    /// writer's cursor, so concurrent commit overlay and app reads are
+    /// safe on one spool.
+    pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        buf.fill(0);
+        if offset >= self.size || buf.is_empty() {
+            return Ok(());
+        }
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let n = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileExt as _;
+                    self.file.read_at(&mut buf[filled..], offset + filled as u64)?
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::FileExt as _;
+                    self.file.seek_read(&mut buf[filled..], offset + filled as u64)?
+                }
+                #[cfg(not(any(unix, windows)))]
+                {
+                    let _ = offset + filled as u64;
+                    return Err(Error::Storage(
+                        "write spool positioned reads unsupported on this platform".into(),
+                    ));
+                }
+            };
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        Ok(())
+    }
+
+    /// Merge the authoritative BASE content into the spool (commit prep):
+    /// every non-dirty byte below `base_len` is streamed in from `base`
+    /// (a 64 KiB-bounded copy loop — the base is never materialized);
+    /// dirty ranges keep the spool's own bytes, and the base stream is
+    /// consumed (discarded) across them so a single sequential pass works
+    /// on any backend. Extends the spool when the base is longer.
+    pub fn overlay_base(&mut self, base: &mut dyn std::io::Read, base_len: u64) -> Result<()> {
+        if base_len > self.size {
+            self.grow_to(base_len)?;
+        }
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut base_pos: u64 = 0;
+        let mut next_dirty = self.dirty.iter().copied();
+        let mut pending = next_dirty.next();
+        while base_pos < base_len {
+            let (gap_end, skip_to) = match pending {
+                Some((ds, de)) if ds < base_len => (ds, de.min(base_len)),
+                _ => (base_len, base_len),
+            };
+            if base_pos < gap_end {
+                copy_stream_range(base, &mut self.file, base_pos, gap_end, &mut buf)?;
+                base_pos = gap_end;
+            }
+            if let Some(_) = pending {
+                // consume (discard) the base's bytes under the dirty span
+                let mut left = skip_to.saturating_sub(base_pos);
+                while left > 0 {
+                    let want = (left as usize).min(buf.len());
+                    let n = read_full(base, &mut buf[..want])?;
+                    if n == 0 {
+                        return Err(Error::Storage(format!(
+                            "base stream ended {} bytes short during commit overlay",
+                            left
+                        )));
+                    }
+                    left -= n as u64;
+                    base_pos += n as u64;
+                }
+                pending = next_dirty.next();
+                if pending.is_none() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        if base_pos < base_len {
+            copy_stream_range(base, &mut self.file, base_pos, base_len, &mut buf)?;
+        }
+        Ok(())
+    }
+
+    /// Overlay the session's dirty bytes onto a read buffer at
+    /// `read_offset` — the exact role ChunkMap::overlay_range played in
+    /// the same-mount read-coherence path. Only dirty ranges touch the
+    /// buffer (holes are NOT zeros here: unwritten spool bytes must not
+    /// mask committed base content).
+    pub fn overlay_range(&self, buf: &mut [u8], read_offset: u64) -> Result<()> {
+        let end = read_offset + buf.len() as u64;
+        for &(rs, re) in &self.dirty {
+            let s = rs.max(read_offset);
+            let e = re.min(end);
+            if s >= e {
+                continue;
+            }
+            let mut tmp = vec![0u8; (e - s) as usize];
+            self.read_at(s, &mut tmp)?;
+            let from = (s - read_offset) as usize;
+            buf[from..from + tmp.len()].copy_from_slice(&tmp);
+        }
+        Ok(())
+    }
+
+    /// Merge `other` INTO `self`, other's bytes WINNING on overlap
+    /// (deterministic fd-order fold for detached sessions). Only other's
+    /// dirty ranges are copied — its holes never mask self's bytes.
+    pub fn merge_from(&mut self, other: WriteSpool) -> Result<()> {
+        if other.size > self.size {
+            self.grow_to(other.size)?;
+        }
+        for (rs, re) in other.dirty.clone() {
+            let mut tmp = vec![0u8; (re - rs) as usize];
+            other.read_at(rs, &mut tmp)?;
+            self.write(rs, &tmp)?;
+        }
+        Ok(())
+    }
+
+    /// Merge `other` INTO `self`, SELF's bytes WINNING on overlap — the
+    /// failed-commit recovery path (ChunkMap::restore_under semantics):
+    /// writes that arrived during the failed commit (self) are newer and
+    /// keep their bytes; the drained batch (other) fills the gaps so
+    /// nothing is lost for the retry.
+    pub fn merge_under(&mut self, mut other: WriteSpool) -> Result<()> {
+        if other.size > self.size {
+            self.grow_to(other.size)?;
+        }
+        let self_dirty = self.dirty.clone();
+        for (os, oe) in other.dirty.clone() {
+            let mut cur = os;
+            for &(ss, se) in &self_dirty {
+                if se <= cur {
+                    continue;
+                }
+                if ss >= oe {
+                    break;
+                }
+                if ss > cur {
+                    Self::copy_between(&mut other, self, cur, ss.min(oe))?;
+                }
+                cur = cur.max(se);
+                if cur >= oe {
+                    break;
+                }
+            }
+            if cur < oe {
+                Self::copy_between(&mut other, self, cur, oe)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn copy_between(
+        src: &mut WriteSpool,
+        dst: &mut WriteSpool,
+        from: u64,
+        to: u64,
+    ) -> Result<()> {
+        let mut pos = from;
+        while pos < to {
+            let want = ((to - pos) as usize).min(64 * 1024);
+            let mut tmp = vec![0u8; want];
+            src.read_at(pos, &mut tmp)?;
+            dst.write(pos, &tmp)?;
+            pos += want as u64;
+        }
+        Ok(())
+    }
+
+    /// The commit succeeded with no concurrent writes: release everything
+    /// (bytes AND budget) — the committed content now lives in the object
+    /// store, the spool is an empty session again.
+    pub fn reset(&mut self) -> Result<()> {
+        self.res.shrink(0);
+        self.file.set_len(0)?;
+        self.size = 0;
+        self.dirty.clear();
+        self.write_ops = 0;
+        Ok(())
+    }
+
+    /// Rewind the spool file for a streaming read-out (commit upload).
+    pub fn rewind(&mut self) -> Result<()> {
+        use std::io::Seek;
+        self.file.seek(std::io::SeekFrom::Start(0))?;
+        Ok(())
+    }
+
+    /// Streaming read-out handle for the commit upload (call after
+    /// [`Self::rewind`]); the caller streams exactly [`Self::size`] bytes.
+    pub fn reader(&mut self) -> &mut std::fs::File {
+        &mut self.file
+    }
+}
+
+fn read_full(src: &mut dyn std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match src.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
+}
+
+fn copy_stream_range(
+    src: &mut dyn std::io::Read,
+    dst: &mut std::fs::File,
+    from: u64,
+    to: u64,
+    buf: &mut [u8],
+) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write as _};
+    let mut pos = from;
+    while pos < to {
+        let want = ((to - pos) as usize).min(buf.len());
+        let n = read_full(src, &mut buf[..want])?;
+        if n == 0 {
+            return Err(Error::Storage(format!(
+                "base stream ended early during commit overlay (at {pos}, wanted {to})"
+            )));
+        }
+        dst.seek(SeekFrom::Start(pos))?;
+        dst.write_all(&buf[..n])?;
+        pos += n as u64;
+    }
+    Ok(())
+}
+
+impl std::fmt::Debug for WriteSpool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriteSpool")
+            .field("size", &self.size)
+            .field("dirty_ranges", &self.dirty.len())
+            .field("reserved", &self.res.bytes())
+            .finish()
     }
 }
 
@@ -532,6 +922,144 @@ mod tests {
         drop(g);
         assert!(b.dir().join("staging.lock").is_file());
         drop(b);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn test_spool(budget: &Arc<StagingBudget>) -> WriteSpool {
+        WriteSpool::open(budget).unwrap()
+    }
+
+    #[test]
+    fn spool_random_writes_holes_and_read_your_writes() {
+        let root = tmp_root("spool1");
+        let b = StagingBudget::open_at(StagingLimits::default(), root.clone()).unwrap();
+        let mut sp = test_spool(&b);
+        assert_eq!(b.stats().active_write_sessions, 1);
+        // sparse write at 5000: everything before reads as zero
+        sp.write(5000, b"hello").unwrap();
+        assert_eq!(sp.size(), 5005);
+        let mut buf = vec![0u8; 5010];
+        sp.read_at(0, &mut buf).unwrap();
+        assert!(buf[..5000].iter().all(|&b| b == 0), "hole must read as zero");
+        assert_eq!(&buf[5000..5005], b"hello");
+        // overwrite in place
+        sp.write(5002, b"XX").unwrap();
+        sp.read_at(5000, &mut buf[..5]).unwrap();
+        assert_eq!(&buf[..5], b"heXXo");
+        // dirty_end tracks the last write
+        assert_eq!(sp.dirty_end(), 5005);
+        assert_eq!(b.stats().spool_bytes, 5005);
+        drop(sp);
+        assert_eq!(b.stats().used, 0);
+        assert_eq!(b.stats().active_write_sessions, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spool_truncate_extends_zero_fills_and_shrinks_release() {
+        let root = tmp_root("spool2");
+        let b = StagingBudget::open_at(StagingLimits::default(), root.clone()).unwrap();
+        let mut sp = test_spool(&b);
+        sp.write(0, b"abcdef").unwrap();
+        sp.truncate(10).unwrap();
+        assert_eq!(sp.size(), 10);
+        let mut buf = [0u8; 10];
+        sp.read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf[..6], b"abcdef");
+        assert_eq!(&buf[6..], &[0; 4]);
+        sp.truncate(3).unwrap();
+        assert_eq!(sp.size(), 3);
+        assert_eq!(b.stats().spool_bytes, 3, "shrinking releases the difference");
+        let mut small = [0u8; 3];
+        sp.read_at(0, &mut small).unwrap();
+        assert_eq!(&small, b"abc");
+        drop(sp);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spool_growth_admission_refuses_without_writing() {
+        let root = tmp_root("spool3");
+        let b = StagingBudget::open_at(
+            StagingLimits { budget_bytes: 100, max_object_bytes: 0 },
+            root.clone(),
+        )
+        .unwrap();
+        let mut sp = test_spool(&b);
+        sp.write(0, &[7u8; 50]).unwrap();
+        let err = sp.write(80, &[9u8; 30]).err().unwrap().to_string();
+        assert!(err.contains("capacity"), "{err}");
+        assert_eq!(sp.size(), 50, "refused write must not grow the spool");
+        let mut buf = [0u8; 50];
+        sp.read_at(0, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 7));
+        // truncate past the budget refuses the same way
+        assert!(sp.truncate(200).is_err());
+        assert_eq!(sp.size(), 50);
+        drop(sp);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spool_overlay_base_merges_around_dirty_and_resets() {
+        let root = tmp_root("spool4");
+        let b = StagingBudget::open_at(StagingLimits::default(), root.clone()).unwrap();
+        let mut sp = test_spool(&b);
+        // base: 0..100 of 'A'; session wrote 'X' at 10..20 and 90..95
+        sp.write(10, &[b'X'; 10]).unwrap();
+        sp.write(90, &[b'Y'; 5]).unwrap();
+        let base = vec![b'A'; 100];
+        let mut base_r = std::io::Cursor::new(base);
+        sp.overlay_base(&mut base_r, 100).unwrap();
+        assert_eq!(sp.size(), 100);
+        let mut out = vec![0u8; 100];
+        sp.read_at(0, &mut out).unwrap();
+        assert!(out[..10].iter().all(|&b| b == b'A'));
+        assert_eq!(&out[10..20], &[b'X'; 10]);
+        assert!(out[20..90].iter().all(|&b| b == b'A'));
+        assert_eq!(&out[90..95], &[b'Y'; 5]);
+        assert!(out[95..].iter().all(|&b| b == b'A'));
+        // commit success with no concurrent writes: full reset
+        assert_eq!(sp.write_ops(), 2);
+        sp.reset().unwrap();
+        assert_eq!((sp.size(), sp.dirty_end(), sp.write_ops()), (0, 0, 0));
+        assert_eq!(b.stats().used, 0, "reset releases the reservation");
+        drop(sp);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spool_overlay_base_extends_and_handles_dirty_past_base() {
+        let root = tmp_root("spool5");
+        let b = StagingBudget::open_at(StagingLimits::default(), root.clone()).unwrap();
+        let mut sp = test_spool(&b);
+        // session extended far past the base (append without flush)
+        sp.write(40, &[b'Z'; 10]).unwrap();
+        let base = vec![b'B'; 20];
+        let mut base_r = std::io::Cursor::new(base);
+        sp.overlay_base(&mut base_r, 20).unwrap();
+        assert_eq!(sp.size(), 50);
+        let mut out = vec![0u8; 50];
+        sp.read_at(0, &mut out).unwrap();
+        assert!(out[..20].iter().all(|&b| b == b'B'));
+        assert!(out[20..40].iter().all(|&b| b == 0), "gap between base and first write");
+        assert_eq!(&out[40..50], &[b'Z'; 10]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spool_overlay_base_short_stream_is_an_error() {
+        let root = tmp_root("spool6");
+        let b = StagingBudget::open_at(StagingLimits::default(), root.clone()).unwrap();
+        let mut sp = test_spool(&b);
+        sp.write(0, b"dirty").unwrap();
+        let base = vec![b'A'; 10];
+        let mut base_r = std::io::Cursor::new(base);
+        // claim base_len 100 but supply only 10 dirty-free bytes after the
+        // dirty span — the overlay must fail, never silently zero-fill
+        let r = sp.overlay_base(&mut base_r, 100);
+        assert!(r.is_err());
+        drop(sp);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

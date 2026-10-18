@@ -1287,3 +1287,72 @@ fn s425_per_object_cap_refuses_before_fetch() {
     assert_eq!(len, 4096);
     drop(rd);
 }
+
+// ---- S4.25 §三: server write sessions spool to disk, never the heap ----
+
+#[test]
+fn s425_write_session_spools_and_commits_streamed() {
+    let mut cfg = fresh("s425spool");
+    cfg.staging.budget_bytes = 64 * 1024 * 1024;
+    let eng = lightfs::engine::open_engine(&cfg).unwrap();
+    let content: Vec<u8> = (0..16 * 1024 * 1024u64).map(|i| (i % 251) as u8).collect();
+    let mut tmp = std::env::temp_dir().join(format!("s425spool-src-{}", std::process::id()));
+    std::fs::write(&tmp, &content).unwrap();
+
+    let h = eng.core.open_write("/none", None).err().expect("no such file yet");
+    let _ = h;
+    eng.core.create("/big.dat", 0o644).unwrap();
+    let before = temp_residue();
+    let h = eng.core.open_write("/big.dat", None).unwrap();
+    // an opened session reserves 0 until the first write
+    assert_eq!(eng.core.staging.stats().used, 0);
+    // random writes into the session (seek past EOF leaves zero holes)
+    h.write(4 * 1024 * 1024, &content[4 * 1024 * 1024..8 * 1024 * 1024]).unwrap();
+    assert_eq!(eng.core.staging.stats().spool_bytes, 8 * 1024 * 1024);
+    assert_eq!(eng.core.staging.stats().active_write_sessions, 1);
+    h.write(0, &content[..1024]).unwrap();
+    h.write(2 * 1024 * 1024, &content[2 * 1024 * 1024..3 * 1024 * 1024]).unwrap();
+    let node = eng.core.commit_write(&h).unwrap();
+    assert_eq!(node.size as u64, 8 * 1024 * 1024, "commit size = spool high-water");
+    // spool reset: bytes AND budget released (the session gauge drops
+    // when the handle itself is dropped — commit emptied it, not closed it)
+    assert_eq!(eng.core.staging.stats().used, 0);
+    drop(h);
+    assert_eq!(eng.core.staging.stats().active_write_sessions, 0);
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    assert!(temp_residue() <= before, "committed session leaves no staging file");
+    // byte-exact content through the verified read path
+    let (mut rd, len) = eng.core.open_read("/big.dat", 0, 8 * 1024 * 1024).unwrap();
+    let mut got = vec![0u8; len as usize];
+    std::io::Read::read_exact(&mut rd, &mut got).unwrap();
+    drop(rd);
+    assert_eq!(&got[..1024], &content[..1024]);
+    assert_eq!(&got[1024..2 * 1024 * 1024], &[0u8][..].repeat((2 * 1024 * 1024 - 1024) as usize));
+    assert_eq!(&got[2 * 1024 * 1024..3 * 1024 * 1024], &content[2 * 1024 * 1024..3 * 1024 * 1024]);
+    assert_eq!(&got[3 * 1024 * 1024..4 * 1024 * 1024], &[0u8][..].repeat(1024 * 1024));
+    assert_eq!(&got[4 * 1024 * 1024..], &content[4 * 1024 * 1024..8 * 1024 * 1024]);
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn s425_write_session_refuses_past_budget_without_corruption() {
+    let mut cfg = fresh("s425spoolcap");
+    cfg.staging.budget_bytes = 1024 * 1024; // 1 MiB
+    let eng = lightfs::engine::open_engine(&cfg).unwrap();
+    eng.core.create("/c.dat", 0o644).unwrap();
+    let h = eng.core.open_write("/c.dat", None).unwrap();
+    h.write(0, &[1u8; 512 * 1024]).unwrap();
+    let err = h
+        .write(512 * 1024, &[2u8; 1024 * 1024])
+        .err()
+        .expect("1.5 MiB total exceeds the 1 MiB budget")
+        .to_string();
+    assert!(err.contains("capacity"), "{err}");
+    // the failed write left the session untouched: the earlier bytes still
+    // commit fine (explicit refusal, never silent eviction)
+    let node = eng.core.commit_write(&h).unwrap();
+    assert_eq!(node.size as u64, 512 * 1024);
+    let data = eng.core.read("/c.dat", 0, 512 * 1024).unwrap();
+    assert!(data.iter().all(|&b| b == 1));
+    assert_eq!(eng.core.staging.stats().used, 0);
+}
