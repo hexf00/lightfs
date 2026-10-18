@@ -480,15 +480,25 @@ fn commit_write(fh: u64) -> Result<(), Error> {
     // Every error after the swap merges the drained spool back (window
     // writes stay newer — WriteSpool::merge_under) and re-bases the CAS
     // anchor to the version observed at attempt start, so a retry flush
-    // can succeed instead of silently dropping the drained data.
-    let fail = |e: Error, observed: Option<i64>| -> Error {
+    // can succeed instead of silently dropping the drained data. The
+    // DRAINED spool must be passed in: re-swapping the session here would
+    // take the FRESH spool (the attempt's data was moved out at entry)
+    // and merge nothing (WinFsp accept A7: retry flush landed at h1's
+    // 4 bytes with a silent Ok).
+    let fail = |e: Error, observed: Option<i64>, mut drained: crate::staging::WriteSpool| -> Error {
         let mut writes = WRITES.lock().unwrap();
         if let Some(sess) = writes.get_mut(&fh) {
             let fresh = match crate::staging::WriteSpool::open(&STAGING) {
                 Ok(f) => f,
                 Err(e2) => return e2,
             };
-            let drained = std::mem::replace(&mut sess.spool, fresh);
+            // writes that arrived during the commit window: they were newer
+            // than the attempt, so they come back as the session's spool
+            // and the drained bytes fill only their holes
+            let window = std::mem::replace(&mut sess.spool, fresh);
+            if let Err(e3) = sess.spool.merge_under(window) {
+                return e3;
+            }
             if let Err(e3) = sess.spool.merge_under(drained) {
                 return e3;
             }
@@ -504,25 +514,17 @@ fn commit_write(fh: u64) -> Result<(), Error> {
             // mirror fuse.rs: the app saw this failure; release must not
             // retry it behind its back (flush_failed gates cb_release)
             sess.flush_failed = true;
-        } else {
-            eprintln!("lightfs-winfsp: commit_write fh={fh} FAILED ({e}); NO SESSION to merge back");
         }
         e
     };
     let node_now = match fs.lookup(&path) {
         Ok(n) => n,
-        Err(e) => {
-            drop(drained);
-            return Err(fail(e, None));
-        }
+        Err(e) => return Err(fail(e, None, drained)),
     };
     let committed_node =
         match fs.commit_write_merged(node_now.id, &path, expected, &mut drained) {
             Ok(n) => n,
-            Err(e) => {
-                drop(drained);
-                return Err(fail(e, Some(node_now.version)));
-            }
+            Err(e) => return Err(fail(e, Some(node_now.version), drained)),
         };
     drop(drained);
     eprintln!(

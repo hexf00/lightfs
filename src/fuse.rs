@@ -674,14 +674,24 @@ impl FuseAdapter {
                 dirty_at_start,
             )
         };
-        let fail = |e: Error, observed: Option<i64>| -> Error {
+        let fail = |e: Error, observed: Option<i64>, mut drained: crate::staging::WriteSpool| -> Error {
             let mut writes = self.writes.lock().unwrap();
             if let Some(state) = writes.get_mut(&fh) {
                 let fresh = match crate::staging::WriteSpool::open(&self.staging) {
                     Ok(f) => f,
                     Err(e2) => return e2,
                 };
-                let drained = std::mem::replace(&mut state.spool, fresh);
+                // The DRAINED spool is passed in — re-swapping the session
+                // here takes the FRESH spool (the attempt's bytes were moved
+                // out at entry) and merges nothing. Writes that arrived
+                // during the commit window are newer: they come back as the
+                // session's spool and the drained bytes fill only their
+                // holes (A7 semantics: the retry flush must be able to
+                // succeed on the re-based version).
+                let window = std::mem::replace(&mut state.spool, fresh);
+                if let Err(e3) = state.spool.merge_under(window) {
+                    return e3;
+                }
                 if let Err(e3) = state.spool.merge_under(drained) {
                     return e3;
                 }
@@ -708,10 +718,7 @@ impl FuseAdapter {
             .commit_write_merged(node_id, &path, expected, &mut drained);
         let committed_node = match commit_result {
             Ok(n) => n,
-            Err(e) => {
-                drop(drained);
-                return Err(fail(e, observed));
-            }
+            Err(e) => return Err(fail(e, observed, drained)),
         };
         // success: release the drained spool (its content is committed)
         drop(drained);
