@@ -723,7 +723,13 @@ impl WriteSpool {
                     break;
                 }
                 if ss > cur {
-                    Self::copy_between(&mut other, self, cur, ss.min(oe))?;
+                    let to = ss.min(oe);
+                    Self::copy_between(&mut other, self, cur, to)?;
+                    // copied bytes are session data: without the dirty
+                    // mark the retry flush takes the !is_dirty() no-op
+                    // shortcut and the commit overlay lets the base
+                    // clobber them (WinFsp accept A7)
+                    self.mark_dirty(cur, to);
                 }
                 cur = cur.max(se);
                 if cur >= oe {
@@ -732,6 +738,7 @@ impl WriteSpool {
             }
             if cur < oe {
                 Self::copy_between(&mut other, self, cur, oe)?;
+                self.mark_dirty(cur, oe);
             }
         }
         Ok(())
@@ -1031,6 +1038,33 @@ mod tests {
         assert_eq!(&got[4106..], &[5u8; 4086]);
         drop(sp);
         drop(sp2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spool_merge_under_registers_copied_holes_as_dirty() {
+        // WinFsp accept A7 (multi-handle CAS conflict + retry): the
+        // drained spool merges into a FRESH session spool — the copied
+        // bytes MUST be dirty, or the retry flush takes the !is_dirty()
+        // no-op shortcut and silently drops the session's writes.
+        let root = tmp_root("spool-merge");
+        let b = StagingBudget::open_at(StagingLimits::default(), root.clone()).unwrap();
+        let mut a = test_spool(&b); // the surviving (fresh) session spool
+        let mut d = test_spool(&b); // the drained attempt spool
+        d.write(4096, b"BBBB").unwrap();
+        a.merge_under(d).unwrap();
+        assert!(a.is_dirty(), "merged bytes must be dirty");
+        assert_eq!(a.size(), 4100);
+        let mut buf = [0u8; 4];
+        a.read_at(4096, &mut buf).unwrap();
+        assert_eq!(&buf, b"BBBB");
+        // the commit overlay must treat them dirty-wins against a base
+        let base = vec![0u8; 4100];
+        let mut rd = std::io::Cursor::new(base);
+        a.overlay_base(&mut rd, 4100).unwrap();
+        a.read_at(4096, &mut buf).unwrap();
+        assert_eq!(&buf, b"BBBB", "base overlay must not clobber merged bytes");
+        drop(a);
         let _ = std::fs::remove_dir_all(&root);
     }
 
