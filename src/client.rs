@@ -9,7 +9,7 @@
 //!   the server in v1 (data-plane bypass is Phase 10 and must not change
 //!   filesystem semantics).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -279,48 +279,6 @@ impl Client {
                 "X-LightFS-Create",
                 if create_if_missing { "1" } else { "0" },
             )
-            .header("X-LightFS-Length", data.len().to_string());
-        if let Some(v) = expected_version {
-            builder = builder.header("X-LightFS-Expected-Version", v.to_string());
-        }
-        let mut resp = crate::metrics::time("client.data.write", || {
-            builder
-                .send(data)
-                .map_err(|e| Error::Io(format!("data/write transport: {e}")))
-        })?;
-        let status = resp.status().as_u16();
-        let text = resp
-            .body_mut()
-            .with_config()
-            .limit(MAX_RESPONSE_BODY)
-            .read_to_string()
-            .map_err(|e| Error::Io(e.to_string()))?;
-        if !(200..300).contains(&status) {
-            return Err(error_from_body(status, &text));
-        }
-        let v: Value =
-            serde_json::from_str(&text).map_err(|e| Error::Io(format!("node json: {e}")))?;
-        node_from_json(&v)
-    }
-
-    /// Commit anchored on the STABLE node id: the server locates the node
-    /// by id (never re-resolving the path), so the CAS gate protects THIS
-    /// file across renames by other clients, and a deleted identity fails
-    /// with IDENTITY_GONE instead of writing onto a path successor.
-    fn write_node_by_id(
-        &self,
-        node_id: i64,
-        path_hint: &str,
-        data: &[u8],
-        expected_version: Option<i64>,
-    ) -> Result<Node> {
-        let encoded_path = crate::sigv4::uri_encode(path_hint, true);
-        let mut builder = self
-            .agent
-            .post(format!("{}/data/write", self.url))
-            .header("X-LightFS-Path", &encoded_path)
-            .header("X-LightFS-Create", "0")
-            .header("X-LightFS-Node-Id", node_id.to_string())
             .header("X-LightFS-Length", data.len().to_string());
         if let Some(v) = expected_version {
             builder = builder.header("X-LightFS-Expected-Version", v.to_string());

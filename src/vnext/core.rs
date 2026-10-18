@@ -372,7 +372,11 @@ impl Core {
             kind: NodeKind::Dir,
             size: 0,
             mtime: commit.created_at,
-            mode: 0o555,
+            // POSIX root: owner-writable. 0o555 makes every mounted create
+            // inside / fail the kernel's default_permissions check with
+            // EACCES (and WinFsp's access check alike) - the root is a real
+            // directory, not a read-only mount point.
+            mode: 0o755,
             object_key: None,
             version: 0,
             etag: String::new(),

@@ -1211,7 +1211,7 @@ fn s425_slow_reader_holds_budget_until_drop() {
     let big = spool_file("s425slow", 8 * 1024 * 1024);
     write_spooled(&eng.core, "/slow.bin", &big, true, None);
     // the slow consumer: full-read reader acquired, NOT consumed
-    let (mut rd, len) = eng.core.open_read("/slow.bin", 0, 8 * 1024 * 1024).unwrap();
+    let (rd, len) = eng.core.open_read("/slow.bin", 0, 8 * 1024 * 1024).unwrap();
     assert_eq!(len, 8 * 1024 * 1024);
     assert_eq!(eng.core.staging.stats().used, 8 * 1024 * 1024);
     assert_eq!(eng.core.staging.stats().active_reads, 1);
@@ -1229,7 +1229,7 @@ fn s425_slow_reader_holds_budget_until_drop() {
     drop(rd);
     assert_eq!(eng.core.staging.stats().used, 0);
     assert_eq!(eng.core.staging.stats().active_reads, 0);
-    let (mut rd2, _) = eng.core.open_read("/slow.bin", 0, 8 * 1024 * 1024).unwrap();
+    let (rd2, _) = eng.core.open_read("/slow.bin", 0, 8 * 1024 * 1024).unwrap();
     drop(rd2);
     assert_eq!(eng.core.staging.stats().used, 0);
 }
@@ -1283,7 +1283,7 @@ fn s425_per_object_cap_refuses_before_fetch() {
     // small objects sail through
     let small = spool_file("s425small", 4096);
     write_spooled(&eng.core, "/s.bin", &small, true, None);
-    let (mut rd, len) = eng.core.open_read("/s.bin", 0, 4096).unwrap();
+    let (rd, len) = eng.core.open_read("/s.bin", 0, 4096).unwrap();
     assert_eq!(len, 4096);
     drop(rd);
 }
@@ -1296,7 +1296,7 @@ fn s425_write_session_spools_and_commits_streamed() {
     cfg.staging.budget_bytes = 64 * 1024 * 1024;
     let eng = lightfs::engine::open_engine(&cfg).unwrap();
     let content: Vec<u8> = (0..16 * 1024 * 1024u64).map(|i| (i % 251) as u8).collect();
-    let mut tmp = std::env::temp_dir().join(format!("s425spool-src-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("s425spool-src-{}", std::process::id()));
     std::fs::write(&tmp, &content).unwrap();
 
     let h = eng.core.open_write("/none", None).err().expect("no such file yet");

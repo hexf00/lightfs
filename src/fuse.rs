@@ -114,6 +114,15 @@ pub struct FuseAdapter {
     /// budget per mount process).
     staging: std::sync::Arc<crate::staging::StagingBudget>,
     next_fh: AtomicU64,
+    /// Adapter-local inode numbers. vnext node ids CANNOT serve as FUSE
+    /// inos: file ids and directory tree ids come from two independent
+    /// rowid sequences that both start at 1, so `ino == node.id` collides
+    /// (file id 1 vs the root tree id 1) and the kernel ends up with two
+    /// dentries on one inode. Inos are allocated here, monotonically,
+    /// with 1 reserved for the mount root; node-id identity is enforced
+    /// on OPEN-HANDLE operations (sessions anchor on node.id), never on
+    /// the ino namespace.
+    next_ino: AtomicU64,
     uid: u32,
     gid: u32,
 }
@@ -158,9 +167,9 @@ fn errno(e: &Error) -> Errno {
     }
 }
 
-fn attr_for(node: &Node, uid: u32, gid: u32) -> FileAttr {
+fn attr_for(ino: u64, node: &Node, uid: u32, gid: u32) -> FileAttr {
     FileAttr {
-        ino: INodeNo(node.id as u64),
+        ino: INodeNo(ino),
         size: node.size as u64,
         blocks: (node.size as u64).div_ceil(4096),
         atime: unix_to_systemtime(node.mtime),
@@ -220,9 +229,23 @@ impl FuseAdapter {
             pending: std::sync::LazyLock::new(crate::writeback::PendingEof::new),
             staging,
             next_fh: AtomicU64::new(1),
+            next_ino: AtomicU64::new(2),
             uid,
             gid,
         }
+    }
+
+    /// The stable adapter-local ino for `path`: reuse the mapping when the
+    /// kernel already knows this name, otherwise allocate a fresh ino and
+    /// remember it (both directions).
+    fn ino_for(&self, path: &str) -> u64 {
+        if let Some(ino) = self.ino_of_path(path) {
+            return ino;
+        }
+        let ino = self.next_ino.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inodes.lock().unwrap().insert(ino, std::path::PathBuf::from(path));
+        self.paths.lock().unwrap().insert(path.to_string(), ino);
+        ino
     }
 
     fn path_of(&self, ino: INodeNo) -> Result<String, Errno> {
@@ -261,7 +284,8 @@ impl FuseAdapter {
             } else {
                 FileType::RegularFile
             };
-            entries.push((c.id as u64, kind, c.name.clone()));
+            let child_path = Self::child_path(path, std::ffi::OsStr::new(&c.name));
+            entries.push((self.ino_for(&child_path), kind, c.name.clone()));
         }
         entries
     }
@@ -298,14 +322,6 @@ impl FuseAdapter {
         if let Some(ino) = ino {
             self.inodes.lock().unwrap().remove(&ino);
         }
-    }
-
-    fn remember(&self, ino: u64, parent_path: &str, name: &OsStr) {
-        let mut p = PathBuf::from(parent_path);
-        p.push(name);
-        let ps = p.to_string_lossy().to_string();
-        self.inodes.lock().unwrap().insert(ino, p);
-        self.paths.lock().unwrap().insert(ps, ino);
     }
 
     fn child_path(parent_path: &str, name: &OsStr) -> String {
@@ -747,24 +763,24 @@ impl Filesystem for FuseAdapter {
             .map(|(n, _)| n.clone());
         if let Some(node) = cached {
             crate::metrics::observe("fuse.lookup.cache_hit", Duration::ZERO);
-            self.remember(node.id as u64, &parent_path, name);
+            let ino = self.ino_for(&path);
             reply.entry(
                 &self.attr_ttl,
-                &attr_for(&node, self.uid, self.gid),
+                &attr_for(ino, &node, self.uid, self.gid),
                 fuser::Generation(0),
             );
             return;
         }
         match self.fs.lookup(&path) {
             Ok(node) => {
-                self.remember(node.id as u64, &parent_path, name);
+                let ino = self.ino_for(&path);
                 self.attr_cache
                     .lock()
                     .unwrap()
-                    .insert(path, (node.clone(), std::time::Instant::now()));
+                    .insert(path.clone(), (node.clone(), std::time::Instant::now()));
                 reply.entry(
                     &self.attr_ttl,
-                    &attr_for(&node, self.uid, self.gid),
+                    &attr_for(ino, &node, self.uid, self.gid),
                     fuser::Generation(0),
                 );
             }
@@ -805,8 +821,13 @@ impl Filesystem for FuseAdapter {
                     crate::metrics::observe("fuse.getattr.cache_hit", Duration::ZERO);
                     n
                 }
-                None => match self.fs.lookup_by_id(ino.0 as i64, &path) {
+                None => match self.fs.lookup(&path) {
                     Ok(n) => {
+                        // Stat is PATH-anchored: the kernel stats the
+                        // dentry (name), and inos are adapter-local, so
+                        // there is no id equality to check here. Node-id
+                        // identity stays enforced where it matters - on
+                        // open handles (sessions anchor on node.id).
                         self.attr_cache
                             .lock()
                             .unwrap()
@@ -817,7 +838,7 @@ impl Filesystem for FuseAdapter {
                 },
             }
         };
-        let mut attr = attr_for(&node, self.uid, self.gid);
+        let mut attr = attr_for(ino.0, &node, self.uid, self.gid);
         let in_flight = self.pending.get(&path);
         if in_flight > node.size as u64 {
             // Write-back model: report the in-flight EOF like the
@@ -926,7 +947,7 @@ impl Filesystem for FuseAdapter {
                     .lock()
                     .unwrap()
                     .insert(path.clone(), (node.clone(), std::time::Instant::now()));
-                reply.attr(&self.attr_ttl, &attr_for(&node, self.uid, self.gid))
+                reply.attr(&self.attr_ttl, &attr_for(ino.0, &node, self.uid, self.gid))
             }
             Err(e) => reply.error(errno(&e)),
         }
@@ -1062,10 +1083,10 @@ impl Filesystem for FuseAdapter {
         match self.fs.mkdir(&path, mode & 0o7777) {
             Ok(node) => {
                 self.dirent_invalidate();
-                self.remember(node.id as u64, &parent_path, name);
+                let ino = self.ino_for(&path);
                 reply.entry(
                     &self.attr_ttl,
-                    &attr_for(&node, self.uid, self.gid),
+                    &attr_for(ino, &node, self.uid, self.gid),
                     fuser::Generation(0),
                 );
             }
@@ -1094,10 +1115,10 @@ impl Filesystem for FuseAdapter {
         match self.fs.symlink(&target, &path) {
             Ok(node) => {
                 self.dirent_invalidate();
-                self.remember(node.id as u64, &parent_path, name);
+                let ino = self.ino_for(&path);
                 reply.entry(
                     &self.attr_ttl,
-                    &attr_for(&node, self.uid, self.gid),
+                    &attr_for(ino, &node, self.uid, self.gid),
                     fuser::Generation(0),
                 );
             }
@@ -1142,10 +1163,10 @@ impl Filesystem for FuseAdapter {
             Ok((node, fh)) => {
                 self.dirent_invalidate();
                 self.pending.drop_path(&path);
-                self.remember(node.id as u64, &parent_path, name);
+                let ino = self.ino_for(&path);
                 reply.created(
                     &self.attr_ttl,
-                    &attr_for(&node, self.uid, self.gid),
+                    &attr_for(ino, &node, self.uid, self.gid),
                     fuser::Generation(0),
                     fuser::FileHandle(fh),
                     fuser::FopenFlags::empty(),

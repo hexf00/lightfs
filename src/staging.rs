@@ -449,8 +449,10 @@ impl WriteSpool {
     /// taken lazily — an opened-but-never-written session reserves 0.
     pub fn open(budget: &Arc<StagingBudget>) -> Result<WriteSpool> {
         let res = budget.try_reserve(0, StagingKind::Spool, "write session")?;
-        let mut guard = TempFileGuard::create_in(budget.dir())
-            .map_err(|e| Error::Storage(format!("write spool file: {e}")))?;
+        let mut guard = TempFileGuard::create_in(budget.dir()).map_err(|e| {
+            eprintln!("lightfs: write spool file create failed in {:?}: {e}", budget.dir());
+            Error::Storage(format!("write spool file: {e}"))
+        })?;
         let file = guard
             .file
             .take()

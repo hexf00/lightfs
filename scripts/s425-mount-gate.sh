@@ -21,7 +21,12 @@ DEPLOY_DIR="${DEPLOY_DIR:-/deploy}"
 # RUN_DIR may live on a mounted volume (survives the container for
 # post-mortem); the MOUNT TARGET must stay on the container-local FS.
 RUN="${RUN_DIR:-/tmp/s425-run-$$}"
-MNT="${MNT_DIR:-/mnt/s425-gate}"
+# fresh target per run: a previously-mounted path can hold a STALE fuse
+# mount from a dead run, and remounting over a corpse stacks and dies on
+# old kernels (3.10: fresh conn dies with ENOTCONN, corpse still listed in
+# /proc/mounts while /sys/fs/fuse/connections is empty). MNT_DIR stays
+# overridable but is then guarded by clear_stale.
+MNT="${MNT_DIR:-/tmp/s425-gate-$$}"
 EP="${LIGHTFS_S3_ENDPOINT:-http://host.docker.internal:9000}"
 # unique bucket per run: a failed earlier run leaves a namespace marker,
 # and a fresh database refuses to co-root with it (fail-closed by design)
@@ -30,6 +35,42 @@ BIND="${LIGHTFS_BIND:-127.0.0.1:18999}"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 note() { echo "== $1"; }
+
+mount_listed() { grep -qs " $1 fuse" /proc/mounts; }
+# A mount still listed at the target is a CORPSE from a dead run: stacking
+# a fresh mount over it fails weirdly on old kernels. Clear it, or refuse
+# to run - never mount over it.
+clear_stale() {
+  if mount_listed "$1"; then
+    fusermount -u -z "$1" 2>/dev/null || fusermount3 -u -z "$1" 2>/dev/null || umount -l "$1" 2>/dev/null || true
+    sleep 0.5
+  fi
+  mount_listed "$1" && fail "stale fuse mount at $1 is unremovable - refusing to stack a new mount over it"
+}
+# Listed is NOT up (a listed-but-dead mount passes `mountpoint -q`): the
+# target must also answer a real filesystem op. On failure dump the full
+# diagnostic (stderr, mount table, kernel connections, thread wait-chans).
+wait_mount_up() {
+  local pid=$1
+  for _ in $(seq 1 100); do
+    if mount_listed "$MNT" && timeout 2 ls "$MNT" >/dev/null 2>&1; then return 0; fi
+    sleep 0.2
+  done
+  echo "--- mount.err ---"; cat "$RUN/mount.err" 2>/dev/null
+  echo "--- mount.log ---"; cat "$RUN/mount.log" 2>/dev/null
+  echo "--- target in /proc/mounts:"; grep -s "$MNT" /proc/mounts || echo "(not listed)"
+  echo "--- kernel fuse connections: $(ls /sys/fs/fuse/connections/ 2>/dev/null | wc -l)"
+  for t in "/proc/$pid/task/"*; do
+    [[ -r "$t/wchan" ]] || continue
+    echo "  thread $(cat "$t/comm" 2>/dev/null) blocked in $(cat "$t/wchan" 2>/dev/null)"
+  done
+  fail "mount did not come up at $MNT"
+}
+cleanup() {
+  kill -9 "${MOUNT_PID:-0}" "${MOUNT_PID2:-0}" "${SERVER_PID:-0}" 2>/dev/null
+  fusermount -u -z "$MNT" 2>/dev/null || fusermount3 -u -z "$MNT" 2>/dev/null || umount -l "$MNT" 2>/dev/null
+}
+trap cleanup EXIT
 
 for bin in lightfs lightfs-shell lightfs-accept; do
   [[ -x "$DEPLOY_DIR/$bin" ]] || fail "binary missing: $DEPLOY_DIR/$bin"
@@ -90,13 +131,10 @@ enabled = false
 [cache.data]
 enabled = false
 CFGEOF
+clear_stale "$MNT"
 "$DEPLOY_DIR/lightfs" mount --config "$RUN/mount.toml" "$MNT" >"$RUN/mount.log" 2>"$RUN/mount.err" &
 MOUNT_PID=$!
-for i in $(seq 1 100); do
-  [[ -d "$MNT" ]] && mountpoint -q "$MNT" 2>/dev/null && break
-  sleep 0.2
-done
-mountpoint -q "$MNT" 2>/dev/null || fail "mount did not come up (see $RUN/mount.err)"
+wait_mount_up "$MOUNT_PID"
 note "mount up (pid $MOUNT_PID at $MNT)"
 
 rss_kb() { awk '/VmRSS/{print $2}' "/proc/$1/status" 2>/dev/null || echo 0; }
@@ -193,14 +231,13 @@ note "E: PASSED"
 note "F: SIGKILL mount, committed data survives, staging swept"
 kill -9 "$MOUNT_PID" 2>/dev/null
 sleep 1
+# the SIGKILLed daemon may leave the mount listed-but-dead (corpse) on old
+# kernels: clear it the same way before remounting
+clear_stale "$MNT"
 # committed big file must still be there after remount
 "$DEPLOY_DIR/lightfs" mount --config "$RUN/mount.toml" "$MNT" >>"$RUN/mount.log" 2>>"$RUN/mount.err" &
 MOUNT_PID2=$!
-for i in $(seq 1 100); do
-  mountpoint -q "$MNT" 2>/dev/null && break
-  sleep 0.2
-done
-mountpoint -q "$MNT" 2>/dev/null || fail "remount after SIGKILL"
+wait_mount_up "$MOUNT_PID2"
 [[ -s "$MNT/big-256.bin" ]] || fail "committed data lost after mount SIGKILL"
 note "F: PASSED"
 

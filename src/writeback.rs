@@ -509,7 +509,7 @@ mod tests {
         let mut s = PendingWrite::new("/f".into(), 77, 1, &b).unwrap();
         s.spool.write(0, vec![b'O'; 8192].as_slice()).unwrap(); // old batch [0, 8192)
         let fresh = crate::staging::WriteSpool::open(&b).unwrap();
-        let mut drained = std::mem::replace(&mut s.spool, fresh);
+        let drained = std::mem::replace(&mut s.spool, fresh);
         // during the (failing) commit, a new write lands at [4096, 4196)
         s.spool.write(4096, vec![b'N'; 100].as_slice()).unwrap();
         s.spool.merge_under(drained).unwrap();

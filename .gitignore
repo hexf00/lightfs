@@ -14,3 +14,7 @@ staging/
 # TLC trace-exploration artifacts (S4.12.1: never commit these)
 *_TTrace_*
 formal/**/states/
+target-musl/
+target-x86/
+target-arm64/
+musl-build.log
