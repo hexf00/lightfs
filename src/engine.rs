@@ -88,6 +88,31 @@ fn staging_limits(cfg: &Config) -> crate::staging::StagingLimits {
     }
 }
 
+/// Open the engine's staging budget under the configured `[staging].dir`
+/// root (empty = the system temp directory, swept at startup like every
+/// managed budget). A directory that cannot be created or locked degrades
+/// to a headless budget with a loud warning — engine open never fails on
+/// staging governance.
+fn open_staging_budget(cfg: &Config) -> std::sync::Arc<crate::staging::StagingBudget> {
+    let limits = staging_limits(cfg);
+    let opened = if cfg.staging.dir.is_empty() {
+        crate::staging::StagingBudget::open(limits)
+    } else {
+        crate::staging::StagingBudget::open_at(limits, std::path::PathBuf::from(&cfg.staging.dir))
+    };
+    match opened {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "lightfs: WARNING managed staging directory unavailable ({e}); \
+                 admission stays arithmetic-only (budget still enforced, files \
+                 land in the raw temp dir)"
+            );
+            crate::staging::StagingBudget::headless(limits)
+        }
+    }
+}
+
 pub fn open_engine(cfg: &Config) -> Result<Engine> {
     reject_non_strict(cfg)?;
     ensure_parent_dir(&cfg.metadata.path);
@@ -95,8 +120,9 @@ pub fn open_engine(cfg: &Config) -> Result<Engine> {
     let lock = crate::fslock::FileLock::try_acquire(&engine_lock_path(cfg)?)?;
     let store = crate::vnext::Store::open(&cfg.metadata.path)?;
     let objects: Arc<dyn ObjectStore> = Arc::new(S3ObjectStore::new(cfg.s3_config())?);
+    let staging = open_staging_budget(cfg);
     let mut core =
-        Core::new_shared_with_staging(Arc::new(store), objects, staging_limits(cfg))?;
+        Core::new_shared_with_staging_budget(Arc::new(store), objects, staging)?;
     core.hold_engine_lock(lock);
     Ok(Engine {
         core: Arc::new(core),
@@ -113,8 +139,9 @@ pub fn open_engine_mem(cfg: &Config) -> Result<Engine> {
     let lock = crate::fslock::FileLock::try_acquire(&engine_lock_path(cfg)?)?;
     let store = crate::vnext::Store::open(&cfg.metadata.path)?;
     let objects: Arc<dyn ObjectStore> = Arc::new(crate::object_store::mem::MemObjectStore::new());
+    let staging = open_staging_budget(cfg);
     let mut core =
-        Core::new_shared_with_staging(Arc::new(store), objects, staging_limits(cfg))?;
+        Core::new_shared_with_staging_budget(Arc::new(store), objects, staging)?;
     core.hold_engine_lock(lock);
     Ok(Engine {
         core: Arc::new(core),

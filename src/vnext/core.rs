@@ -193,8 +193,6 @@ impl Core {
         objects: Arc<dyn ObjectStore>,
         limits: crate::staging::StagingLimits,
     ) -> Result<Core> {
-        objects.ping()?;
-        let metrics = Arc::new(Metrics::default());
         let staging = match crate::staging::StagingBudget::open(limits) {
             Ok(b) => b,
             Err(e) => {
@@ -206,6 +204,18 @@ impl Core {
                 crate::staging::StagingBudget::headless(limits)
             }
         };
+        Self::new_shared_with_staging_budget(store, objects, staging)
+    }
+
+    /// Core over an ALREADY-open staging budget (the engine open path:
+    /// `[staging].dir` selects the root there).
+    pub fn new_shared_with_staging_budget(
+        store: Arc<Store>,
+        objects: Arc<dyn ObjectStore>,
+        staging: Arc<crate::staging::StagingBudget>,
+    ) -> Result<Core> {
+        objects.ping()?;
+        let metrics = Arc::new(Metrics::default());
         let core = Core {
             store,
             objects: Arc::new(CountedObjects { inner: objects, m: metrics.clone() }),
@@ -918,6 +928,12 @@ impl Core {
                 actual: entry.k,
             });
         }
+        // A zero-length range is always empty (POSIX read of 0 bytes
+        // returns 0): a file created but never written has no object yet,
+        // and truncate-extend of such a file must not fail its base read.
+        if size == 0 {
+            return Ok(Vec::new());
+        }
         let r = entry
             .o
             .ok_or_else(|| Error::ObjectMissing(format!("{path}: file has no content yet")))?;
@@ -1008,6 +1024,10 @@ impl Core {
                 actual: entry.k,
             });
         }
+        // Zero-length ranges are always empty (see `read`).
+        if size == 0 {
+            return Ok((Box::new(std::io::empty()), 0));
+        }
         let r = entry
             .o
             .ok_or_else(|| Error::ObjectMissing(format!("{path}: file has no content yet")))?;
@@ -1028,6 +1048,10 @@ impl Core {
         size: u64,
     ) -> Result<(Box<dyn std::io::Read + Send>, u64)> {
         let entry = self.locate_by_id(file_id, "")?;
+        // Zero-length ranges are always empty (see `read`).
+        if size == 0 {
+            return Ok((Box::new(std::io::empty()), 0));
+        }
         let r = entry
             .o
             .ok_or_else(|| Error::ObjectMissing(format!("file {file_id}: no content yet")))?;

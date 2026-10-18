@@ -32,7 +32,7 @@ pub struct Client {
     cache: MetaCache,
     ttl: Option<Duration>,
     /// S4.25: this process's write-session spool budget.
-    staging: std::sync::Arc<crate::staging::StagingBudget>,
+    staging: std::sync::OnceLock<std::sync::Arc<crate::staging::StagingBudget>>,
 }
 
 /// TTL metadata cache. Never authoritative: losing it, expiring it, or a
@@ -180,31 +180,40 @@ impl Client {
             .new_agent();
         // S4.25: the client process owns its OWN staging budget (same
         // bounded defaults as the server; a mount client is bounded too).
-        let staging = match crate::staging::StagingBudget::open(
-            crate::staging::StagingLimits::default(),
-        ) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!(
-                    "lightfs: WARNING managed staging directory unavailable ({e}); \
-                     write sessions fall back to the raw temp dir (budget still enforced)"
-                );
-                crate::staging::StagingBudget::headless(crate::staging::StagingLimits::default())
-            }
-        };
+        // It opens LAZILY on first session: Client::new runs once per CLI
+        // invocation, and a full temp-root sweep per process was a
+        // measurable per-operation cost (S4.25 perf round).
         Self {
             url: cfg.url.trim_end_matches('/').to_string(),
             agent,
             cache: MetaCache::default(),
             ttl: cfg.metadata_ttl,
-            staging,
+            staging: std::sync::OnceLock::new(),
         }
     }
 
     /// The client's staging budget (S4.25): mounted write sessions spool
-    /// under it; read-side staging lives server-side. Observation only.
-    pub fn staging(&self) -> std::sync::Arc<crate::staging::StagingBudget> {
-        self.staging.clone()
+    /// under it; read-side staging lives server-side. Opens lazily on
+    /// first use — see `Client::new`.
+    fn staging_budget(&self) -> std::sync::Arc<crate::staging::StagingBudget> {
+        self.staging
+            .get_or_init(|| {
+                match crate::staging::StagingBudget::open_fresh(
+                    crate::staging::StagingLimits::default(),
+                ) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!(
+                            "lightfs: WARNING managed staging directory unavailable ({e}); \
+                             write sessions fall back to the raw temp dir (budget still enforced)"
+                        );
+                        crate::staging::StagingBudget::headless(
+                            crate::staging::StagingLimits::default(),
+                        )
+                    }
+                }
+            })
+            .clone()
     }
 
     /// Phase 11 honesty check: the data cache is specified as optional and
@@ -495,7 +504,7 @@ impl FsApi for Client {
             node_id: node.id,
             path: path.to_string(),
             expected_version: expected_version.unwrap_or(node.version),
-            spool: crate::staging::WriteSpool::open(&self.staging)?,
+            spool: crate::staging::WriteSpool::open(&self.staging_budget())?,
         }))
     }
 
@@ -543,7 +552,7 @@ impl FsApi for Client {
     }
 
     fn client_staging(&self) -> Option<std::sync::Arc<crate::staging::StagingBudget>> {
-        Some(self.staging.clone())
+        Some(self.staging_budget())
     }
 
     // S4.25 §三: the mounted-write COMMIT over the wire. The base streams
@@ -640,7 +649,7 @@ impl FsApi for Client {
             node_id,
             path: path.to_string(),
             expected_version: expected_version.unwrap_or(node.version),
-            spool: crate::staging::WriteSpool::open(&self.staging)?,
+            spool: crate::staging::WriteSpool::open(&self.staging_budget())?,
         }))
     }
 

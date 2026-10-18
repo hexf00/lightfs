@@ -908,11 +908,17 @@ fn s423_damaged_and_legacy_objects_fail_closed() {
 // ---- S4.24: bounded full reads, read_at, salvage streaming, temp hygiene ----
 
 fn temp_residue() -> usize {
+    temp_residue_in(&std::env::temp_dir())
+}
+
+fn temp_residue_in(root: &std::path::Path) -> usize {
     // staging files live either in a managed `lightfs-staging-*` subdir
-    // (engine/core path) or at the temp root (headless salvage budgets)
-    let root = std::env::temp_dir();
+    // (engine/core path) or at the root itself (headless salvage budgets).
+    // Tests that point `[staging].dir` at a private root pass that root
+    // here: a global count races with ANY concurrently-running test (or a
+    // leaked dir from an earlier killed process) and flakes the window.
     let mut n = 0;
-    if let Ok(rd) = std::fs::read_dir(&root) {
+    if let Ok(rd) = std::fs::read_dir(root) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
             if name.starts_with("lightfs-staging-file-") {
@@ -1294,6 +1300,11 @@ fn s425_per_object_cap_refuses_before_fetch() {
 fn s425_write_session_spools_and_commits_streamed() {
     let mut cfg = fresh("s425spool");
     cfg.staging.budget_bytes = 64 * 1024 * 1024;
+    // a private staging root: the residue window below must not race with
+    // concurrently-running tests' temp files (global count flaked here)
+    let stage_root = std::env::temp_dir().join(format!("s425spool-stage-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&stage_root);
+    cfg.staging.dir = stage_root.to_string_lossy().to_string();
     let eng = lightfs::engine::open_engine(&cfg).unwrap();
     let content: Vec<u8> = (0..16 * 1024 * 1024u64).map(|i| (i % 251) as u8).collect();
     let tmp = std::env::temp_dir().join(format!("s425spool-src-{}", std::process::id()));
@@ -1302,7 +1313,7 @@ fn s425_write_session_spools_and_commits_streamed() {
     let h = eng.core.open_write("/none", None).err().expect("no such file yet");
     let _ = h;
     eng.core.create("/big.dat", 0o644).unwrap();
-    let before = temp_residue();
+    let before = temp_residue_in(&stage_root);
     let h = eng.core.open_write("/big.dat", None).unwrap();
     // an opened session reserves 0 until the first write
     assert_eq!(eng.core.staging.stats().used, 0);
@@ -1320,7 +1331,10 @@ fn s425_write_session_spools_and_commits_streamed() {
     drop(h);
     assert_eq!(eng.core.staging.stats().active_write_sessions, 0);
     std::thread::sleep(std::time::Duration::from_millis(80));
-    assert!(temp_residue() <= before, "committed session leaves no staging file");
+    assert!(
+        temp_residue_in(&stage_root) <= before,
+        "committed session leaves no staging file"
+    );
     // byte-exact content through the verified read path
     let (mut rd, len) = eng.core.open_read("/big.dat", 0, 8 * 1024 * 1024).unwrap();
     let mut got = vec![0u8; len as usize];
@@ -1332,6 +1346,7 @@ fn s425_write_session_spools_and_commits_streamed() {
     assert_eq!(&got[3 * 1024 * 1024..4 * 1024 * 1024], &[0u8][..].repeat(1024 * 1024));
     assert_eq!(&got[4 * 1024 * 1024..], &content[4 * 1024 * 1024..8 * 1024 * 1024]);
     let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_dir_all(&stage_root);
 }
 
 #[test]
@@ -1355,4 +1370,30 @@ fn s425_write_session_refuses_past_budget_without_corruption() {
     let data = eng.core.read("/c.dat", 0, 512 * 1024).unwrap();
     assert!(data.iter().all(|&b| b == 1));
     assert_eq!(eng.core.staging.stats().used, 0);
+}
+
+/// S4.25: a ZERO-length read never requires content. A file created but
+/// never written has no object at all (empty files that WERE committed
+/// get a real empty object — see s424_empty_file...), and truncate-extend
+/// of such a file (the WinFsp A4 discovery) must not fail its base read.
+/// Nonzero reads keep the ObjectMissing contract untouched.
+#[test]
+fn zero_length_read_needs_no_content() {
+    let cfg = fresh("zerolen");
+    let eng = lightfs::engine::open_engine(&cfg).unwrap();
+    eng.core.create("/z.bin", 0o644).unwrap();
+    assert_eq!(eng.core.read("/z.bin", 0, 0).unwrap(), Vec::<u8>::new());
+    let (mut r, len) = eng.core.open_read("/z.bin", 0, 0).unwrap();
+    assert_eq!(len, 0);
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut r, &mut buf).unwrap();
+    assert!(buf.is_empty());
+    let node = eng.core.lookup("/z.bin").unwrap();
+    let (mut r, len) = eng.core.open_read_by_id(node.id, 0, 0).unwrap();
+    assert_eq!(len, 0);
+    buf.clear();
+    std::io::Read::read_to_end(&mut r, &mut buf).unwrap();
+    assert!(buf.is_empty());
+    let e = eng.core.read("/z.bin", 0, 1).unwrap_err();
+    assert!(matches!(e, lightfs::error::Error::ObjectMissing(_)));
 }

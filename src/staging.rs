@@ -93,6 +93,19 @@ impl StagingBudget {
     /// Test seam: same, under an explicit root.
     pub fn open_at(limits: StagingLimits, root: PathBuf) -> std::io::Result<Arc<StagingBudget>> {
         sweep_stale_staging(&root);
+        Self::open_at_impl(limits, root)
+    }
+
+    /// No dead-directory sweep. For short-lived client processes, where a
+    /// full temp-root scan per process is a per-operation cost (every CLI
+    /// invocation is a process): orphaned staging dirs are reclaimed by
+    /// the next sweep participant (server boot, mount adapters), which
+    /// share the same temp root.
+    pub fn open_fresh(limits: StagingLimits) -> std::io::Result<Arc<StagingBudget>> {
+        Self::open_at_impl(limits, std::env::temp_dir())
+    }
+
+    fn open_at_impl(limits: StagingLimits, root: PathBuf) -> std::io::Result<Arc<StagingBudget>> {
         let dir = root.join(format!(
             "lightfs-staging-{}-{}",
             std::process::id(),
