@@ -528,9 +528,16 @@ impl WriteSpool {
             self.res.shrink(new_size);
             self.file.set_len(new_size)?;
             self.size = new_size;
-            self.dirty.retain(|(_, e)| *e <= new_size);
-            for (_, e) in self.dirty.iter_mut() {
-                *e = (*e).min(new_size);
+            // A range STRADDLING the new EOF keeps its pre-EOF prefix
+            // (ftruncate semantics: pages beyond the new EOF are discarded
+            // and never resent, but the prefix below the EOF is user
+            // data). Dropping the whole range let the base stream clobber
+            // live dirty bytes during the commit overlay (WinFsp accept
+            // A5: shrink a straddling chunk, then append — byte 0 came
+            // back as base zero instead of the written pattern).
+            self.dirty.retain(|r| r.0 < new_size);
+            for r in self.dirty.iter_mut() {
+                r.1 = r.1.min(new_size);
             }
             self.write_ops += 1;
         }
@@ -989,6 +996,41 @@ mod tests {
         sp.read_at(0, &mut small).unwrap();
         assert_eq!(&small, b"abc");
         drop(sp);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spool_truncate_keeps_straddling_dirty_prefix_under_base_overlay() {
+        // WinFsp accept A5: write 8192, shrink to 4096 (the dirty range
+        // straddles the new EOF), then a commit overlays the committed
+        // base — the base (zeros) must NOT clobber the kept prefix, and
+        // bytes appended past the new EOF must survive.
+        let root = tmp_root("spool-straddle");
+        let b = StagingBudget::open_at(StagingLimits::default(), root.clone()).unwrap();
+        let mut sp = test_spool(&b);
+        sp.write(0, &[7u8; 8192]).unwrap();
+        sp.truncate(4096).unwrap();
+        sp.write(4096, b"XYZ").unwrap();
+        let mut empty_base = std::io::empty();
+        sp.overlay_base(&mut empty_base, 0).unwrap();
+        let mut buf = vec![0u8; 4099];
+        sp.read_at(0, &mut buf).unwrap();
+        assert!(buf[..4096].iter().all(|&x| x == 7), "straddling prefix survives");
+        assert_eq!(&buf[4096..], b"XYZ");
+        // a real base under the holes: bytes the session never touched
+        // come from the base, dirty bytes still win
+        let mut sp2 = test_spool(&b);
+        sp2.write(4096, &[9u8; 10]).unwrap();
+        let base = vec![5u8; 8192];
+        let mut rd = std::io::Cursor::new(base);
+        sp2.overlay_base(&mut rd, 8192).unwrap();
+        let mut got = vec![0u8; 8192];
+        sp2.read_at(0, &mut got).unwrap();
+        assert_eq!(&got[..4096], &[5u8; 4096]);
+        assert_eq!(&got[4096..4106], &[9u8; 10]);
+        assert_eq!(&got[4106..], &[5u8; 4086]);
+        drop(sp);
+        drop(sp2);
         let _ = std::fs::remove_dir_all(&root);
     }
 

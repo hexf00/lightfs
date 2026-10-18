@@ -323,3 +323,69 @@ peak RSS is FLAT in file size (~31-40 MB at 256 MiB, vs ~277 MB linear
 on the pre-streaming build). `commit_write` (interactive session path)
 still holds the session buffer: O(file size), documented, NOT claimed
 bounded. Full reads and salvage are bounded as described above.
+
+## 7. The mounted-write boundary (S4.25)
+
+**Staging budget.** Every process that stages bytes to disk holds ONE
+`StagingBudget`: a flock-guarded `lightfs-staging-<pid>-<nanos>` directory
+under the configured root (`[staging].dir`, default the system temp
+directory) with arithmetic admission (`budget_bytes`, `max_object_bytes`;
+refusal is `Error::Capacity` = ENOSPC, never eviction, never spin).
+`budget_bytes` default is 2 GiB. Dead processes' directories are swept
+provably-dead at startup by sweep participants (server boot, engine
+open): a directory whose `staging.lock` is not flocked is removed.
+Short-lived CLIENTS open their budget lazily (first write session) and
+without sweeping — a per-process temp-root scan was a measurable
+per-operation cost (every CLI invocation is a process); orphans are
+reclaimed by the next sweep participant sharing the same root.
+
+**Write sessions spool to disk.** A mounted write session (FUSE or
+WinFsp) buffers dirty bytes in a `WriteSpool`: one private 0600 file,
+random writes, sparse holes, two-sided truncate, read-your-writes over
+a base, dirty-range overlay. The commit streams the envelope straight
+out of the spool around the base content — the session never holds the
+whole file in the heap. Server-side write sessions (`WriteHandle`) and
+client-side sessions (`ClientWriteSession`) share the same spool. The
+session's contribution to the visible size is its highest dirty byte
+end; `close` on a session with no writes commits nothing.
+
+**The mounted-write commit over the wire.** `FsApi::commit_write_merged`
+is the mount flush: the file's CURRENT committed content streams in as
+the base (a never-committed file has NO base — `ObjectMissing` on the
+base read means "merge over nothing"), the spool's dirty ranges win,
+and the merged whole uploads through the same `/data/write`
+(Node-Id + Expected-Version + Length) any streamed write takes. The
+CORE implements this in-process; the network `Client` overrides it —
+the trait DEFAULT propagates the base-read error, which is exactly why
+every first flush of a new file failed on a real mount while in-process
+tests passed. Adapters must go through the override, not the default.
+
+**Zero-length reads never touch content.** A ranged HEAD read of 0
+bytes returns empty without resolving the object (POSIX read semantics).
+A file created but never written has NO object; truncate-extend of such
+a file (set_len before any flush) must not fail its base read. Nonzero
+reads keep the `ObjectMissing` contract, and whole-file
+`read_stream_by_id` stays strict — "no base" is a signal the commit
+merge consumes, not an error to erase.
+
+**Wire codes.** `ObjectMissing` maps to the distinct `OBJECT_MISSING`
+code (404), NOT to `NOT_FOUND` — collapsing it destroys the "no base"
+semantics above on every wire client.
+
+**FUSE inode namespace.** Kernel inos are adapter-allocated (a
+monotonic counter plus a path↔ino map), never node ids: vnext
+directories have tree ids from a separate rowid sequence, and the root
+tree id changes on every commit (COW). Handle-based operations resolve
+the REAL node id through the adapter's map (`node_id_of`); getattr is
+path-anchored because a directory's id is meaningless across commits.
+The root directory is mode 0755 — 0555 makes `default_permissions`
+(and WinFsp) reject every create inside the mount.
+
+**Measured (local, five rounds × 300 files, shell RPC).** Baseline
+5d8ca74 vs S4.25: small-file write ~10.1 → ~11.5 ms/op, read ~7.0 →
+~7.5 ms/op (within run-to-run drift; the residual ~1 ms is the
+per-session spool file lifecycle — the bounded-memory contract, paid
+where it is owed). An intermediate build paid 21.5/17.9 ms — the
+eager-sweep defect above, since fixed. Mounted-write RSS on the Linux
+FUSE gate: 2668 KB (hwm 3008) for a 64 MiB mount write, 2112 KB for
+256 MiB — bounded by the spool, not the file.

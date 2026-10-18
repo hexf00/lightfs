@@ -940,7 +940,11 @@ fn temp_residue_in(root: &std::path::Path) -> usize {
 
 #[test]
 fn s424_full_read_streamed_verified_and_fail_closed() {
-    let cfg = fresh("s424full");
+    let mut cfg = fresh("s424full");
+    // private staging root for the residue assertion (parallel-test races)
+    let stage_root = std::env::temp_dir().join(format!("s424full-stage-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&stage_root);
+    cfg.staging.dir = stage_root.to_string_lossy().to_string();
     let eng = lightfs::engine::open_engine(&cfg).unwrap();
 
     // 64 MiB streamed write, then a WHOLE-file read through the server
@@ -988,7 +992,7 @@ fn s424_full_read_streamed_verified_and_fail_closed() {
     let mid = HEADER_OR_PAYLOAD_POS;
     damaged[mid] ^= 0xff;
     raw.put(&key, &damaged).unwrap();
-    let before = temp_residue();
+    let before = temp_residue_in(&stage_root);
     // Re-PUT damage necessarily changes the backend validator, so the
     // SAME-RESPONSE etag check fires first — itself part of the required
     // fail-closed matrix (the footer-mismatch arm is pinned by the
@@ -1004,7 +1008,11 @@ fn s424_full_read_streamed_verified_and_fail_closed() {
         "{err}"
     );
     assert!(eng.core.read_at(cid, "/big.bin", 0, 16).is_err(), "pinned read must refuse too");
-    assert_eq!(temp_residue(), before, "failed verification leaves no staging file");
+    assert_eq!(
+        temp_residue_in(&stage_root),
+        before,
+        "failed verification leaves no staging file"
+    );
 }
 
 const HEADER_OR_PAYLOAD_POS: usize = 20 + 4096;
@@ -1190,10 +1198,16 @@ fn s424_salvage_streaming_many_objects_bounded_report() {
 fn s425_staging_budget_exhaustion_is_named_and_leaves_no_residue() {
     let mut cfg = fresh("s425budget");
     cfg.staging.budget_bytes = 1024 * 1024; // 1 MiB total
+    // private staging root: the residue assertion must not race with
+    // concurrently-running tests' temp files (same flake class as the
+    // spool-residue test above)
+    let stage_root = std::env::temp_dir().join(format!("s425budget-stage-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&stage_root);
+    cfg.staging.dir = stage_root.to_string_lossy().to_string();
     let eng = lightfs::engine::open_engine(&cfg).unwrap();
     let big = spool_file("s425big", 4 * 1024 * 1024);
     write_spooled(&eng.core, "/big.bin", &big, true, None);
-    let before = temp_residue();
+    let before = temp_residue_in(&stage_root);
     let err = eng
         .core
         .open_read("/big.bin", 0, 4 * 1024 * 1024)
@@ -1201,7 +1215,12 @@ fn s425_staging_budget_exhaustion_is_named_and_leaves_no_residue() {
         .expect("4 MiB cannot fit a 1 MiB budget")
         .to_string();
     assert!(err.contains("capacity"), "{err}");
-    assert_eq!(temp_residue(), before, "refused admission stages nothing");
+    assert_eq!(
+        temp_residue_in(&stage_root),
+        before,
+        "refused admission stages nothing"
+    );
+    let _ = std::fs::remove_dir_all(&stage_root);
     assert_eq!(eng.core.staging.stats().used, 0, "refusal must not leak budget");
     // partial reads go through the RANGE path (no staging file) and keep
     // working within the same budget
@@ -1266,7 +1285,11 @@ fn s425_failed_verification_releases_budget() {
         .expect("damaged object must fail")
         .to_string();
     assert!(err.contains("recorded etag") || err.contains("sha256 footer mismatch"), "{err}");
-    assert_eq!(temp_residue(), before, "failed verification leaves no staging file");
+    assert_eq!(
+        temp_residue_in(&stage_root),
+        before,
+        "failed verification leaves no staging file"
+    );
     assert_eq!(eng.core.staging.stats().used, 0, "failed read must release its reservation");
 }
 
