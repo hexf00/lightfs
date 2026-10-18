@@ -438,7 +438,7 @@ fn respond_error(req: tiny_http::Request, e: &Error) {
     })
     .to_string();
     let status = match e.code() {
-        "NOT_FOUND" => 404,
+        "NOT_FOUND" | "OBJECT_MISSING" => 404,
         "ALREADY_EXISTS" => 409,
         "CONFLICT" => 409,
         "INVALID" => 400,

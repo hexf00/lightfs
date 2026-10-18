@@ -124,9 +124,17 @@ impl From<std::io::Error> for Error {
 
 impl Error {
     /// Stable machine-readable code used by the RPC protocol.
+    ///
+    /// ObjectMissing carries its OWN code: collapsing it into NOT_FOUND
+    /// made every cross-process consumer see `NotFound` where the contract
+    /// says "the name exists, the object is gone" - concretely, the mount
+    /// client's commit merge treats ObjectMissing as "never-committed
+    /// file, no base" and without the distinction every FIRST flush of a
+    /// new file through a real mount failed.
     pub fn code(&self) -> &'static str {
         match self {
-            Error::NotFound(_) | Error::ParentNotFound(_) | Error::ObjectMissing(_) => "NOT_FOUND",
+            Error::NotFound(_) | Error::ParentNotFound(_) => "NOT_FOUND",
+            Error::ObjectMissing(_) => "OBJECT_MISSING",
             Error::IdentityGone(_) => "IDENTITY_GONE",
             Error::AlreadyExists(_) => "ALREADY_EXISTS",
             Error::Conflict { .. } => "CONFLICT",
