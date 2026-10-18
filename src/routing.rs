@@ -440,6 +440,10 @@ impl FsApi for RoutingFs {
     /// The commit chain's base read: negatives have no cache anywhere
     /// (local backends don't cache), positives must NOT hit the CacheFs —
     /// delegate to its structural bypass.
+    fn client_staging(&self) -> Option<std::sync::Arc<crate::staging::StagingBudget>> {
+        self.remote.client_staging()
+    }
+
     fn read_by_id_authoritative(
         &self,
         node_id: i64,

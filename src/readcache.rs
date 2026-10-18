@@ -557,6 +557,10 @@ impl FsApi for CacheFs {
 
     /// The commit chain's base read: structural bypass (module docs,
     /// guarantee 2). Dirty data and cache contents can never meet here.
+    fn client_staging(&self) -> Option<std::sync::Arc<crate::staging::StagingBudget>> {
+        self.inner.client_staging()
+    }
+
     fn read_by_id_authoritative(
         &self,
         node_id: i64,
