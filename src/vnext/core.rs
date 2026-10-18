@@ -122,6 +122,10 @@ pub struct Core {
     pub(crate) store: Arc<Store>,
     pub(crate) objects: Arc<dyn ObjectStore>,
     pub metrics: Arc<Metrics>,
+    /// S4.25: bounded staging-disk admission for verified full reads
+    /// (and, server-side, the mounted-write spool). One budget per
+    /// process; reservations live exactly as long as their staged bytes.
+    pub staging: Arc<crate::staging::StagingBudget>,
     /// The single-writer engine lock, held for the engine's lifetime.
     _lock: Option<crate::fslock::FileLock>,
 }
@@ -176,12 +180,37 @@ impl Core {
     /// Core over an ALREADY-shared store (crash-simulation tests reopen
     /// over the same Arc a panicking engine dropped).
     pub fn new_shared(store: Arc<Store>, objects: Arc<dyn ObjectStore>) -> Result<Core> {
+        Self::new_shared_with_staging(store, objects, crate::staging::StagingLimits::default())
+    }
+
+    /// Core with an explicit staging budget (S4.25): the engine open path
+    /// passes the configured `[staging]` limits; `new_shared` uses the
+    /// bounded defaults. A staging directory that cannot be created or
+    /// locked degrades to a HEADLESS budget (admission arithmetic only)
+    /// with a loud warning — never to silent unbounded staging.
+    pub fn new_shared_with_staging(
+        store: Arc<Store>,
+        objects: Arc<dyn ObjectStore>,
+        limits: crate::staging::StagingLimits,
+    ) -> Result<Core> {
         objects.ping()?;
         let metrics = Arc::new(Metrics::default());
+        let staging = match crate::staging::StagingBudget::open(limits) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "lightfs: WARNING managed staging directory unavailable ({e}); \
+                     admission stays arithmetic-only (budget still enforced, files \
+                     land in the raw temp dir)"
+                );
+                crate::staging::StagingBudget::headless(limits)
+            }
+        };
         let core = Core {
             store,
             objects: Arc::new(CountedObjects { inner: objects, m: metrics.clone() }),
             metrics,
+            staging,
             _lock: None,
         };
         core.init_namespace()?;
@@ -710,7 +739,20 @@ impl Core {
         offset: u64,
         size: u64,
     ) -> Result<Vec<u8>> {
-        if offset >= recorded_size || size == 0 {
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        if offset >= recorded_size {
+            if offset == 0 {
+                // S4.25 §一: a zero-LOGICAL-size file does not get a
+                // verification exemption. The stored object still exists
+                // (52 envelope bytes, empty payload) and must be fetched
+                // and fully verified — corrupt, truncated or missing, it
+                // fails with a named error instead of masquerading as
+                // empty content. Reads past EOF (offset > 0 here) stay
+                // legitimately empty with no request.
+                return self.read_full_verified(key, recorded_etag, Some(recorded_size));
+            }
             return Ok(Vec::new());
         }
         let want = size.min(recorded_size - offset);
@@ -768,8 +810,13 @@ impl Core {
     /// THIS BOUNDARY by explicit choice of the Vec return — the server's
     /// full-read path uses [`Self::read_full_verified_stream`] instead
     /// and never materializes the payload in the heap.
-    pub fn read_full_verified(&self, key: &str, recorded_etag: &str) -> Result<Vec<u8>> {
-        let mut vo = self.read_full_verified_stream(key, recorded_etag)?;
+    pub fn read_full_verified(
+        &self,
+        key: &str,
+        recorded_etag: &str,
+        expected_payload: Option<u64>,
+    ) -> Result<Vec<u8>> {
+        let mut vo = self.read_full_verified_stream(key, recorded_etag, expected_payload)?;
         let mut out = Vec::with_capacity(vo.payload_len as usize);
         vo.reader.read_to_end(&mut out)?;
         Ok(out)
@@ -782,14 +829,31 @@ impl Core {
     /// response (no HEAD, no two-request version assumption); an empty
     /// recorded etag skips the comparison, exactly as before.
     ///
-    /// Temp cost: one file of `payload_len` bytes in `std::env::temp_dir`
-    /// for the lifetime of the returned value; deleted on drop, on any
-    /// verification failure, on short read, on IO error, on cancellation.
+    /// Staging admission (S4.25 §二): nothing reaches a staging file
+    /// before a reservation for the EXPECTED payload size succeeds. The
+    /// expected size is the caller's recorded logical size when known,
+    /// else derived from the backend-reported object length — and is
+    /// corrected to the DECODED payload length before publication (the
+    /// reservation never permanently assumes logical == payload). The
+    /// reservation lives as long as the returned reader: a slow consumer
+    /// holds its bytes, a cancelled one releases them on drop. Refusal is
+    /// `Error::Capacity` and no bytes are staged.
+    ///
+    /// Temp cost: one file of `payload_len` bytes inside the managed
+    /// staging directory for the lifetime of the returned value; deleted
+    /// on drop, on any verification failure, on short read, on IO error,
+    /// on cancellation.
     pub fn read_full_verified_stream(
         &self,
         key: &str,
         recorded_etag: &str,
+        expected_payload: Option<u64>,
     ) -> Result<VerifiedObjectRead> {
+        // refuse BEFORE the fetch when the recorded size already cannot
+        // fit the per-object cap
+        if let Some(w) = expected_payload {
+            self.staging.admits(w)?;
+        }
         let mut sg = self.objects.get_stream(key, None)?;
         if !recorded_etag.is_empty() && sg.etag != recorded_etag {
             return Err(Error::ObjectCorrupt(format!(
@@ -797,7 +861,14 @@ impl Core {
                 sg.etag
             )));
         }
-        let mut staged = TempFileGuard::create()
+        // envelope total = header + payload + footer; the backend-reported
+        // length gives an expected payload when the caller had none
+        let expected = expected_payload.or_else(|| {
+            sg.len.checked_sub((envelope::HEADER_LEN + envelope::FOOTER_LEN) as u64)
+        });
+        let expected = expected.unwrap_or(0);
+        let mut res = self.staging.try_reserve(expected, crate::staging::StagingKind::Read, key)?;
+        let mut staged = crate::staging::TempFileGuard::create_in(self.staging.dir())
             .map_err(|e| Error::Storage(format!("staging file: {e}")))?;
         let decoded = {
             use std::io::Write as _;
@@ -816,6 +887,13 @@ impl Core {
             }
         }?;
         let payload_len = decoded.payload_len;
+        // correct the reservation to the VERIFIED size (never trust the
+        // pre-decode expectation past this point)
+        if payload_len > res.bytes() {
+            res.grow(payload_len - res.bytes(), key)?;
+        } else if payload_len < res.bytes() {
+            res.shrink(payload_len);
+        }
         let mut file = staged.file.take().expect("guard still holds a file");
         use std::io::Seek;
         file.rewind()?;
@@ -823,6 +901,7 @@ impl Core {
             reader: file,
             payload_len,
             guard: staged,
+            _res: res,
         })
     }
 
@@ -945,12 +1024,15 @@ impl Core {
         offset: u64,
         size: u64,
     ) -> Result<(Box<dyn std::io::Read + Send>, u64)> {
-        if offset == 0 && recorded_size > 0 && size >= recorded_size {
+        // S4.25 §一: whole-file requests include the zero-length file —
+        // `recorded_size == 0` no longer bypasses verification; only an
+        // explicitly empty REQUEST (`size == 0`) is served with no I/O.
+        if offset == 0 && size > 0 && size >= recorded_size {
             // WHOLE-file request: one full GET (the range path fetched the
             // same bytes anyway), footer verified BEFORE anything is
             // served, streamed out of the validated staging file. Same
             // request count as before; 32 more bytes on the wire.
-            let vo = self.read_full_verified_stream(key, recorded_etag)?;
+            let vo = self.read_full_verified_stream(key, recorded_etag, Some(recorded_size))?;
             let len = vo.payload_len;
             return Ok((Box::new(vo), len));
         }
@@ -1663,7 +1745,11 @@ impl Core {
         // checksum needs every byte. Whether pinned reads may downgrade
         // to ranged GET + backend validator is a separate correctness
         // contract decision, deliberately NOT made here.
-        let mut vo = self.read_full_verified_stream(key, entry.e.as_deref().unwrap_or(""))?;
+        let mut vo = self.read_full_verified_stream(
+            key,
+            entry.e.as_deref().unwrap_or(""),
+            Some(entry.s.max(0) as u64),
+        )?;
         let payload_len = vo.payload_len;
         let start = offset.min(payload_len);
         let end = start.saturating_add(size).min(payload_len);
@@ -1713,7 +1799,12 @@ pub struct VerifiedObjectRead {
     /// Held for Drop: deletes the staging file when the read is consumed
     /// or cancelled. Never read directly.
     #[allow(dead_code)]
-    pub(crate) guard: TempFileGuard,
+    pub(crate) guard: crate::staging::TempFileGuard,
+    /// Held for Drop: releases the staging-budget bytes the reader's
+    /// staged file occupies (S4.25: a slow consumer holds its bytes; a
+    /// cancelled read gives them back).
+    #[allow(dead_code)]
+    pub(crate) _res: crate::staging::StagingReservation,
 }
 
 impl std::io::Read for VerifiedObjectRead {
@@ -1728,54 +1819,3 @@ impl std::io::Seek for VerifiedObjectRead {
     }
 }
 
-/// Private staging file, deleted on EVERY exit path (success consumption,
-/// verification failure, short read, IO error, cancellation-by-drop).
-/// Failure to remove is surfaced, never silent (it holds user data).
-pub(crate) struct TempFileGuard {
-    path: std::path::PathBuf,
-    pub file: Option<std::fs::File>,
-}
-
-impl TempFileGuard {
-    pub(crate) fn create() -> std::io::Result<TempFileGuard> {
-        let dir = std::env::temp_dir();
-        for _ in 0..8 {
-            let p = dir.join(format!(
-                "lightfs-read-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
-            ));
-            let mut f = std::fs::OpenOptions::new();
-            f.read(true).write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                f.mode(0o600);
-            }
-            match f.open(&p) {
-                Ok(file) => {
-                    return Ok(TempFileGuard { path: p, file: Some(file) });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        Err(std::io::Error::other("could not create staging file"))
-    }
-}
-
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_file(&self.path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                eprintln!(
-                    "lightfs: WARNING failed to remove staging file {}: {e}",
-                    self.path.display()
-                );
-            }
-        }
-    }
-}

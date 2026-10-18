@@ -143,7 +143,24 @@ fn handle_request_inner(mut req: tiny_http::Request, core: &Core) {
             let _ = req.respond(resp);
         }
         tiny_http::Method::Get if url == "/metrics" => {
-            let resp = unchunked(tiny_http::Response::from_string(crate::metrics::dump()));
+            // S4.25: staging observation rides the same endpoint — one
+            // line per gauge, prefixed so scrapers can select them.
+            let st = core.staging.stats();
+            let staging_lines = format!(
+                "staging_budget_bytes {}\nstaging_used_bytes {}\nstaging_read_bytes {}\n\
+                 staging_spool_bytes {}\nstaging_active_reads {}\nstaging_active_write_sessions {}\n\
+                 staging_admitted_total {}\nstaging_refused_total {}\n",
+                st.budget_bytes,
+                st.used,
+                st.read_bytes,
+                st.spool_bytes,
+                st.active_reads,
+                st.active_write_sessions,
+                st.admitted_total,
+                st.refused_total
+            );
+            let body = format!("{staging_lines}{}", crate::metrics::dump());
+            let resp = unchunked(tiny_http::Response::from_string(body));
             let _ = req.respond(resp);
         }
         tiny_http::Method::Post if url == "/rpc" => {

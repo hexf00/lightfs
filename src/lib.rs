@@ -26,5 +26,6 @@ pub mod rpc;
 pub mod server;
 pub mod shell;
 pub mod sigv4;
+pub mod staging;
 pub mod vnext;
 pub mod writeback;

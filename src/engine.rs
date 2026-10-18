@@ -80,6 +80,14 @@ fn reject_non_strict(cfg: &Config) -> Result<()> {
 /// config/parent-dir prep, then the engine lock taken from the
 /// database's canonical identity WITHOUT opening or initializing
 /// SQLite, then everything else under that lock.
+/// The `[staging]` section as core limits (S4.25).
+fn staging_limits(cfg: &Config) -> crate::staging::StagingLimits {
+    crate::staging::StagingLimits {
+        budget_bytes: cfg.staging.budget_bytes,
+        max_object_bytes: cfg.staging.max_object_bytes,
+    }
+}
+
 pub fn open_engine(cfg: &Config) -> Result<Engine> {
     reject_non_strict(cfg)?;
     ensure_parent_dir(&cfg.metadata.path);
@@ -87,7 +95,8 @@ pub fn open_engine(cfg: &Config) -> Result<Engine> {
     let lock = crate::fslock::FileLock::try_acquire(&engine_lock_path(cfg)?)?;
     let store = crate::vnext::Store::open(&cfg.metadata.path)?;
     let objects: Arc<dyn ObjectStore> = Arc::new(S3ObjectStore::new(cfg.s3_config())?);
-    let mut core = Core::new(store, objects)?;
+    let mut core =
+        Core::new_shared_with_staging(Arc::new(store), objects, staging_limits(cfg))?;
     core.hold_engine_lock(lock);
     Ok(Engine {
         core: Arc::new(core),
@@ -104,7 +113,8 @@ pub fn open_engine_mem(cfg: &Config) -> Result<Engine> {
     let lock = crate::fslock::FileLock::try_acquire(&engine_lock_path(cfg)?)?;
     let store = crate::vnext::Store::open(&cfg.metadata.path)?;
     let objects: Arc<dyn ObjectStore> = Arc::new(crate::object_store::mem::MemObjectStore::new());
-    let mut core = Core::new(store, objects)?;
+    let mut core =
+        Core::new_shared_with_staging(Arc::new(store), objects, staging_limits(cfg))?;
     core.hold_engine_lock(lock);
     Ok(Engine {
         core: Arc::new(core),

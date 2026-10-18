@@ -34,7 +34,8 @@
 use crate::error::{Error, Result};
 use crate::object_store::ObjectStore;
 use crate::vnext::envelope::{self, ObjKind};
-use crate::vnext::core::TempFileGuard;
+use crate::staging::{StagingKind, StagingLimits, StagingBudget, TempFileGuard};
+use std::sync::Arc;
 
 /// The object-store prefix holding immutable data payloads. Both the
 /// commit path (writes) and this salvage path (reads) share the
@@ -114,6 +115,20 @@ pub fn salvage_all_data(
     objects: &dyn ObjectStore,
     sink: &mut dyn SalvageSink,
 ) -> Result<SalvageReport> {
+    // No explicit budget supplied: salvage runs under the bounded
+    // default limits in its own managed directory.
+    let staging = StagingBudget::open(StagingLimits::default())
+        .map_err(|e| Error::Storage(format!("salvage staging dir: {e}")))?;
+    salvage_all_data_with_staging(objects, &staging, sink)
+}
+
+/// Same, under a caller-supplied staging budget (the engine passes the
+/// configured `[staging]` budget; tests pass isolated ones).
+pub fn salvage_all_data_with_staging(
+    objects: &dyn ObjectStore,
+    staging: &Arc<StagingBudget>,
+    sink: &mut dyn SalvageSink,
+) -> Result<SalvageReport> {
     let mut report = SalvageReport::default();
     let mut token: Option<String> = None;
     loop {
@@ -121,7 +136,7 @@ pub fn salvage_all_data(
         for info in &page.items {
             report.scanned += 1;
             let key = info.key.clone();
-            match salvage_one(objects, &key, sink) {
+            match salvage_one(objects, staging, &key, sink) {
                 Ok(item) => report.recovered.push(item),
                 Err(reason) => report.rejected.push(RejectedObject { locator: key, reason }),
             }
@@ -140,6 +155,7 @@ pub fn salvage_all_data(
 /// bytes ever accumulate here. Nothing is written back to the store.
 fn salvage_one(
     objects: &dyn ObjectStore,
+    staging: &Arc<StagingBudget>,
     key: &str,
     sink: &mut dyn SalvageSink,
 ) -> std::result::Result<SalvagedItem, String> {
@@ -148,7 +164,21 @@ fn salvage_one(
         Error::Storage(m) => format!("unreadable: {m}"),
         other => format!("unreadable: {other}"),
     })?;
-    let mut staged = TempFileGuard::create().map_err(|e| format!("staging file: {e}"))?;
+    // S4.25: admission from the backend-reported object length before
+    // anything is staged; corrected to the decoded payload length below.
+    let expected = sg
+        .len
+        .checked_sub((crate::vnext::envelope::HEADER_LEN + crate::vnext::envelope::FOOTER_LEN) as u64)
+        .unwrap_or(0);
+    let mut res = staging
+        .try_reserve(expected, StagingKind::Read, key)
+        .map_err(|e| format!("staging admission: {e}"))?;
+    let mut staged = match TempFileGuard::create_in(staging.dir()) {
+        Ok(g) => g,
+        Err(e) => {
+            return Err(format!("staging file: {e}"));
+        }
+    };
     let item = {
         let mut file = staged.file.take().expect("fresh guard holds a file");
         use std::io::Write as _;
@@ -169,6 +199,7 @@ fn salvage_one(
         // anything unexpected: reported, never returned as file content.
         return Err(format!("not a data object (kind {})", item.kind as u8));
     }
+    res.shrink(item.payload_len);
     let mut file = staged.file.take().expect("guard still holds a file");
     use std::io::Seek as _;
     file.rewind().map_err(|e| format!("staging rewind: {e}"))?;

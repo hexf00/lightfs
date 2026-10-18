@@ -35,6 +35,39 @@ pub struct Config {
     /// = `lightfs backup` refuses and `gc` refuses to delete any object.
     #[serde(default)]
     pub backup: BackupSection,
+    /// S4.25: staging-disk admission for verified full reads and mounted
+    /// write spool files (one budget per process, shared by both).
+    #[serde(default)]
+    pub staging: StagingSection,
+}
+
+/// S4.25 staging-disk knobs. Bounded by default.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct StagingSection {
+    /// Ceiling on staging-disk bytes ONE process may hold at once:
+    /// verified full-read staging files plus mounted-write spool files.
+    /// A request that cannot fit fails with an explicit capacity error
+    /// (ENOSPC at the FS boundary); staged data is never evicted to make
+    /// room. 0 = unbounded (explicit opt-out, discouraged).
+    pub budget_bytes: u64,
+    /// Ceiling per staged object (read) or per write session (spool).
+    /// 0 = no per-object cap.
+    pub max_object_bytes: u64,
+    /// Root directory for the managed per-process staging directory
+    /// (flock-guarded; dead processes' directories are swept at startup).
+    /// Empty = the system temp directory.
+    pub dir: String,
+}
+
+impl Default for StagingSection {
+    fn default() -> Self {
+        Self {
+            budget_bytes: 2 * 1024 * 1024 * 1024,
+            max_object_bytes: 0,
+            dir: String::new(),
+        }
+    }
 }
 
 /// S3.1 pack prototype knobs. All off/neutral by default.
@@ -264,6 +297,7 @@ impl Config {
                 writeback: WritebackSection::default(),
                 policy: None,
                 backup: Default::default(),
+                staging: Default::default(),
             }),
         }
     }

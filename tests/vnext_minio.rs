@@ -874,13 +874,13 @@ fn s423_damaged_and_legacy_objects_fail_closed() {
 
     let e1 = eng
         .core
-        .read_full_verified("objects/zz-damaged.data", "")
+        .read_full_verified("objects/zz-damaged.data", "", None)
         .expect_err("damaged object refused")
         .to_string();
     assert!(e1.contains("sha256 footer mismatch"), "{e1}");
     let e2 = eng
         .core
-        .read_full_verified("objects/zz-legacy.data", "")
+        .read_full_verified("objects/zz-legacy.data", "", None)
         .expect_err("legacy object refused")
         .to_string();
     assert!(e2.contains("unsupported envelope format LF1"), "{e2}");
@@ -908,11 +908,28 @@ fn s423_damaged_and_legacy_objects_fail_closed() {
 // ---- S4.24: bounded full reads, read_at, salvage streaming, temp hygiene ----
 
 fn temp_residue() -> usize {
-    std::fs::read_dir(std::env::temp_dir())
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with("lightfs-read-"))
-        .count()
+    // staging files live either in a managed `lightfs-staging-*` subdir
+    // (engine/core path) or at the temp root (headless salvage budgets)
+    let root = std::env::temp_dir();
+    let mut n = 0;
+    if let Ok(rd) = std::fs::read_dir(&root) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with("lightfs-staging-file-") {
+                n += 1;
+            } else if name.starts_with("lightfs-staging-") {
+                if let Ok(sub) = std::fs::read_dir(e.path()) {
+                    n += sub
+                        .flatten()
+                        .filter(|x| {
+                            x.file_name().to_string_lossy().starts_with("lightfs-staging-file-")
+                        })
+                        .count();
+                }
+            }
+        }
+    }
+    n
 }
 
 #[test]
@@ -1033,7 +1050,9 @@ fn s424_empty_file_and_dropped_reader_cleanup() {
     let eng = lightfs::engine::open_engine(&cfg).unwrap();
     let e0 = spool_file("s424e0", 0);
     write_spooled(&eng.core, "/empty", &e0, true, None);
-    // empty file: recorded_size == 0 -> range path, empty answer
+    // empty file (S4.25 §一): the whole-file read now FETCHES and fully
+    // verifies the 52-byte object — success still looks identical from
+    // outside (empty answer), but corruption behind it can no longer hide
     let (mut rd, len) = eng.core.open_read("/empty", 0, 16).unwrap();
     let mut buf = Vec::new();
     std::io::Read::read_to_end(&mut rd, &mut buf).unwrap();
@@ -1050,6 +1069,70 @@ fn s424_empty_file_and_dropped_reader_cleanup() {
     drop(rd);
     std::thread::sleep(std::time::Duration::from_millis(50));
     assert!(temp_residue() <= before, "staging file must be deleted on drop");
+}
+
+#[test]
+fn s425_empty_file_object_is_verified_not_assumed() {
+    let cfg = fresh("s425empty");
+    let eng = lightfs::engine::open_engine(&cfg).unwrap();
+    // zero-byte file through the streamed write path: the object exists
+    // (52 envelope bytes, empty payload) even though logical size is 0
+    let e0 = spool_file("s425e0", 0);
+    write_spooled(&eng.core, "/empty", &e0, true, None);
+    let (mut rd, len) = eng.core.open_read("/empty", 0, 4096).unwrap();
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut rd, &mut buf).unwrap();
+    assert_eq!((len, buf.len()), (0, 0), "success shape unchanged");
+    drop(rd);
+
+    use lightfs::object_store::ObjectStore as _;
+    let raw = lightfs::object_store::s3::S3ObjectStore::new(cfg.s3_config()).unwrap();
+    let key = {
+        let known = eng.core.store().known_objects().unwrap();
+        known.iter().find(|(_, l)| l.ends_with(".data")).unwrap().1.clone()
+    };
+
+    // corrupt empty object -> named failure, never a silent empty answer
+    // (re-PUT changes the validator, so the same-response etag arm fires
+    // first; the footer arm is pinned by the envelope decode tests)
+    let cur = raw.get(&key, None).unwrap();
+    let mut damaged = cur.data.clone();
+    let mid = damaged.len() - 1; // inside the footer of a 52-byte object
+    damaged[mid] ^= 0xff;
+    raw.put(&key, &damaged).unwrap();
+    let err = eng
+        .core
+        .open_read("/empty", 0, 16)
+        .err()
+        .expect("corrupt empty object must fail")
+        .to_string();
+    assert!(
+        err.contains("recorded etag") || err.contains("sha256 footer mismatch"),
+        "{err}"
+    );
+
+    // missing object -> named failure too
+    raw.delete(&key).unwrap();
+    let err = eng
+        .core
+        .read("/empty", 0, 16)
+        .err()
+        .expect("missing empty object must fail")
+        .to_string();
+    assert!(!err.is_empty(), "{err}");
+
+    // explicit zero-length read stays request-free: it succeeds even with
+    // the object GONE (no fetch happens, none needed)
+    let (mut rd, len) = eng.core.open_read("/empty", 0, 0).unwrap();
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut rd, &mut buf).unwrap();
+    assert_eq!((len, buf.len()), (0, 0));
+    drop(rd);
+
+    // reads past EOF (offset > 0) stay legitimately empty, no request —
+    // they succeed even with the object gone
+    let data = eng.core.read("/empty", 16, 16).unwrap();
+    assert!(data.is_empty());
 }
 
 #[test]
@@ -1093,4 +1176,114 @@ fn s424_salvage_streaming_many_objects_bounded_report() {
     assert!(rep.recovered.iter().all(|i| i.payload_len == 64 * 1024));
     std::thread::sleep(std::time::Duration::from_millis(50));
     assert!(temp_residue() <= before, "salvage staging files must be cleaned");
+}
+
+// ---- S4.25 §二: staging admission on the read path ----
+
+#[test]
+fn s425_staging_budget_exhaustion_is_named_and_leaves_no_residue() {
+    let mut cfg = fresh("s425budget");
+    cfg.staging.budget_bytes = 1024 * 1024; // 1 MiB total
+    let eng = lightfs::engine::open_engine(&cfg).unwrap();
+    let big = spool_file("s425big", 4 * 1024 * 1024);
+    write_spooled(&eng.core, "/big.bin", &big, true, None);
+    let before = temp_residue();
+    let err = eng
+        .core
+        .open_read("/big.bin", 0, 4 * 1024 * 1024)
+        .err()
+        .expect("4 MiB cannot fit a 1 MiB budget")
+        .to_string();
+    assert!(err.contains("capacity"), "{err}");
+    assert_eq!(temp_residue(), before, "refused admission stages nothing");
+    assert_eq!(eng.core.staging.stats().used, 0, "refusal must not leak budget");
+    // partial reads go through the RANGE path (no staging file) and keep
+    // working within the same budget
+    let data = eng.core.read("/big.bin", 0, 512).unwrap();
+    check_pattern(&data, 0);
+}
+
+#[test]
+fn s425_slow_reader_holds_budget_until_drop() {
+    let mut cfg = fresh("s425slow");
+    cfg.staging.budget_bytes = 8 * 1024 * 1024;
+    let eng = lightfs::engine::open_engine(&cfg).unwrap();
+    let big = spool_file("s425slow", 8 * 1024 * 1024);
+    write_spooled(&eng.core, "/slow.bin", &big, true, None);
+    // the slow consumer: full-read reader acquired, NOT consumed
+    let (mut rd, len) = eng.core.open_read("/slow.bin", 0, 8 * 1024 * 1024).unwrap();
+    assert_eq!(len, 8 * 1024 * 1024);
+    assert_eq!(eng.core.staging.stats().used, 8 * 1024 * 1024);
+    assert_eq!(eng.core.staging.stats().active_reads, 1);
+    // budget is full: another whole-file read is refused BY NAME
+    let err = eng
+        .core
+        .open_read("/slow.bin", 0, 8 * 1024 * 1024)
+        .err()
+        .expect("budget held by the slow reader")
+        .to_string();
+    assert!(err.contains("capacity"), "{err}");
+    // a range read of the same file is unaffected (no staging file)
+    assert!(eng.core.read("/slow.bin", 0, 16).is_ok());
+    // cancellation releases the bytes
+    drop(rd);
+    assert_eq!(eng.core.staging.stats().used, 0);
+    assert_eq!(eng.core.staging.stats().active_reads, 0);
+    let (mut rd2, _) = eng.core.open_read("/slow.bin", 0, 8 * 1024 * 1024).unwrap();
+    drop(rd2);
+    assert_eq!(eng.core.staging.stats().used, 0);
+}
+
+#[test]
+fn s425_failed_verification_releases_budget() {
+    let mut cfg = fresh("s425fail");
+    cfg.staging.budget_bytes = 8 * 1024 * 1024;
+    let eng = lightfs::engine::open_engine(&cfg).unwrap();
+    let big = spool_file("s425fail", 4 * 1024 * 1024);
+    write_spooled(&eng.core, "/f.bin", &big, true, None);
+    use lightfs::object_store::ObjectStore as _;
+    let key = {
+        let known = eng.core.store().known_objects().unwrap();
+        known.iter().find(|(_, l)| l.ends_with(".data")).unwrap().1.clone()
+    };
+    let raw = lightfs::object_store::s3::S3ObjectStore::new(cfg.s3_config()).unwrap();
+    let cur = raw.get(&key, None).unwrap();
+    let mut damaged = cur.data.clone();
+    let last = damaged.len() - 1;
+    damaged[last] ^= 0xff;
+    raw.put(&key, &damaged).unwrap();
+    let before = temp_residue();
+    let err = eng
+        .core
+        .open_read("/f.bin", 0, 4 * 1024 * 1024)
+        .err()
+        .expect("damaged object must fail")
+        .to_string();
+    assert!(err.contains("recorded etag") || err.contains("sha256 footer mismatch"), "{err}");
+    assert_eq!(temp_residue(), before, "failed verification leaves no staging file");
+    assert_eq!(eng.core.staging.stats().used, 0, "failed read must release its reservation");
+}
+
+#[test]
+fn s425_per_object_cap_refuses_before_fetch() {
+    let mut cfg = fresh("s425cap");
+    cfg.staging.max_object_bytes = 1024 * 1024; // 1 MiB per object
+    let eng = lightfs::engine::open_engine(&cfg).unwrap();
+    let big = spool_file("s425cap", 4 * 1024 * 1024);
+    write_spooled(&eng.core, "/c.bin", &big, true, None);
+    let refused_before = eng.core.staging.stats().refused_total;
+    let err = eng
+        .core
+        .open_read("/c.bin", 0, 4 * 1024 * 1024)
+        .err()
+        .expect("4 MiB object exceeds the 1 MiB per-object cap")
+        .to_string();
+    assert!(err.contains("per-object cap"), "{err}");
+    assert_eq!(eng.core.staging.stats().refused_total, refused_before + 1);
+    // small objects sail through
+    let small = spool_file("s425small", 4096);
+    write_spooled(&eng.core, "/s.bin", &small, true, None);
+    let (mut rd, len) = eng.core.open_read("/s.bin", 0, 4096).unwrap();
+    assert_eq!(len, 4096);
+    drop(rd);
 }
