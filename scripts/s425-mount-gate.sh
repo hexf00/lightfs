@@ -219,10 +219,14 @@ note "D: PASSED"
 
 # ---- [E] concurrent write sessions + staging observation ----
 note "E: concurrent sessions and staging gauges"
+dd_pids=()
 for i in 1 2 3 4; do
   ( dd if=/dev/urandom of="$MNT/dir/conc-$i.bin" bs=1M count=8 iflag=fullblock 2>/dev/null ) &
+  dd_pids+=($!)
 done
-wait
+# wait ONLY the dd workers: the server/mount are background children of
+# this script too, and a bare `wait` would block on them forever
+wait "${dd_pids[@]}"
 for i in 1 2 3 4; do [[ -s "$MNT/dir/conc-$i.bin" ]] || fail "concurrent write $i"; done
 echo "  staging_used=$(staging_used) refused=$(staging_refused)"
 note "E: PASSED"
