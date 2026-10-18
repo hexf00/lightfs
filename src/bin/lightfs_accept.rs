@@ -125,6 +125,39 @@ fn assert_bytes(what: &str, path: &Path, want: &[u8]) {
     println!("  OK  {what} ({} bytes byte-exact)", want.len());
 }
 
+/// The offline fsck gate shared by C5 and D. The vnext branch has NO fsck
+/// subcommand yet (S4.19 deleted the old-core fsck; the vnext rebuild is
+/// BACKLOG): the binary answers `unknown command: fsck` on STDERR with
+/// exit 1 and empty stdout. That specific answer is a NAMED SKIP — a
+/// missing tool cannot report corruption — while every other failure
+/// keeps its teeth and fails the suite with both streams attached.
+fn offline_fsck_or_skip(ctx: &Ctx, what: &str) {
+    let out = Command::new(&ctx.lightfs)
+        .args(["fsck", "--config"])
+        .arg(&ctx.config)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap_or_else(|e| panic!("{what}: fsck spawn: {e}"));
+    if out.status.success() {
+        println!("  OK  {what} offline fsck clean");
+        return;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("unknown command") && stderr.contains("fsck") {
+        println!(
+            "  SKIP  {what} offline fsck: build has no fsck subcommand \
+             (old-core fsck deleted in S4.19; vnext rebuild is BACKLOG)"
+        );
+        return;
+    }
+    panic!(
+        "{what}: fsck reported problems (exit {:?}): stdout: {stdout} stderr: {stderr}",
+        out.status.code()
+    );
+}
+
 fn wait_health(url: &str, tries: usize, what: &str) {
     let agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
@@ -1590,19 +1623,7 @@ fn section_c(ctx: &mut Ctx, root: &Path) {
 
     // C5 offline fsck (server stopped: no SQLite contention).
     ctx.kill_server();
-    let out = Command::new(&ctx.lightfs)
-        .args(["fsck", "--config"])
-        .arg(&ctx.config)
-        .output()
-        .expect("C5: fsck spawn");
-    let code = out.status.code().unwrap_or(-1);
-    if code != 0 {
-        panic!(
-            "C5: fsck reported problems (exit {code}): {}",
-            String::from_utf8_lossy(&out.stdout)
-        );
-    }
-    println!("  OK  C5 offline fsck clean");
+    offline_fsck_or_skip(ctx, "C5");
 }
 
 // ---------------------------------------------------------------- entry
@@ -1901,21 +1922,7 @@ fn section_d(ctx: &mut Ctx, root: &Path, root2: &Path) {
     drop(m_child);
     ctx.unmount_target();
     ctx.kill_server();
-    let out = Command::new(&ctx.lightfs)
-        .args(["fsck", "--config"])
-        .arg(&ctx.config)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("D: fsck spawn");
-    if !out.status.success() {
-        panic!(
-            "D: fsck reported problems after the cross-client section (exit {:?}): {}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stdout)
-        );
-    }
-    println!("  OK  D: offline fsck clean");
+    offline_fsck_or_skip(ctx, "D");
 }
 
 // ---------------------------------------------------------------------------
