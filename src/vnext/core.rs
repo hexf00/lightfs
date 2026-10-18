@@ -17,7 +17,7 @@ use rusqlite::Connection;
 
 use crate::error::{Error, Result};
 use crate::metadata::{Node, NodeKind};
-use crate::object_store::{ListPage, ObjectData, ObjectInfo, ObjectStore, Range};
+use crate::object_store::{ListPage, ObjectData, ObjectInfo, ObjectStore, Range, StreamedGet};
 use crate::vnext::envelope::{self, ObjKind};
 use crate::vnext::store::{CommitRow, Entry, FileVersionRow, StorageRef, Store};
 
@@ -92,11 +92,11 @@ impl ObjectStore for CountedObjects {
         self.m.bytes_read.fetch_add(out.data.len() as u64, Ordering::Relaxed);
         Ok(out)
     }
-    fn get_stream(&self, key: &str, range: Option<Range>) -> Result<(Box<dyn Read + Send>, u64)> {
+    fn get_stream(&self, key: &str, range: Option<Range>) -> Result<StreamedGet> {
         self.m.s3_get.fetch_add(1, Ordering::Relaxed);
-        let (r, len) = self.inner.get_stream(key, range)?;
-        self.m.bytes_read.fetch_add(len, Ordering::Relaxed);
-        Ok((r, len))
+        let out = self.inner.get_stream(key, range)?;
+        self.m.bytes_read.fetch_add(out.len, Ordering::Relaxed);
+        Ok(out)
     }
     fn head(&self, key: &str) -> Result<ObjectInfo> {
         self.m.s3_head.fetch_add(1, Ordering::Relaxed);
@@ -762,21 +762,68 @@ impl Core {
         Ok(body.data)
     }
 
-    /// Full read with full digest verification: a damaged object is
-    /// refused, never served (read-your-bytes integrity).
+    /// Full read with full digest verification, streamed (S4.24): ONE
+    /// GET whose own response metadata carries the validator, a
+    /// single-pass decode into a caller-visible `Vec`. O(file) memory AT
+    /// THIS BOUNDARY by explicit choice of the Vec return — the server's
+    /// full-read path uses [`Self::read_full_verified_stream`] instead
+    /// and never materializes the payload in the heap.
     pub fn read_full_verified(&self, key: &str, recorded_etag: &str) -> Result<Vec<u8>> {
-        let obj = self.objects.get(key, None)?;
-        if !recorded_etag.is_empty() && obj.info.etag != recorded_etag {
+        let mut vo = self.read_full_verified_stream(key, recorded_etag)?;
+        let mut out = Vec::with_capacity(vo.payload_len as usize);
+        vo.reader.read_to_end(&mut out)?;
+        Ok(out)
+    }
+
+    /// Verified full read, bounded memory (S4.24): the object is
+    /// stream-decoded into a PRIVATE temp file and published only after
+    /// the footer verified — the returned reader is the validated file.
+    /// The validator comparison uses the etag carried by the SAME GET
+    /// response (no HEAD, no two-request version assumption); an empty
+    /// recorded etag skips the comparison, exactly as before.
+    ///
+    /// Temp cost: one file of `payload_len` bytes in `std::env::temp_dir`
+    /// for the lifetime of the returned value; deleted on drop, on any
+    /// verification failure, on short read, on IO error, on cancellation.
+    pub fn read_full_verified_stream(
+        &self,
+        key: &str,
+        recorded_etag: &str,
+    ) -> Result<VerifiedObjectRead> {
+        let mut sg = self.objects.get_stream(key, None)?;
+        if !recorded_etag.is_empty() && sg.etag != recorded_etag {
             return Err(Error::ObjectCorrupt(format!(
                 "{key}: recorded etag {recorded_etag} != observed {}",
-                obj.info.etag
+                sg.etag
             )));
         }
-        let (kind, content) = envelope::open(&obj.data)?;
-        if kind != ObjKind::Data {
-            return Err(Error::ObjectCorrupt(format!("{key}: not a data object")));
-        }
-        Ok(content)
+        let mut staged = TempFileGuard::create()
+            .map_err(|e| Error::Storage(format!("staging file: {e}")))?;
+        let decoded = {
+            use std::io::Write as _;
+            let mut file = staged.file.take().expect("fresh guard holds a file");
+            let d = envelope::decode_stream(&mut sg.reader, &mut file, Some(ObjKind::Data));
+            // hand the file back regardless; flush only on success
+            let flushed = match &d {
+                Ok(_) => file.flush().err(),
+                Err(_) => None,
+            };
+            staged.file = Some(file);
+            match (d, flushed) {
+                (Ok(d), None) => Ok(d),
+                (Err(e), _) => Err(e),
+                (Ok(_), Some(io)) => Err(Error::Io(io.to_string())),
+            }
+        }?;
+        let payload_len = decoded.payload_len;
+        let mut file = staged.file.take().expect("guard still holds a file");
+        use std::io::Seek;
+        file.rewind()?;
+        Ok(VerifiedObjectRead {
+            reader: file,
+            payload_len,
+            guard: staged,
+        })
     }
 
     pub fn read(&self, path: &str, offset: u64, size: u64) -> Result<Vec<u8>> {
@@ -835,15 +882,38 @@ impl Core {
         Ok(&r.locator)
     }
 
+    /// Server read entry (S4.24 routing): a request that covers the
+    /// WHOLE file from offset 0 is served from the footer-verified
+    /// streamed decode (bounded memory, content published only after the
+    /// checksum passed). Range requests keep the exact range contract —
+    /// same GET shapes, same offset math, no footer fetch, O(range)
+    /// bytes; their payload integrity rests on the recorded etag exactly
+    /// as before.
     pub fn open_read(
         &self,
         path: &str,
         offset: u64,
         size: u64,
     ) -> Result<(Box<dyn std::io::Read + Send>, u64)> {
-        let data = self.read(path, offset, size)?;
-        let len = data.len() as u64;
-        Ok((Box::new(std::io::Cursor::new(data)), len))
+        let (entry, _) = self.resolve_follow(path)?;
+        if entry.k != "file" {
+            return Err(Error::KindMismatch {
+                path: path.to_string(),
+                expected: "file",
+                actual: entry.k,
+            });
+        }
+        let r = entry
+            .o
+            .ok_or_else(|| Error::ObjectMissing(format!("{path}: file has no content yet")))?;
+        let key = self.check_ref(&r)?;
+        self.open_read_ref(
+            key,
+            entry.e.as_deref().unwrap_or(""),
+            entry.s.max(0) as u64,
+            offset,
+            size,
+        )
     }
 
     pub fn open_read_by_id(
@@ -852,7 +922,39 @@ impl Core {
         offset: u64,
         size: u64,
     ) -> Result<(Box<dyn std::io::Read + Send>, u64)> {
-        let data = self.read_by_id(file_id, offset, size)?;
+        let entry = self.locate_by_id(file_id, "")?;
+        let r = entry
+            .o
+            .ok_or_else(|| Error::ObjectMissing(format!("file {file_id}: no content yet")))?;
+        let key = self.check_ref(&r)?;
+        self.open_read_ref(
+            key,
+            entry.e.as_deref().unwrap_or(""),
+            entry.s.max(0) as u64,
+            offset,
+            size,
+        )
+    }
+
+    /// Shared decision body for both open_read variants.
+    fn open_read_ref(
+        &self,
+        key: &str,
+        recorded_etag: &str,
+        recorded_size: u64,
+        offset: u64,
+        size: u64,
+    ) -> Result<(Box<dyn std::io::Read + Send>, u64)> {
+        if offset == 0 && recorded_size > 0 && size >= recorded_size {
+            // WHOLE-file request: one full GET (the range path fetched the
+            // same bytes anyway), footer verified BEFORE anything is
+            // served, streamed out of the validated staging file. Same
+            // request count as before; 32 more bytes on the wire.
+            let vo = self.read_full_verified_stream(key, recorded_etag)?;
+            let len = vo.payload_len;
+            return Ok((Box::new(vo), len));
+        }
+        let data = self.read_range_verified(key, recorded_etag, recorded_size, offset, size)?;
         let len = data.len() as u64;
         Ok((Box::new(std::io::Cursor::new(data)), len))
     }
@@ -1553,11 +1655,23 @@ impl Core {
             .ok_or_else(|| Error::ObjectMissing(format!("{path}: no content at this commit")))?;
         let key = self.check_ref(&r)?;
         // Full verified read, then slice: pinned history must be
-        // byte-exact, so the digest is always checked here.
-        let full = self.read_full_verified(key, entry.e.as_deref().unwrap_or(""))?;
-        let start = (offset as usize).min(full.len());
-        let end = (start + size as usize).min(full.len());
-        Ok(full[start..end].to_vec())
+        // byte-exact, so the footer digest is ALWAYS checked here — the
+        // range is carved out of the verified staging file AFTER
+        // validation, never before (S4.24: same semantics, bounded
+        // memory). Honest cost trade: memory is now O(range), but the
+        // FULL object still travels over the network because the
+        // checksum needs every byte. Whether pinned reads may downgrade
+        // to ranged GET + backend validator is a separate correctness
+        // contract decision, deliberately NOT made here.
+        let mut vo = self.read_full_verified_stream(key, entry.e.as_deref().unwrap_or(""))?;
+        let payload_len = vo.payload_len;
+        let start = offset.min(payload_len);
+        let end = start.saturating_add(size).min(payload_len);
+        use std::io::{Read as _, Seek, SeekFrom};
+        vo.reader.seek(SeekFrom::Start(start))?;
+        let mut buf = vec![0u8; (end - start) as usize];
+        vo.reader.read_exact(&mut buf)?;
+        Ok(buf)
     }
 }
 
@@ -1588,4 +1702,80 @@ impl WriteHandle {
         Ok(data.len())
     }
 
+}
+
+/// A footer-verified full object staged in a private temp file (S4.24).
+/// The reader is the VALIDATED file (positioned at 0); the payload length
+/// is the decoded logical size. Dropping this value deletes the file.
+pub struct VerifiedObjectRead {
+    pub reader: std::fs::File,
+    pub payload_len: u64,
+    /// Held for Drop: deletes the staging file when the read is consumed
+    /// or cancelled. Never read directly.
+    #[allow(dead_code)]
+    pub(crate) guard: TempFileGuard,
+}
+
+impl std::io::Read for VerifiedObjectRead {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.reader.read(buf)
+    }
+}
+
+impl std::io::Seek for VerifiedObjectRead {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.reader.seek(pos)
+    }
+}
+
+/// Private staging file, deleted on EVERY exit path (success consumption,
+/// verification failure, short read, IO error, cancellation-by-drop).
+/// Failure to remove is surfaced, never silent (it holds user data).
+pub(crate) struct TempFileGuard {
+    path: std::path::PathBuf,
+    pub file: Option<std::fs::File>,
+}
+
+impl TempFileGuard {
+    pub(crate) fn create() -> std::io::Result<TempFileGuard> {
+        let dir = std::env::temp_dir();
+        for _ in 0..8 {
+            let p = dir.join(format!(
+                "lightfs-read-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            let mut f = std::fs::OpenOptions::new();
+            f.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                f.mode(0o600);
+            }
+            match f.open(&p) {
+                Ok(file) => {
+                    return Ok(TempFileGuard { path: p, file: Some(file) });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::other("could not create staging file"))
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "lightfs: WARNING failed to remove staging file {}: {e}",
+                    self.path.display()
+                );
+            }
+        }
+    }
 }

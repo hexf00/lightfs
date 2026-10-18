@@ -270,22 +270,56 @@ deduplication):**
 | SigV4 payload hash + HMAC-SHA256 | `sigv4.rs` / HTTP client | request signing (transport), per request | HTTP layer |
 | tree/commit content hashes | — | do not exist: SQLite is the sole metadata authority (S4.20); `Tree/Commit/Ref` kinds decode as legacy identifiers only | — |
 
-**Read guarantees by shape.** Full read: header fields, physical
-length and footer checksum all verified — a damaged object is refused,
-never served. Range read: ONE ranged GET from offset 0 (header +
-requested window; the footer is not fetched and adds NO request);
-deeper ranges: header GET + window GET; payload integrity rests on the
-recorded etag comparison. Pinned/past-commit reads: always full-verified.
-Empty objects decode and verify like any other. Unknown format/encoder/
-cipher/checksum id, non-canonical header, truncated payload, missing or
-wrong footer: all fail closed with named errors.
+**Read guarantees by shape.** FULL read (whole file from offset 0,
+server/RPC entry): ONE full-object GET whose own response carries the
+validator; the object is stream-decoded (header verified, payload
+through a bounded buffer, incremental `SHA-256(header||payload)`) into
+a PRIVATE staging file and PUBLISHED to the caller only after the
+footer verified — the served reader IS the validated file. No extra
+HEAD; the etag comparison uses the same GET response (never a second
+request, never a two-version assumption). Range read (partial window
+or non-zero offset): ONE ranged GET from offset 0 (header + requested
+window; the footer is not fetched and adds NO request), deeper ranges:
+header GET + window GET; payload integrity rests on the recorded etag
+comparison, unchanged. Pinned/past-commit reads (`read_at`): ALWAYS
+full-verified — the range is carved out of the verified staging file
+AFTER validation; memory is O(range) but the FULL object still
+travels the network because the checksum needs every byte (downgrading
+pinned reads to ranged GET + validator would be a separate correctness
+contract decision, deliberately not made). Empty objects decode and
+verify like any other. Unknown format/encoder/cipher/checksum id,
+non-canonical header, truncated payload, missing or wrong footer,
+trailing bytes, forged/overflowing lengths: all fail closed with named
+errors (checked arithmetic in the decoder; nothing allocates by
+declared length).
 
-**Memory bounds (measured, S4.23 report).** `write_stream` (the server
-RPC path): staging file on disk → single-pass streamed encode →
-`put_stream` (single PUT ≤8 MiB objects, 8 MiB parts above) → server
-upload-window peak RSS is FLAT in file size (~31-40 MB at 256 MiB, vs
-~277 MB linear on the pre-streaming build). `commit_write` (interactive
-session path) still holds the session buffer: O(file size), documented,
-NOT claimed bounded. Full reads (both paths) fetch and verify the whole
-object: O(file size) by contract — the streaming-read question is a
-separate, unclaimed task.
+**The staging trade (S4.24, measured).** Full reads trade heap for
+disk: the verified object occupies a temp file of `payload_len` bytes
+in `std::env::temp_dir` for the lifetime of the served reader (max
+concurrent full reads × file size), then it is deleted — on drop, on
+any verification failure, on short read, on IO error, on cancellation;
+failed verification never publishes bytes and never leaves residue.
+Wall-clock cost is real and reported, not hidden: local full-read
+benchmarks pay ~0.7 ms per small read (file lifecycle) and roughly
+double for a 256 MiB read, with request counts byte-identical to the
+pre-staging build. Peak server RSS for a full 256 MiB read drops from
+~333 MB (whole-object Vec + payload copy) to ~5.4 MB flat, and salvage
+of 384 MiB across many objects peaks at ~50 MB with a hashing consumer.
+
+**Salvage output (S4.24).** `salvage_all_data` is per-object streaming:
+each object is decoded and verified into a private staging file and
+handed once to a consumer sink (`SalvageSink::verified(locator, len,
+reader)`) — only metadata survives in the report (locator, payload
+length, rejection reasons); payload bytes are never accumulated.
+Consumer IO failures are recorded per-object; the staging file is
+deleted on every exit path; nothing is ever written back to the store.
+The pass still recovers CONTENT candidates only — no paths, no
+directory structure, no commit history, no adopt tool.
+
+**Memory bounds (measured).** `write_stream` (the server RPC path):
+staging file on disk → single-pass streamed encode → `put_stream`
+(single PUT ≤8 MiB objects, 8 MiB parts above) → server upload-window
+peak RSS is FLAT in file size (~31-40 MB at 256 MiB, vs ~277 MB linear
+on the pre-streaming build). `commit_write` (interactive session path)
+still holds the session buffer: O(file size), documented, NOT claimed
+bounded. Full reads and salvage are bounded as described above.

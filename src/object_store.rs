@@ -16,6 +16,19 @@ pub struct Range {
     pub len: u64,
 }
 
+/// One streamed GET response (S4.24): body reader + the response's OWN
+/// object metadata + the exact length the reader yields. The metadata is
+/// never fetched separately.
+pub struct StreamedGet {
+    pub reader: Box<dyn Read + Send>,
+    /// Backend validator for THIS response (S3 ETag); empty when the
+    /// backend supplies none. NOT a content hash — validator semantics only.
+    pub etag: String,
+    /// Exact physical byte count the reader will yield (Content-Length /
+    /// Content-Range derived).
+    pub len: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectInfo {
     pub key: String,
@@ -98,10 +111,16 @@ pub trait ObjectStore: Send + Sync {
     /// returns empty data, S3 answers 416) and callers must never rely on
     /// either.
     fn get(&self, key: &str, range: Option<Range>) -> Result<ObjectData>;
-    /// Stream `key` (optionally a range): returns a reader and the exact
-    /// number of bytes it will yield. Bounded memory on the backend side.
-    /// Range semantics as [`ObjectStore::get`].
-    fn get_stream(&self, key: &str, range: Option<Range>) -> Result<(Box<dyn Read + Send>, u64)>;
+    /// Stream `key` (optionally a range): bounded memory on the backend
+    /// side. Range semantics as [`ObjectStore::get`].
+    ///
+    /// Contract (S4.24): the reader, the object's validator (`etag`) and
+    /// the exact physical byte length the reader will yield ALL come from
+    /// the SAME response — no second request, and no HEAD-then-GET
+    /// two-version assumption. A backend that cannot supply an etag for
+    /// this response reports the empty string; callers compare recorded
+    /// validators only against non-empty values.
+    fn get_stream(&self, key: &str, range: Option<Range>) -> Result<StreamedGet>;
     /// Metadata for `key`; a missing key is `Error::ObjectMissing`.
     fn head(&self, key: &str) -> Result<ObjectInfo>;
     /// Presigned GET URL where supported (S3); None otherwise. OPTIONAL

@@ -537,3 +537,198 @@ mod tests {
         assert_eq!(payload_slice(&sealed, 100), &[7u8; 100]);
     }
 }
+
+// ---- streaming decode (S4.24) ----
+
+/// What a successful [`decode_stream`] learned about the object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedObject {
+    pub kind: ObjKind,
+    pub payload_len: u64,
+}
+
+/// Stream-decode a FULL v2 object from `src`: verify the fixed header,
+/// copy payload bytes through a bounded buffer into `sink` while
+/// computing `SHA-256(header || payload)` incrementally, then verify the
+/// footer, the physical length and STRICT EOF (no trailing bytes). Every
+/// failure is a named `Error::ObjectCorrupt` (or the transport's io
+/// error) — damaged objects are never half-delivered as success.
+///
+/// Checked arithmetic throughout: a forged huge `payload_len` overflows
+/// the length math into an explicit corrupt error and, even when it
+/// would not, ends in a short-read error — never a wrap, panic or
+/// oversized allocation (nothing here allocates by length).
+///
+/// PUBLICATION RULE: this function writes payload bytes into `sink` as
+/// they stream, but the CALLER owns what `sink` is. Callers that stage
+/// to a temp file must treat the file as readable only after `Ok`, and
+/// must delete it on any error path (see `Core::read_full_verified_stream`
+/// and the salvage sink for the canonical guards).
+pub fn decode_stream(
+    src: &mut dyn Read,
+    sink: &mut dyn std::io::Write,
+    expected_kind: Option<ObjKind>,
+) -> Result<DecodedObject> {
+    let mut header = [0u8; HEADER_LEN];
+    match src.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Err(corrupt("truncated header", 0));
+        }
+        Err(e) => return Err(e.into()),
+    }
+    let (kind, payload_len) = open_header(&header)?;
+    if let Some(want) = expected_kind {
+        if kind != want {
+            return Err(corrupt(
+                &format!("not the expected object type (kind {})", kind as u8),
+                0,
+            ));
+        }
+    }
+    let expected_physical = (HEADER_LEN as u64)
+        .checked_add(payload_len)
+        .and_then(|v| v.checked_add(FOOTER_LEN as u64))
+        .ok_or_else(|| corrupt("length overflow (forged payload length)", 0))?;
+    let mut hasher = Sha256::new();
+    hasher.update(header);
+    let mut buf = [0u8; 64 * 1024];
+    let mut copied = 0u64;
+    while copied < payload_len {
+        let want = std::cmp::min(buf.len() as u64, payload_len - copied) as usize;
+        let got = src.read(&mut buf[..want])?;
+        if got == 0 {
+            return Err(corrupt(
+                &format!("short read: source ended {} bytes before payload end", payload_len - copied),
+                0,
+            ));
+        }
+        hasher.update(&buf[..got]);
+        sink.write_all(&buf[..got])?;
+        copied += got as u64;
+    }
+    let mut footer = [0u8; FOOTER_LEN];
+    match src.read_exact(&mut footer) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Err(corrupt("truncated footer", 0));
+        }
+        Err(e) => return Err(e.into()),
+    }
+    if hasher.finalize().as_slice() != footer {
+        return Err(corrupt("sha256 footer mismatch (object damaged)", 0));
+    }
+    if copied + HEADER_LEN as u64 + FOOTER_LEN as u64 != expected_physical {
+        return Err(corrupt("physical length inconsistency", 0));
+    }
+    // STRICT EOF: one byte past the declared physical length is damage.
+    let mut extra = [0u8; 1];
+    match src.read(&mut extra) {
+        Ok(0) => {}
+        Ok(_) => return Err(corrupt("trailing bytes after the declared object end", 0)),
+        Err(e) => return Err(e.into()),
+    }
+    Ok(DecodedObject { kind, payload_len })
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+
+    /// Sink that records what was published and can be told to fail.
+    struct RecordingSink {
+        pub written: Arc<Mutex<Vec<u8>>>,
+    }
+    impl std::io::Write for RecordingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn decode_roundtrip_and_publication_semantics() {
+        for size in [0usize, 1, 8 * 1024, 100 * 1024] {
+            let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let sealed = seal(ObjKind::Data, &data);
+            let written = Arc::new(Mutex::new(Vec::new()));
+            let mut sink = RecordingSink { written: written.clone() };
+            let mut src = Cursor::new(&sealed);
+            let d = decode_stream(&mut src, &mut sink, Some(ObjKind::Data)).unwrap();
+            assert_eq!(d.kind, ObjKind::Data);
+            assert_eq!(d.payload_len, size as u64);
+            assert_eq!(&*written.lock().unwrap(), &data, "payload published for size {size}");
+        }
+    }
+
+    #[test]
+    fn decode_fail_closed_matrix() {
+        let sealed = seal(ObjKind::Data, &[7u8; 1000]);
+        let run = |bytes: Vec<u8>| {
+            let written = Arc::new(Mutex::new(Vec::new()));
+            let mut sink = RecordingSink { written };
+            let msg = decode_stream(&mut Cursor::new(bytes), &mut sink, Some(ObjKind::Data))
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            (msg, sink.written.lock().unwrap().len())
+        };
+        // header damage
+        let mut bad = sealed.clone();
+        bad[0] ^= 0xff;
+        assert!(run(bad).0.contains("bad magic"));
+        let mut ver = sealed.clone();
+        ver[4] = 9;
+        assert!(run(ver).0.contains("unsupported format version"));
+        let mut algo = sealed.clone();
+        algo[8] = 5;
+        assert!(run(algo).0.contains("checksum algorithm"));
+        // payload damage: sink saw bytes (publication is the caller's
+        // rule) but the verdict is a named corruption
+        let mut damaged = sealed.clone();
+        damaged[500] ^= 0xff;
+        let (msg, written) = run(damaged);
+        assert!(msg.contains("sha256 footer mismatch"), "{msg}");
+        assert_eq!(written, 1000, "payload streamed before the verdict");
+        // footer flip / truncations
+        let mut foot = sealed.clone();
+        let last = foot.len() - 1;
+        foot[last] ^= 0xff;
+        assert!(run(foot).0.contains("sha256 footer mismatch"));
+        assert!(run(sealed[..sealed.len() - 10].to_vec()).0.contains("truncated footer"));
+        assert!(run(sealed[..HEADER_LEN + 40].to_vec()).0.contains("short read"));
+        assert!(run(sealed[..10].to_vec()).0.contains("truncated header"));
+        // trailing garbage after the declared physical end
+        let mut extra = sealed.clone();
+        extra.push(1);
+        assert!(run(extra).0.contains("trailing bytes"));
+        // forged huge payload length: no wrap, no giant allocation, named error
+        let mut huge = sealed.clone();
+        huge[12..20].copy_from_slice(&u64::MAX.to_le_bytes());
+        let (msg, _) = run(huge);
+        assert!(msg.contains("length overflow"), "{msg}");
+        let mut big = sealed.clone();
+        big[12..20].copy_from_slice(&(1u64 << 40).to_le_bytes());
+        assert!(run(big).0.contains("short read"), "1 TiB declared, 1 KiB supplied");
+        // kind mismatch is a named refusal
+        let mut src = Cursor::new(&sealed);
+        let mut sink = RecordingSink { written: Arc::new(Mutex::new(Vec::new())) };
+        assert!(decode_stream(&mut src, &mut sink, Some(ObjKind::Namespace)).is_err());
+    }
+
+    #[test]
+    fn decode_stream_equals_open_output() {
+        let data: Vec<u8> = (0..50_000u32).map(|i| (i % 249) as u8).collect();
+        let sealed = seal(ObjKind::Data, &data);
+        let (_, via_open) = open(&sealed).unwrap();
+        let mut sink = Vec::new();
+        let mut src = Cursor::new(&sealed);
+        decode_stream(&mut src, &mut sink, None).unwrap();
+        assert_eq!(sink, via_open);
+    }
+}

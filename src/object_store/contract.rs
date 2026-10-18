@@ -27,7 +27,6 @@
 //!   bounded-memory or real-network behavior — those need the integration
 //!   harness and fault injection, not a functional suite.
 
-use std::io::Read;
 
 use crate::error::Error;
 use crate::object_store::{ObjectStore, Range};
@@ -203,7 +202,8 @@ fn streaming(store: &dyn ObjectStore, ns: &str) {
 
     // get_stream: the promised length is exact and the bytes complete.
     let kg = format!("{ns}stream/across-buffers");
-    let (mut rd, n) = must("get_stream", store.get_stream(&kg, None));
+    let mut sg = must("get_stream", store.get_stream(&kg, None));
+    let (rd, n) = (sg.reader.as_mut(), sg.len);
     let mut buf = Vec::new();
     rd.read_to_end(&mut buf)
         .unwrap_or_else(|e| panic!("OS-1 contract: get_stream reader failed: {e}"));
@@ -262,10 +262,11 @@ fn ranges(store: &dyn ObjectStore, ns: &str) {
     );
 
     // get_stream honors the same range semantics.
-    let (mut rd, n) = must(
+    let mut sgr = must(
         "get_stream(range)",
         store.get_stream(&k, Some(Range { start: 4, len: 3 })),
     );
+    let (rd, n) = (sgr.reader.as_mut(), sgr.len);
     let mut buf = Vec::new();
     rd.read_to_end(&mut buf)
         .unwrap_or_else(|e| panic!("OS-1 contract: ranged get_stream reader failed: {e}"));

@@ -6,7 +6,7 @@ use std::io::Read;
 use std::sync::Mutex;
 
 use crate::error::{Error, Result};
-use crate::object_store::{ListPage, ObjectData, ObjectInfo, ObjectStore, Range};
+use crate::object_store::{StreamedGet, ListPage, ObjectData, ObjectInfo, ObjectStore, Range};
 
 #[derive(Default)]
 struct Entry {
@@ -168,7 +168,7 @@ impl ObjectStore for MemObjectStore {
         self.put(key, &data)
     }
 
-    fn get_stream(&self, key: &str, range: Option<Range>) -> Result<(Box<dyn Read + Send>, u64)> {
+    fn get_stream(&self, key: &str, range: Option<Range>) -> Result<StreamedGet> {
         let objs = self.objects.lock().unwrap();
         let e = objs
             .get(key)
@@ -187,7 +187,12 @@ impl ObjectStore for MemObjectStore {
         };
         let len = slice.len() as u64;
         let _ = offset;
-        Ok((Box::new(std::io::Cursor::new(slice.to_vec())), len))
+        let etag = e.etag.clone();
+        Ok(StreamedGet {
+            reader: Box::new(std::io::Cursor::new(slice.to_vec())),
+            etag,
+            len,
+        })
     }
 
     fn head(&self, key: &str) -> Result<ObjectInfo> {

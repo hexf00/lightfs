@@ -34,22 +34,53 @@
 use crate::error::{Error, Result};
 use crate::object_store::ObjectStore;
 use crate::vnext::envelope::{self, ObjKind};
+use crate::vnext::core::TempFileGuard;
 
 /// The object-store prefix holding immutable data payloads. Both the
 /// commit path (writes) and this salvage path (reads) share the
 /// constant so a layout change cannot silently orphan salvage.
 pub const DATA_PREFIX: &str = "objects/";
 
-/// One verifiably intact data payload.
+/// One verifiably intact data payload's METADATA (S4.24: the payload
+/// bytes themselves are never accumulated in this report — they stream
+/// once through [`SalvageSink::verified`] and are gone).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct SalvagedObject {
+pub struct SalvagedItem {
     /// Original physical locator, verbatim as the backend reported it.
     /// DIAGNOSTIC ONLY — carries no logical identity and must never be
     /// parsed to guess one.
     pub locator: String,
-    pub logical_len: u64,
-    /// Payload bytes, byte-exact as committed (digest-verified).
-    pub content: Vec<u8>,
+    pub payload_len: u64,
+}
+
+/// Per-object consumer for verified salvage output. `verified` runs ONLY
+/// after the object's footer and header fully validated; `reader` yields
+/// the payload exactly `payload_len` bytes from a private staging file
+/// that is DELETED when the call returns — consume (copy/hash/forward)
+/// inside the call. A consumer IO error is recorded per-object as a
+/// rejection; the staging file is never delivered as a recovered file on
+/// any failure path.
+pub trait SalvageSink {
+    fn verified(
+        &mut self,
+        locator: &str,
+        payload_len: u64,
+        reader: &mut dyn std::io::Read,
+    ) -> std::io::Result<()>;
+}
+
+impl<F> SalvageSink for F
+where
+    F: FnMut(&str, u64, &mut dyn std::io::Read) -> std::io::Result<()>,
+{
+    fn verified(
+        &mut self,
+        locator: &str,
+        payload_len: u64,
+        reader: &mut dyn std::io::Read,
+    ) -> std::io::Result<()> {
+        self(locator, payload_len, reader)
+    }
 }
 
 /// One object that could NOT be restored, with the reason. Never an
@@ -63,22 +94,15 @@ pub struct RejectedObject {
 
 #[derive(Debug, Default, serde::Serialize)]
 pub struct SalvageReport {
-    /// Verified restoration candidates (committed or not — unknown).
-    pub recovered: Vec<SalvagedObject>,
+    /// Verified restoration candidates (committed or not — unknown);
+    /// metadata only, see [`SalvagedItem`].
+    pub recovered: Vec<SalvagedItem>,
     /// Explicitly reported failures: corrupt envelopes, unknown format
-    /// versions, unknown object types, unreadable objects.
+    /// versions, unknown object types, unreadable objects, consumer
+    /// failures.
     pub rejected: Vec<RejectedObject>,
     /// Everything the enumeration returned.
     pub scanned: usize,
-}
-
-impl SalvageReport {
-    /// Export every recovered payload; the caller owns the bytes.
-    pub fn contents(&self) -> impl Iterator<Item = (&str, &[u8])> {
-        self.recovered
-            .iter()
-            .map(|o| (o.locator.as_str(), o.content.as_slice()))
-    }
 }
 
 /// Enumerate the data prefix and salvage every verifiable object.
@@ -86,7 +110,10 @@ impl SalvageReport {
 /// CAPABILITY: relies on `ObjectStore::list` (see module docs). Errors
 /// from the backend (including permission failures) propagate — an
 /// inaccessible store is an explicit error, not an empty report.
-pub fn salvage_all_data(objects: &dyn ObjectStore) -> Result<SalvageReport> {
+pub fn salvage_all_data(
+    objects: &dyn ObjectStore,
+    sink: &mut dyn SalvageSink,
+) -> Result<SalvageReport> {
     let mut report = SalvageReport::default();
     let mut token: Option<String> = None;
     loop {
@@ -94,8 +121,8 @@ pub fn salvage_all_data(objects: &dyn ObjectStore) -> Result<SalvageReport> {
         for info in &page.items {
             report.scanned += 1;
             let key = info.key.clone();
-            match salvage_one(objects, &key) {
-                Ok(obj) => report.recovered.push(obj),
+            match salvage_one(objects, &key, sink) {
+                Ok(item) => report.recovered.push(item),
                 Err(reason) => report.rejected.push(RejectedObject { locator: key, reason }),
             }
         }
@@ -107,23 +134,50 @@ pub fn salvage_all_data(objects: &dyn ObjectStore) -> Result<SalvageReport> {
     Ok(report)
 }
 
-/// Read and verify one object. `Err` carries the PER-OBJECT reason.
-fn salvage_one(objects: &dyn ObjectStore, key: &str) -> std::result::Result<SalvagedObject, String> {
-    let obj = objects.get(key, None).map_err(|e| match e {
+/// Stream-decode and verify ONE object into a private staging file, then
+/// hand it to the consumer. `Err` carries the PER-OBJECT reason. Bounded
+/// memory: one 64 KiB decode buffer plus the staging file — no payload
+/// bytes ever accumulate here. Nothing is written back to the store.
+fn salvage_one(
+    objects: &dyn ObjectStore,
+    key: &str,
+    sink: &mut dyn SalvageSink,
+) -> std::result::Result<SalvagedItem, String> {
+    let mut sg = objects.get_stream(key, None).map_err(|e| match e {
         Error::ObjectMissing(_) => "object listed but missing on read".to_string(),
         Error::Storage(m) => format!("unreadable: {m}"),
         other => format!("unreadable: {other}"),
     })?;
-    let (kind, content) = envelope::open(&obj.data).map_err(|e| e.to_string())?;
-    if kind != ObjKind::Data {
+    let mut staged = TempFileGuard::create().map_err(|e| format!("staging file: {e}"))?;
+    let item = {
+        let mut file = staged.file.take().expect("fresh guard holds a file");
+        use std::io::Write as _;
+        let d = envelope::decode_stream(&mut sg.reader, &mut file, None);
+        let flushed = match &d {
+            Ok(_) => file.flush().err(),
+            Err(_) => None,
+        };
+        staged.file = Some(file);
+        match (d, flushed) {
+            (Ok(d), None) => Ok(d),
+            (Err(e), _) => Err(e.to_string()),
+            (Ok(_), Some(io)) => Err(format!("staging write failed: {io}")),
+        }
+    }?;
+    if item.kind != ObjKind::Data {
         // Legacy metadata copies (S4.19 Tree/Commit/Ref objects) or
         // anything unexpected: reported, never returned as file content.
-        return Err(format!("not a data object (kind {})", kind as u8));
+        return Err(format!("not a data object (kind {})", item.kind as u8));
     }
-    Ok(SalvagedObject {
+    let mut file = staged.file.take().expect("guard still holds a file");
+    use std::io::Seek as _;
+    file.rewind().map_err(|e| format!("staging rewind: {e}"))?;
+    if let Err(e) = sink.verified(key, item.payload_len, &mut file) {
+        return Err(format!("consumer failed: {e}"));
+    }
+    Ok(SalvagedItem {
         locator: key.to_string(),
-        logical_len: content.len() as u64,
-        content,
+        payload_len: item.payload_len,
     })
 }
 
@@ -148,8 +202,17 @@ mod tests {
         m.put("objects/9/legacy.data", &envelope::seal(ObjKind::Tree, b"[]"))
             .unwrap();
 
+        // Test sink: captures (locator, bytes) per verified object. The
+        // production shape streams instead of collecting.
+        let mut collected: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut sink = |locator: &str, _len: u64, r: &mut dyn std::io::Read| {
+            let mut buf = Vec::new();
+            r.read_to_end(&mut buf)?;
+            collected.push((locator.to_string(), buf));
+            Ok(())
+        };
         let before = m.list(DATA_PREFIX, None, 1000).unwrap().items.len();
-        let report = salvage_all_data(&m).unwrap();
+        let report = salvage_all_data(&m, &mut sink).unwrap();
         let after = m.list(DATA_PREFIX, None, 1000).unwrap().items.len();
         assert_eq!(before, after, "salvage must not mutate the store");
         assert_eq!(report.scanned, 4);
@@ -157,7 +220,8 @@ mod tests {
         // The locator is echoed verbatim (diagnostic) — never parsed into
         // a logical identity.
         assert_eq!(report.recovered[0].locator, "objects/1/w-a.data");
-        assert_eq!(report.recovered[0].content, b"good-one");
+        assert_eq!(report.recovered[0].payload_len, 8);
+        assert_eq!(collected, vec![("objects/1/w-a.data".into(), b"good-one".to_vec())]);
         assert_eq!(report.rejected.len(), 3, "{:?}", report.rejected);
         assert!(report.rejected.iter().any(|r| r.reason.contains("bad magic")));
         assert!(report
@@ -168,7 +232,5 @@ mod tests {
             .rejected
             .iter()
             .any(|r| r.reason.contains("not a data object")));
-        let exported: Vec<_> = report.contents().collect();
-        assert_eq!(exported, vec![("objects/1/w-a.data", b"good-one".as_slice())]);
     }
 }

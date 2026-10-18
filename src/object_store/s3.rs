@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
-use crate::object_store::{ListPage, ObjectData, ObjectInfo, ObjectStore, Range, range_to_header};
+use crate::object_store::{ListPage, ObjectData, ObjectInfo, ObjectStore, Range, StreamedGet, range_to_header};
 use crate::sigv4::{SigV4, uri_encode, xml_extract_all, xml_extract_first};
 use quick_xml::events::Event;
 
@@ -438,7 +438,7 @@ impl S3ObjectStore {
         Ok(())
     }
 
-    fn get_stream(&self, key: &str, range: Option<Range>) -> Result<(Box<dyn Read + Send>, u64)> {
+    fn get_stream(&self, key: &str, range: Option<Range>) -> Result<StreamedGet> {
         let (url, headers) = self.signed("GET", Some(key), "", b"");
         let mut builder = self.apply_headers(self.agent.get(&url), &headers);
         if let Some(r) = range {
@@ -475,7 +475,15 @@ impl S3ObjectStore {
                     Error::Storage(format!("s3 response without Content-Length on {key}"))
                 })?
         };
-        Ok((Box::new(resp.into_body().into_reader()), len))
+        // Validator from the SAME response (never a separate HEAD): S3
+        // answers GETs with ETag on both 200 and 206; a backend that
+        // omits it degrades to "" (caller skips the comparison).
+        let etag = header_str(&resp, "etag").unwrap_or_default();
+        Ok(StreamedGet {
+            reader: Box::new(resp.into_body().into_reader()),
+            etag,
+            len,
+        })
     }
 
     fn read_body(resp: &mut ureq::http::Response<ureq::Body>) -> String {
@@ -851,7 +859,7 @@ impl ObjectStore for S3ObjectStore {
         })
     }
 
-    fn get_stream(&self, key: &str, range: Option<Range>) -> Result<(Box<dyn Read + Send>, u64)> {
+    fn get_stream(&self, key: &str, range: Option<Range>) -> Result<StreamedGet> {
         let _g = crate::metrics::scope("s3.get_stream");
         S3ObjectStore::get_stream(self, key, range)
     }
@@ -1725,7 +1733,7 @@ mod minio_tests {
         s3.put("phase1/range-len", &payload).unwrap();
 
         // middle 100 bytes: len must be 100, bytes must match the slice
-        let (mut r, len) = s3
+        let mut sg = s3
             .get_stream(
                 "phase1/range-len",
                 Some(Range {
@@ -1734,6 +1742,7 @@ mod minio_tests {
                 }),
             )
             .unwrap();
+let (r, len) = (sg.reader.as_mut(), sg.len);
         assert_eq!(
             len, 100,
             "206 length must be the slice, not the object total"
@@ -1744,7 +1753,7 @@ mod minio_tests {
         assert_eq!(got, &payload[200..300]);
 
         // read from middle to EOF: requested 5000 > remaining 800
-        let (mut r, len) = s3
+        let mut sg = s3
             .get_stream(
                 "phase1/range-len",
                 Some(Range {
@@ -1753,6 +1762,7 @@ mod minio_tests {
                 }),
             )
             .unwrap();
+let (r, len) = (sg.reader.as_mut(), sg.len);
         assert_eq!(len, 800);
         let mut got = Vec::new();
         r.read_to_end(&mut got).unwrap();
@@ -1774,7 +1784,8 @@ mod minio_tests {
         assert!(err.to_string().contains("416"), "{err}");
 
         // full object without range: len = object size
-        let (mut r, len) = s3.get_stream("phase1/range-len", None).unwrap();
+        let mut sg = s3.get_stream("phase1/range-len", None).unwrap();
+let (r, len) = (sg.reader.as_mut(), sg.len);
         assert_eq!(len, 1000);
         let mut got = Vec::new();
         r.read_to_end(&mut got).unwrap();

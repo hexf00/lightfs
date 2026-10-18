@@ -118,6 +118,56 @@ fn child_main(mode: &str, db: String, bucket: String) -> ! {
         // S4.22 kill-window: SIGKILL AFTER a raw PUT, BEFORE any ledger
         // row — the object is unregistered residue; gc must never delete
         // it (the ledger is the deletion domain, not the bucket).
+        // S4.24: many large objects, then streaming salvage with a
+        // hashing consumer. The parent samples this process's RSS the
+        // whole time; accumulation of recovered payloads would show up
+        // as RSS tracking the total bytes.
+        "salvage_rss" => {
+            let total_env = std::env::var("LIGHTFS_SALVAGE_RSS_TOTAL")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(384 * 1024 * 1024);
+            let obj_len = 24u64 * 1024 * 1024;
+            let n = (total_env / obj_len) as u32;
+            let spool = std::env::temp_dir().join(format!("lightfs-salvage-rss-src-{}", std::process::id()));
+            {
+                use std::io::Write as _;
+                let mut f = std::fs::File::create(&spool).unwrap();
+                let mut buf = vec![0u8; 1024 * 1024];
+                let blen = buf.len();
+                for (i, b) in buf.iter_mut().enumerate() {
+                    *b = (i % 251) as u8;
+                }
+                let _ = blen;
+                let mut left = obj_len;
+                while left > 0 {
+                    let chunk = buf.len().min(left as usize);
+                    f.write_all(&buf[..chunk]).unwrap();
+                    left -= chunk as u64;
+                }
+            }
+            for i in 0..n {
+                let mut f = std::fs::File::open(&spool).unwrap();
+                core.write_stream(&format!("/rss-{i}.bin"), None, true, &mut f, obj_len)
+                    .unwrap();
+            }
+            let _ = std::fs::remove_file(&spool);
+            use sha2::Digest as _;
+            let rep = lightfs::vnext::recover::salvage_all_data(
+                core.objects().as_ref(),
+                &mut |loc: &str, len: u64, r: &mut dyn std::io::Read| {
+                    let mut h = sha2::Sha256::new();
+                    std::io::copy(r, &mut h)?;
+                    assert_eq!(len % obj_len, 0, "unexpected length for {loc}");
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(rep.recovered.len(), n as usize, "{:?}", rep.rejected);
+            // linger briefly so the parent's sampler sees the settled RSS
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            std::process::exit(0);
+        }
         "kill_after_put" => {
             write_file(core, "/keep-0", b"committed-0");
             core.objects()
@@ -320,7 +370,10 @@ fn salvage_with_unusable_backend_errors_loudly() {
     let mut bad = cfg.clone();
     bad.s3.access_key = "not-a-valid-key".into();
     let store = lightfs::object_store::s3::S3ObjectStore::new(bad.s3_config()).unwrap();
-    let err = match lightfs::vnext::recover::salvage_all_data(&store) {
+    let err = match lightfs::vnext::recover::salvage_all_data(
+        &store,
+        &mut |_: &str, _: u64, _: &mut dyn std::io::Read| Ok(()),
+    ) {
         Err(e) => e,
         Ok(_) => panic!("list with bad credentials must error, not return empty"),
     };
@@ -437,15 +490,18 @@ fn crash_between_data_and_metadata_recovers() {
     // restoration candidates with byte-exact payloads; both raw orphans
     // (written WITHOUT envelopes) are explicitly rejected, never served.
     let snapshot_before = list_all_keys(objects.as_ref());
-    let report = lightfs::vnext::recover::salvage_all_data(objects.as_ref()).unwrap();
+    let mut keep_payloads: Vec<Vec<u8>> = Vec::new();
+    let report = lightfs::vnext::recover::salvage_all_data(objects.as_ref(), &mut |loc: &str, _len: u64, r: &mut dyn std::io::Read| {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(r, &mut buf)?;
+        if !loc.starts_with("objects/999/") {
+            keep_payloads.push(buf);
+        }
+        Ok(())
+    })
+    .unwrap();
     let snapshot_after = list_all_keys(objects.as_ref());
     assert_eq!(snapshot_before, snapshot_after, "salvage must not mutate OSS");
-    let mut keep_payloads: Vec<Vec<u8>> = report
-        .recovered
-        .iter()
-        .filter(|o| !o.locator.starts_with("objects/999/"))
-        .map(|o| o.content.clone())
-        .collect();
     keep_payloads.sort();
     let expected: Vec<Vec<u8>> = (0..5).map(|i| format!("committed-{i}").into_bytes()).collect();
     assert_eq!(keep_payloads, expected, "byte-exact salvage of the keeps");
@@ -762,12 +818,22 @@ fn s423_streamed_large_files_roundtrip_ranges_restart() {
     }
 
     // salvage decodes and VERIFIES streamed objects; the big v2 objects
-    // land in `recovered` with their logical lengths
-    let rep = lightfs::vnext::recover::salvage_all_data(eng.core.objects().as_ref()).unwrap();
+    // land in `recovered` with their payload lengths (bytes stream once
+    // through the sink — nothing accumulates in the report)
+    let mut salvaged_bytes = 0u64;
+    let rep = lightfs::vnext::recover::salvage_all_data(
+        eng.core.objects().as_ref(),
+        &mut |_loc: &str, len: u64, r: &mut dyn std::io::Read| {
+            std::io::copy(r, &mut std::io::sink())?;
+            salvaged_bytes += len;
+            Ok(())
+        },
+    )
+    .unwrap();
     let locators: Vec<(String, u64)> = rep
         .recovered
         .iter()
-        .map(|r| (r.locator.clone(), r.logical_len))
+        .map(|r| (r.locator.clone(), r.payload_len))
         .collect();
     assert!(
         locators.iter().any(|(l, n)| l.ends_with(".data") && *n == 64 * 1024 * 1024),
@@ -776,6 +842,12 @@ fn s423_streamed_large_files_roundtrip_ranges_restart() {
     assert!(locators.iter().any(|(_, n)| *n == 8 * 1024 * 1024 + 1));
     // the empty streamed object decodes and verifies too (logical_len 0)
     assert!(locators.iter().any(|(_, n)| *n == 0), "{locators:?}");
+    // every recovered byte streamed exactly once through the sink
+    assert_eq!(
+        salvaged_bytes,
+        locators.iter().map(|(_, n)| *n).sum::<u64>(),
+        "sink must observe every verified payload exactly once"
+    );
 
     for p in [&e0, &e1, &big, &one_mib] {
         let _ = std::fs::remove_file(p);
@@ -815,9 +887,210 @@ fn s423_damaged_and_legacy_objects_fail_closed() {
 
     // salvage reports both as rejected with the reason; the good object
     // is recovered — no forged successes
-    let rep = lightfs::vnext::recover::salvage_all_data(eng.core.objects().as_ref()).unwrap();
+    let rep = lightfs::vnext::recover::salvage_all_data(
+        eng.core.objects().as_ref(),
+        &mut |_: &str, _: u64, r: &mut dyn std::io::Read| {
+            std::io::copy(r, &mut std::io::sink())?;
+            Ok(())
+        },
+    )
+    .unwrap();
     let rejected: Vec<String> = rep.rejected.iter().map(|r| r.reason.clone()).collect();
     assert!(rejected.iter().any(|r| r.contains("sha256 footer mismatch")), "{rejected:?}");
     assert!(rejected.iter().any(|r| r.contains("unsupported envelope format LF1")), "{rejected:?}");
-    assert!(rep.recovered.iter().any(|r| r.content == b"good-bytes"));
+    assert!(
+        rep.recovered.iter().any(|r| r.payload_len == 10),
+        "{:?}",
+        rep.recovered
+    );
+}
+
+// ---- S4.24: bounded full reads, read_at, salvage streaming, temp hygiene ----
+
+fn temp_residue() -> usize {
+    std::fs::read_dir(std::env::temp_dir())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("lightfs-read-"))
+        .count()
+}
+
+#[test]
+fn s424_full_read_streamed_verified_and_fail_closed() {
+    let cfg = fresh("s424full");
+    let eng = lightfs::engine::open_engine(&cfg).unwrap();
+
+    // 64 MiB streamed write, then a WHOLE-file read through the server
+    // entry (open_read): must route to the footer-verified streaming
+    // decode and publish the staged file.
+    let big = spool_file("s424big", 64 * 1024 * 1024);
+    write_spooled(&eng.core, "/big.bin", &big, true, None);
+    let cid = eng.core.store().head("main").unwrap().unwrap().commit_id;
+    let (mut rd, len) = eng.core.open_read("/big.bin", 0, 64 * 1024 * 1024).unwrap();
+    assert_eq!(len, 64 * 1024 * 1024);
+    let mut got = std::io::BufReader::with_capacity(256 * 1024, rd.as_mut());
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut got, &mut buf).unwrap();
+    assert_eq!(buf.len(), 64 * 1024 * 1024);
+    check_pattern(&buf[..1024], 0);
+    check_pattern(&buf[32 * 1024 * 1024..32 * 1024 * 1024 + 512], 32 * 1024 * 1024);
+    check_pattern(&buf[buf.len() - 512..], 64 * 1024 * 1024 - 512);
+    drop(buf);
+
+    // over-read clamp is still a whole-file request (same verified path)
+    let (_, len2) = eng.core.open_read("/big.bin", 0, 128 * 1024 * 1024).unwrap();
+    assert_eq!(len2, 64 * 1024 * 1024);
+
+    // partial reads keep the range contract: exact window, no more
+    let (mut rr, rlen) = eng.core.open_read("/big.bin", 33 * 1024 * 1024 + 7, 1000).unwrap();
+    let mut win = Vec::new();
+    std::io::Read::read_to_end(&mut rr, &mut win).unwrap();
+    assert_eq!(rlen, 1000);
+    check_pattern(&win, 33 * 1024 * 1024 + 7);
+
+    // read_at (pinned history): full verification preserved, range out
+    let at = eng.core.read_at(cid, "/big.bin", 1000, 512).unwrap();
+    check_pattern(&at, 1000);
+
+    // damage the stored object: whole-file reads must FAIL CLOSED with a
+    // named corruption error, and no staged residue may survive
+    use lightfs::object_store::ObjectStore as _;
+    let key = {
+        let known = eng.core.store().known_objects().unwrap();
+        known.iter().find(|(_, l)| l.ends_with(".data")).unwrap().1.clone()
+    };
+    let raw = lightfs::object_store::s3::S3ObjectStore::new(cfg.s3_config()).unwrap();
+    let cur = raw.get(&key, None).unwrap();
+    let mut damaged = cur.data.clone();
+    let mid = HEADER_OR_PAYLOAD_POS;
+    damaged[mid] ^= 0xff;
+    raw.put(&key, &damaged).unwrap();
+    let before = temp_residue();
+    // Re-PUT damage necessarily changes the backend validator, so the
+    // SAME-RESPONSE etag check fires first — itself part of the required
+    // fail-closed matrix (the footer-mismatch arm is pinned by the
+    // envelope decode tests). Both names are hard failures.
+    let err = eng
+        .core
+        .open_read("/big.bin", 0, 64 * 1024 * 1024)
+        .err()
+        .expect("damaged object must fail whole-file read")
+        .to_string();
+    assert!(
+        err.contains("recorded etag") || err.contains("sha256 footer mismatch"),
+        "{err}"
+    );
+    assert!(eng.core.read_at(cid, "/big.bin", 0, 16).is_err(), "pinned read must refuse too");
+    assert_eq!(temp_residue(), before, "failed verification leaves no staging file");
+}
+
+const HEADER_OR_PAYLOAD_POS: usize = 20 + 4096;
+
+#[test]
+fn s424_salvage_rss_is_object_bounded_not_total_bounded() {
+    let cfg = fresh("s424rss");
+    let exe = std::env::current_exe().unwrap();
+    let mut cmd = std::process::Command::new(exe);
+    cmd.env("LIGHTFS_VNEXT_CHILD", format!("salvage_rss:{}:{}", cfg.metadata.path, cfg.s3.bucket))
+        .env("LIGHTFS_S3_ENDPOINT", std::env::var("LIGHTFS_S3_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".into()))
+        .env("LIGHTFS_SALVAGE_RSS_TOTAL", (384u64 * 1024 * 1024).to_string())
+        .arg("--exact")
+        .arg("zz_child_harness")
+        .arg("--nocapture")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().expect("spawn salvage child");
+    // sample the child's RSS for its whole life
+    let mut peak_kb = 0u64;
+    loop {
+        match child.try_wait().expect("wait") {
+            Some(_) => break,
+            None => {
+                if let Ok(out) = std::process::Command::new("ps")
+                    .args(["-o", "rss=", "-p", &child.id().to_string()])
+                    .output()
+                {
+                    if let Ok(txt) = String::from_utf8(out.stdout) {
+                        if let Ok(kb) = txt.trim().split_whitespace().next().unwrap_or("0").parse::<u64>() {
+                            peak_kb = peak_kb.max(kb);
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            }
+        }
+    }
+    let peak_mb = peak_kb as f64 / 1024.0;
+    eprintln!("salvage child peak RSS: {peak_mb:.1} MB for 384 MiB salvaged");
+    // 384 MiB of recovered payloads never exists in memory: the peak is
+    // the child's baseline plus single-object buffers, not the total.
+    assert!(peak_kb < 220 * 1024, "salvage accumulated: peak {peak_mb:.1} MB");
+}
+
+#[test]
+fn s424_empty_file_and_dropped_reader_cleanup() {
+    let cfg = fresh("s424empty");
+    let eng = lightfs::engine::open_engine(&cfg).unwrap();
+    let e0 = spool_file("s424e0", 0);
+    write_spooled(&eng.core, "/empty", &e0, true, None);
+    // empty file: recorded_size == 0 -> range path, empty answer
+    let (mut rd, len) = eng.core.open_read("/empty", 0, 16).unwrap();
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut rd, &mut buf).unwrap();
+    assert_eq!(len, 0);
+    assert!(buf.is_empty());
+    drop(rd);
+
+    // dropping a published verified reader deletes its staging file
+    let one = spool_file("s424one", 1);
+    write_spooled(&eng.core, "/one", &one, true, None);
+    let before = temp_residue();
+    let (mut rd, _) = eng.core.open_read("/one", 0, 1).unwrap();
+    std::io::Read::read_exact(&mut rd, &mut [0u8; 1]).unwrap();
+    drop(rd);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(temp_residue() <= before, "staging file must be deleted on drop");
+}
+
+#[test]
+fn s424_salvage_streaming_many_objects_bounded_report() {
+    let cfg = fresh("s424salvage");
+    let eng = lightfs::engine::open_engine(&cfg).unwrap();
+    // 12 files of 64 KiB each through the streamed write path
+    for i in 0..12u32 {
+        let p = spool_file("s424many", 64 * 1024);
+        let name = format!("/m{i}.bin");
+        write_spooled(&eng.core, &name, &p, true, None);
+        let _ = std::fs::remove_file(&p);
+    }
+    // one raw unenveloped object: rejected, never served
+    use lightfs::object_store::ObjectStore as _;
+    lightfs::object_store::s3::S3ObjectStore::new(cfg.s3_config())
+        .unwrap()
+        .put("objects/999/raw.data", &[0u8; 64 * 1024])
+        .unwrap();
+
+    let mut hashed: Vec<(String, u64, u64)> = Vec::new();
+    let before = temp_residue();
+    let rep = lightfs::vnext::recover::salvage_all_data(
+        eng.core.objects().as_ref(),
+        &mut |loc: &str, len: u64, r: &mut dyn std::io::Read| {
+            // consumer hashes instead of collecting: per-object memory only
+            use sha2::{Digest as _, Sha256};
+            let mut h = Sha256::new();
+            std::io::copy(r, &mut h)?;
+            hashed.push((loc.to_string(), len, h.finalize()[0] as u64));
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(rep.scanned, 13);
+    assert_eq!(rep.recovered.len(), 12, "{:?}", rep.rejected);
+    assert_eq!(rep.rejected.len(), 1);
+    assert!(rep.rejected[0].reason.contains("bad magic"), "{:?}", rep.rejected);
+    assert_eq!(hashed.len(), 12);
+    assert!(hashed.iter().all(|(_, l, _)| *l == 64 * 1024));
+    assert!(rep.recovered.iter().all(|i| i.payload_len == 64 * 1024));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(temp_residue() <= before, "salvage staging files must be cleaned");
 }

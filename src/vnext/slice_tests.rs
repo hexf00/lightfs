@@ -272,13 +272,19 @@ fn slice7_payload_only_writes_and_content_salvage() {
     // SQLite is GONE from this point: content salvage (read-only) is the
     // whole recovery guarantee — bytes plus the diagnostic locator, no
     // namespace and no identity claims parsed out of key shapes.
-    let report = recover::salvage_all_data(objects.as_ref()).unwrap();
+    let mut collected: Vec<(String, Vec<u8>)> = Vec::new();
+    let report = recover::salvage_all_data(objects.as_ref(), &mut |loc: &str, _len: u64, r: &mut dyn std::io::Read| {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(r, &mut buf)?;
+        collected.push((loc.to_string(), buf));
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(report.scanned, 1);
     assert!(report.rejected.is_empty(), "{:?}", report.rejected);
     let obj = &report.recovered[0];
     assert_eq!(obj.locator, live_locator, "locator echoed verbatim");
-    assert_eq!(obj.content, b"recoverable-bytes");
-    assert_eq!(report.contents().count(), 1);
+    assert_eq!(collected, vec![(live_locator.clone(), b"recoverable-bytes".to_vec())]);
 }
 
 fn list_keys(objects: &dyn crate::object_store::ObjectStore, prefix: &str) -> Vec<String> {
@@ -429,7 +435,7 @@ fn s421_unsupported_claim_backend_refuses_init() {
             &self,
             k: &str,
             r: Option<Range>,
-        ) -> crate::error::Result<(Box<dyn std::io::Read + Send>, u64)> {
+        ) -> crate::error::Result<crate::object_store::StreamedGet> {
             self.0.get_stream(k, r)
         }
         fn head(&self, k: &str) -> crate::error::Result<ObjectInfo> {
