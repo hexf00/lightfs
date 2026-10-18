@@ -123,6 +123,11 @@ pub struct FuseAdapter {
     /// on OPEN-HANDLE operations (sessions anchor on node.id), never on
     /// the ino namespace.
     next_ino: AtomicU64,
+    /// ino -> the node id the entry was created with. Inos are
+    /// adapter-local and NOT node ids (see next_ino); id-anchored
+    /// operations (reads, truncate) resolve the real node id here,
+    /// falling back to one path lookup when unknown.
+    node_ids: Mutex<HashMap<u64, i64>>,
     uid: u32,
     gid: u32,
 }
@@ -230,6 +235,7 @@ impl FuseAdapter {
             staging,
             next_fh: AtomicU64::new(1),
             next_ino: AtomicU64::new(2),
+            node_ids: Mutex::new(HashMap::new()),
             uid,
             gid,
         }
@@ -246,6 +252,23 @@ impl FuseAdapter {
         self.inodes.lock().unwrap().insert(ino, std::path::PathBuf::from(path));
         self.paths.lock().unwrap().insert(path.to_string(), ino);
         ino
+    }
+
+    /// `ino_for` plus the entry's node id (callers that know it).
+    fn ino_for_node(&self, path: &str, node_id: i64) -> u64 {
+        let ino = self.ino_for(path);
+        self.node_ids.lock().unwrap().insert(ino, node_id);
+        ino
+    }
+
+    /// The node id for an adapter ino. Id-anchored operations need the
+    /// REAL node id; when the map misses (e.g. an ino re-listed through a
+    /// path that predates the process) resolve it once by path.
+    fn node_id_of(&self, ino: u64, path: &str) -> i64 {
+        if let Some(id) = self.node_ids.lock().unwrap().get(&ino).copied() {
+            return id;
+        }
+        self.fs.lookup(path).map(|n| n.id).unwrap_or(ino as i64)
     }
 
     fn path_of(&self, ino: INodeNo) -> Result<String, Errno> {
@@ -285,7 +308,8 @@ impl FuseAdapter {
                 FileType::RegularFile
             };
             let child_path = Self::child_path(path, std::ffi::OsStr::new(&c.name));
-            entries.push((self.ino_for(&child_path), kind, c.name.clone()));
+            let child_ino = self.ino_for_node(&child_path, c.id);
+            entries.push((child_ino, kind, c.name.clone()));
         }
         entries
     }
@@ -763,7 +787,7 @@ impl Filesystem for FuseAdapter {
             .map(|(n, _)| n.clone());
         if let Some(node) = cached {
             crate::metrics::observe("fuse.lookup.cache_hit", Duration::ZERO);
-            let ino = self.ino_for(&path);
+            let ino = self.ino_for_node(&path, node.id);
             reply.entry(
                 &self.attr_ttl,
                 &attr_for(ino, &node, self.uid, self.gid),
@@ -773,7 +797,7 @@ impl Filesystem for FuseAdapter {
         }
         match self.fs.lookup(&path) {
             Ok(node) => {
-                let ino = self.ino_for(&path);
+                let ino = self.ino_for_node(&path, node.id);
                 self.attr_cache
                     .lock()
                     .unwrap()
@@ -880,7 +904,8 @@ impl Filesystem for FuseAdapter {
             // open write sessions re-based to the new version — otherwise
             // the data flush would conflict with the truncation commit and
             // lose the user's data.
-            let node_now = match self.fs.lookup_by_id(ino.0 as i64, &path) {
+            let real_id = self.node_id_of(ino.0, &path);
+            let node_now = match self.fs.lookup_by_id(real_id, &path) {
                 Ok(n) => n,
                 Err(e) => return reply.error(errno(&e)),
             };
@@ -889,7 +914,7 @@ impl Filesystem for FuseAdapter {
             // chain traffic and must bypass the read cache (Phase Q).
             let commit = self
                 .fs
-                .read_by_id_authoritative(ino.0 as i64, &path, 0, cur_len)
+                .read_by_id_authoritative(real_id, &path, 0, cur_len)
                 .and_then(|mut content| {
                     if new_size > content.len() as u64 {
                         // extension: zero-fill (ftruncate semantics)
@@ -900,7 +925,7 @@ impl Filesystem for FuseAdapter {
                     // silently clobbering it.
                     let mut ws =
                         self.fs
-                            .open_write_by_id(ino.0 as i64, &path, Some(node_now.version))?;
+                            .open_write_by_id(real_id, &path, Some(node_now.version))?;
                     ws.write(0, &content)?;
                     ws.commit()
                 });
@@ -1083,7 +1108,7 @@ impl Filesystem for FuseAdapter {
         match self.fs.mkdir(&path, mode & 0o7777) {
             Ok(node) => {
                 self.dirent_invalidate();
-                let ino = self.ino_for(&path);
+                let ino = self.ino_for_node(&path, node.id);
                 reply.entry(
                     &self.attr_ttl,
                     &attr_for(ino, &node, self.uid, self.gid),
@@ -1115,7 +1140,7 @@ impl Filesystem for FuseAdapter {
         match self.fs.symlink(&target, &path) {
             Ok(node) => {
                 self.dirent_invalidate();
-                let ino = self.ino_for(&path);
+                let ino = self.ino_for_node(&path, node.id);
                 reply.entry(
                     &self.attr_ttl,
                     &attr_for(ino, &node, self.uid, self.gid),
@@ -1163,7 +1188,7 @@ impl Filesystem for FuseAdapter {
             Ok((node, fh)) => {
                 self.dirent_invalidate();
                 self.pending.drop_path(&path);
-                let ino = self.ino_for(&path);
+                let ino = self.ino_for_node(&path, node.id);
                 reply.created(
                     &self.attr_ttl,
                     &attr_for(ino, &node, self.uid, self.gid),
@@ -1217,7 +1242,8 @@ impl Filesystem for FuseAdapter {
                 return reply.error(e);
             }
         };
-        match self.read_with_session(ino.0, &path, offset, size as u64) {
+        let node_id = self.node_id_of(ino.0, &path);
+        match self.read_with_session(node_id, &path, offset, size as u64) {
             Ok(data) => reply.data(&data),
             Err(e) => reply.error(errno(&e)),
         }
