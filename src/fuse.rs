@@ -1323,7 +1323,10 @@ impl Filesystem for FuseAdapter {
         FLUSH_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         match r {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(errno(&e)),
+            Err(e) => {
+                eprintln!("lightfs-fuse: flush failed for fh={fh}: {e}");
+                reply.error(errno(&e))
+            }
         }
     }
 

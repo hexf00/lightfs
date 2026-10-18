@@ -546,6 +546,39 @@ impl FsApi for Client {
         Some(self.staging.clone())
     }
 
+    // S4.25 §三: the mounted-write COMMIT over the wire. The base streams
+    // in around the session's dirty bytes and the merged whole uploads
+    // through the SAME /data/write (Node-Id + Expected-Version + Length)
+    // any streamed write takes - no whole-file buffering. A never-
+    // committed file has NO base: the wire reports the missing object and
+    // the merge proceeds with the dirty bytes alone. (The trait default
+    // cannot express this - it propagates the base-read error - which is
+    // exactly why every FIRST flush of a new file failed on a real mount
+    // while every in-process test against Core passed: Core overrides
+    // this with the same no-base semantics.)
+    fn commit_write_merged(
+        &self,
+        node_id: i64,
+        path: &str,
+        expected_version: i64,
+        spool: &mut crate::staging::WriteSpool,
+    ) -> Result<Node> {
+        match self.read_by_id_authoritative_stream(node_id, path) {
+            Ok((mut base, base_len)) => spool.overlay_base(&mut *base, base_len)?,
+            Err(Error::ObjectMissing(_)) => {}
+            Err(e) => return Err(e),
+        }
+        let len = spool.size();
+        spool.rewind()?;
+        self.write_from_reader_by_id(
+            node_id,
+            path,
+            spool.reader(),
+            len,
+            Some(expected_version),
+        )
+    }
+
     fn read_by_id_authoritative_stream(
         &self,
         node_id: i64,
