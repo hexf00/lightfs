@@ -658,3 +658,166 @@ fn s422_kill_windows_no_loss_no_wrong_reclaim() {
         assert_eq!(eng.core.read("/durable", 0, 64).unwrap(), b"durable-bytes");
     }
 }
+
+// ---- S4.23: streamed envelope v2, bounded-memory upload, integrity ----
+
+/// Deterministic patterned spool file on DISK (the test never holds the
+/// whole payload in memory while writing it). Byte at position i is
+/// `(i % 251) as u8` — the same law the verifiers below re-check.
+fn spool_file(tag: &str, len: u64) -> std::path::PathBuf {
+    use std::io::Write as _;
+    let p = std::env::temp_dir().join(format!("lightfs-s423-{tag}-{}.bin", std::process::id()));
+    let mut f = std::fs::File::create(&p).unwrap();
+    let mut written = 0u64;
+    let mut buf = vec![0u8; 1024 * 1024];
+    while written < len {
+        let n = buf.len().min((len - written) as usize);
+        for (i, b) in buf[..n].iter_mut().enumerate() {
+            *b = ((written as usize + i) % 251) as u8;
+        }
+        f.write_all(&buf[..n]).unwrap();
+        written += n as u64;
+    }
+    p
+}
+
+fn pattern_byte(pos: u64) -> u8 {
+    (pos % 251) as u8
+}
+
+fn check_pattern(bytes: &[u8], base: u64) {
+    for (i, b) in bytes.iter().enumerate() {
+        assert_eq!(*b, pattern_byte(base + i as u64), "byte at {}", base + i as u64);
+    }
+}
+
+fn write_spooled(core: &lightfs::vnext::Core, path: &str, src: &std::path::Path, create: bool, expected: Option<i64>) -> lightfs::metadata::Node {
+    let mut f = std::fs::File::open(src).unwrap();
+    let len = f.metadata().unwrap().len();
+    core.write_stream(path, expected, create, &mut f, len).unwrap()
+}
+
+#[test]
+fn s423_streamed_large_files_roundtrip_ranges_restart() {
+    let cfg = fresh("s423large");
+    let eng = lightfs::engine::open_engine(&cfg).unwrap();
+
+    // empty and 1-byte files through the SAME streamed server path
+    let e0 = spool_file("s423e0", 0);
+    write_spooled(&eng.core, "/empty", &e0, true, None);
+    assert!(eng.core.read("/empty", 0, 16).unwrap().is_empty());
+    let e1 = spool_file("s423e1", 1);
+    write_spooled(&eng.core, "/one", &e1, true, None);
+    assert_eq!(eng.core.read("/one", 0, 16).unwrap(), vec![pattern_byte(0)]);
+
+    // 64 MiB: single streaming pass, disk spool -> put_stream, multipart
+    // parts on the S3 side (encoded > SMALL_PUT_MAX).
+    let big = spool_file("s423big", 64 * 1024 * 1024);
+    let node = write_spooled(&eng.core, "/big.bin", &big, true, None);
+    assert_eq!(node.size, 64 * 1024 * 1024);
+    assert_eq!(node.version, 1);
+
+    // full read: footer checksum verified inside the product
+    let full = eng.core.read("/big.bin", 0, 64 * 1024 * 1024).unwrap();
+    assert_eq!(full.len(), 64 * 1024 * 1024);
+    for base in [0u64, 1, 8 * 1024 * 1024 - 1, 8 * 1024 * 1024, 32 * 1024 * 1024, 64 * 1024 * 1024 - 1024] {
+        check_pattern(&full[base as usize..base as usize + 512], base);
+    }
+    drop(full);
+
+    // range reads: cold (offset 0, one GET) and deep (offset > 0, header
+    // GET + window GET); last byte; clip at end; past-the-end empty.
+    assert_eq!(eng.core.read("/big.bin", 0, 4096).unwrap().len(), 4096);
+    let mid = eng.core.read("/big.bin", 33 * 1024 * 1024 + 7, 1000).unwrap();
+    check_pattern(&mid, 33 * 1024 * 1024 + 7);
+    let last = eng.core.read("/big.bin", 64 * 1024 * 1024 - 1, 10).unwrap();
+    assert_eq!(last, vec![pattern_byte(64 * 1024 * 1024 - 1)]);
+    assert!(eng.core.read("/big.bin", 64 * 1024 * 1024, 10).unwrap().is_empty());
+
+    // overwrite through the same streamed path (CAS on version 1)
+    let one_mib = spool_file("s423mib", 1024 * 1024);
+    let n2 = write_spooled(&eng.core, "/big.bin", &one_mib, false, Some(1));
+    assert_eq!(n2.version, 2);
+    assert_eq!(n2.size, 1024 * 1024);
+    let over = eng.core.read("/big.bin", 0, 1024 * 1024).unwrap();
+    check_pattern(&over, 0);
+
+    // restart: a fresh engine reads the streamed object back
+    drop(eng);
+    let eng = lightfs::engine::open_engine(&cfg).unwrap();
+    let back = eng.core.read("/big.bin", 0, 1024 * 1024).unwrap();
+    check_pattern(&back, 0);
+    assert_eq!(eng.core.read("/one", 0, 16).unwrap(), vec![pattern_byte(0)]);
+
+    // multipart boundary: encoded 8 MiB exactly (single PUT) vs one byte
+    // more (multipart lifecycle) both round-trip byte-exactly
+    for (tag, len) in [("s423b8m", 8 * 1024 * 1024u64), ("s423b8m1", 8 * 1024 * 1024 + 1)] {
+        let p = spool_file(tag, len);
+        let path = format!("/{tag}.bin");
+        write_spooled(&eng.core, &path, &p, true, None);
+        let mid = eng.core.read(&path, len / 2, 4096).unwrap();
+        check_pattern(&mid, len / 2);
+        let tail = eng.core.read(&path, len - 3, 100).unwrap();
+        check_pattern(&tail, len - 3);
+    }
+
+    // salvage decodes and VERIFIES streamed objects; the big v2 objects
+    // land in `recovered` with their logical lengths
+    let rep = lightfs::vnext::recover::salvage_all_data(eng.core.objects().as_ref()).unwrap();
+    let locators: Vec<(String, u64)> = rep
+        .recovered
+        .iter()
+        .map(|r| (r.locator.clone(), r.logical_len))
+        .collect();
+    assert!(
+        locators.iter().any(|(l, n)| l.ends_with(".data") && *n == 64 * 1024 * 1024),
+        "64 MiB object must salvage: {locators:?}"
+    );
+    assert!(locators.iter().any(|(_, n)| *n == 8 * 1024 * 1024 + 1));
+    // the empty streamed object decodes and verifies too (logical_len 0)
+    assert!(locators.iter().any(|(_, n)| *n == 0), "{locators:?}");
+
+    for p in [&e0, &e1, &big, &one_mib] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+#[test]
+fn s423_damaged_and_legacy_objects_fail_closed() {
+    let cfg = fresh("s423corrupt");
+    let eng = lightfs::engine::open_engine(&cfg).unwrap();
+    write_file(&eng.core, "/good", b"good-bytes");
+
+    use lightfs::object_store::ObjectStore as _;
+    let raw = lightfs::object_store::s3::S3ObjectStore::new(cfg.s3_config()).unwrap();
+    // a payload-damaged v2 object: refused with the checksum naming itself
+    let mut damaged = lightfs::vnext::envelope::seal(lightfs::vnext::envelope::ObjKind::Data, b"corrupt-me");
+    let last = damaged.len() - 1;
+    damaged[last] ^= 0xff;
+    raw.put("objects/zz-damaged.data", &damaged).unwrap();
+    // a pre-v2 (LF1) object: named as unsupported, never parsed as bytes
+    let mut legacy = vec![0u8; 64];
+    legacy[0..4].copy_from_slice(b"LF1\n");
+    raw.put("objects/zz-legacy.data", &legacy).unwrap();
+
+    let e1 = eng
+        .core
+        .read_full_verified("objects/zz-damaged.data", "")
+        .expect_err("damaged object refused")
+        .to_string();
+    assert!(e1.contains("sha256 footer mismatch"), "{e1}");
+    let e2 = eng
+        .core
+        .read_full_verified("objects/zz-legacy.data", "")
+        .expect_err("legacy object refused")
+        .to_string();
+    assert!(e2.contains("unsupported envelope format LF1"), "{e2}");
+
+    // salvage reports both as rejected with the reason; the good object
+    // is recovered — no forged successes
+    let rep = lightfs::vnext::recover::salvage_all_data(eng.core.objects().as_ref()).unwrap();
+    let rejected: Vec<String> = rep.rejected.iter().map(|r| r.reason.clone()).collect();
+    assert!(rejected.iter().any(|r| r.contains("sha256 footer mismatch")), "{rejected:?}");
+    assert!(rejected.iter().any(|r| r.contains("unsupported envelope format LF1")), "{rejected:?}");
+    assert!(rep.recovered.iter().any(|r| r.content == b"good-bytes"));
+}

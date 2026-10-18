@@ -694,8 +694,14 @@ impl Core {
 
     /// Range read: ONE ranged GET carries the envelope header and the
     /// payload together (cost contract: exactly one object GET per cold
-    /// read), header verified, etag compared; the envelope digest covers
-    /// the WHOLE object, so a partial read trusts the recorded etag.
+    /// read), header verified, etag compared. The v2 checksum lives in the
+    /// FOOTER, which a partial read does not fetch — payload integrity for
+    /// a range read rests on the recorded etag comparison; full reads
+    /// verify the checksum via `read_full_verified`.
+    ///
+    /// `offset`/`size` are in LOGICAL file space; the envelope layer owns
+    /// the logical→payload window mapping, which is the identity because
+    /// this build reads raw encoding only.
     fn read_range_verified(
         &self,
         key: &str,
@@ -713,9 +719,7 @@ impl Core {
         // such read). Deeper ranges need the header first, then the
         // payload window — two small GETs, still O(range) bytes.
         if offset == 0 {
-            let obj = self
-                .objects
-                .get(key, Some(Range { start: 0, len: envelope::HEADER_LEN as u64 + want }))?;
+            let obj = self.objects.get(key, Some(envelope::prefix_range(want)))?;
             if !recorded_etag.is_empty() && obj.info.etag != recorded_etag {
                 return Err(Error::ObjectCorrupt(format!(
                     "{key}: recorded etag {recorded_etag} != observed {}",
@@ -731,11 +735,9 @@ impl Core {
                     "{key}: logical length {logical} shorter than the requested read"
                 )));
             }
-            return Ok(obj.data[envelope::HEADER_LEN..envelope::HEADER_LEN + want as usize].to_vec());
+            return Ok(envelope::payload_slice(&obj.data, want as usize).to_vec());
         }
-        let head =
-            self.objects
-                .get(key, Some(Range { start: 0, len: envelope::HEADER_LEN as u64 }))?;
+        let head = self.objects.get(key, Some(envelope::prefix_range(0)))?;
         if !recorded_etag.is_empty() && head.info.etag != recorded_etag {
             return Err(Error::ObjectCorrupt(format!(
                 "{key}: recorded etag {recorded_etag} != observed {}",
@@ -753,13 +755,7 @@ impl Core {
         if len == 0 {
             return Ok(Vec::new());
         }
-        let body = self.objects.get(
-            key,
-            Some(Range {
-                start: envelope::HEADER_LEN as u64 + offset,
-                len,
-            }),
-        )?;
+        let body = self.objects.get(key, Some(envelope::payload_range(offset, len)))?;
         if !recorded_etag.is_empty() && body.info.etag != recorded_etag {
             return Err(Error::ObjectCorrupt(format!("{key}: etag changed mid-read")));
         }
@@ -1230,10 +1226,19 @@ impl Core {
     /// re-registration leaves the object UNREGISTERED, which gc never
     /// deletes (fail-safe residue, never risk-deleted for cleanup).
     pub fn commit_write(&self, handle: &WriteHandle) -> Result<Node> {
-        let content = handle.snapshot();
+        // Stream-encode straight out of the locked session buffer: no
+        // snapshot clone, no whole-envelope Vec. The buffer itself stays
+        // O(file size) — this is the interactive-write path; the bounded
+        // path is server spool + write_stream (documented, not hidden).
         let key = data_key(&new_object_id());
-        let sealed = envelope::seal(ObjKind::Data, &content);
-        let info = self.objects.put(&key, &sealed)?;
+        let buf = handle.buf.lock().expect("write buffer");
+        let len = buf.len();
+        let mut src = std::io::Cursor::new(&buf[..]);
+        let mut enc = envelope::seal_reader(ObjKind::Data, &mut src, len as u64);
+        let info = self
+            .objects
+            .put_stream(&key, &mut enc, envelope::encoded_len(len as u64))?;
+        drop(buf);
 
         let comps = Self::split_path(&handle.path)?;
         let name = comps
@@ -1243,7 +1248,7 @@ impl Core {
         let file_id = handle.file_id;
         let expected = handle.expected_version;
         let version = expected + 1;
-        let (mtime, size, etag) = (now_secs(), content.len() as i64, info.etag.clone());
+        let (mtime, size, etag) = (now_secs(), len as i64, info.etag.clone());
         let backend = self.objects.backend_id();
         let key2 = key.clone();
         let result = self.mutate(&comps[..comps.len() - 1], |conn, entries| {
@@ -1335,14 +1340,25 @@ impl Core {
     /// pre-check and the transaction) are re-judged INSIDE the
     /// transaction; the pre-check only avoids wasted uploads.
     ///
-    /// The reader must be seekable (the server spools to a temp file
-    /// first) so the envelope digest can be computed without buffering.
+    /// Memory shape (S4.23): the envelope is encoded in a SINGLE streaming
+    /// pass — header, payload chunks (checksum updated in flight), footer —
+    /// and handed straight to `put_stream`, which uploads in bounded
+    /// buffers (single PUT ≤8 MiB objects, 8 MiB parts above). The full
+    /// encoded object never exists in memory and the source is never
+    /// rewound, so the reader no longer needs to be seekable (the server
+    /// still spools to a temp file for HTTP framing and declared-length
+    /// validation).
+    ///
+    /// `len` is the CALLER-declared logical file length and is stored as
+    /// such (entry size, file_versions.size). This build's server writes
+    /// raw encoding only, so it is also the envelope payload length; a
+    /// future trusted-client encoder owns any other relationship.
     pub fn write_stream(
         &self,
         path: &str,
         expected_version: Option<i64>,
         create: bool,
-        reader: &mut dyn envelope::ReadSeek,
+        reader: &mut dyn std::io::Read,
         len: u64,
     ) -> Result<Node> {
         let comps = Self::split_path(path)?;
@@ -1366,13 +1382,13 @@ impl Core {
             None => {}
         }
         let key = data_key(&new_object_id());
-        let mut spooled = Vec::new();
-        envelope::seal_stream(ObjKind::Data, reader, len, &mut spooled)
-            .map_err(|e| Error::Storage(format!("seal stream: {e}")))?;
         // Upload completes BEFORE the transaction opens (no SQLite write
         // lock is ever held across an upload). The PUT response already
         // carries the etag — the old separate HEAD per write is gone.
-        let info = self.objects.put(&key, &spooled)?;
+        let mut enc = envelope::seal_reader(ObjKind::Data, reader, len);
+        let info = self
+            .objects
+            .put_stream(&key, &mut enc, envelope::encoded_len(len))?;
         let backend = self.objects.backend_id();
         let etag = info.etag;
         let result = self.mutate(&comps[..comps.len() - 1], |conn, entries| {
@@ -1470,7 +1486,7 @@ impl Core {
         &self,
         file_id: i64,
         expected_version: Option<i64>,
-        reader: &mut dyn envelope::ReadSeek,
+        reader: &mut dyn std::io::Read,
         len: u64,
     ) -> Result<Node> {
         let entry = self.locate_by_id(file_id, "")?;
@@ -1572,7 +1588,4 @@ impl WriteHandle {
         Ok(data.len())
     }
 
-    fn snapshot(&self) -> Vec<u8> {
-        self.buf.lock().unwrap().clone()
-    }
 }

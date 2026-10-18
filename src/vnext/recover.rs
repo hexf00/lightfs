@@ -163,7 +163,7 @@ mod tests {
         assert!(report
             .rejected
             .iter()
-            .any(|r| r.reason.contains("unknown format version")));
+            .any(|r| r.reason.contains("unsupported format version")));
         assert!(report
             .rejected
             .iter()

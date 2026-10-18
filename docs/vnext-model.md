@@ -18,8 +18,8 @@ backend-neutrality boundaries sit.
   Optimistic per-file CAS (`(file_id, version)` unique) makes writer
   conflicts explicit; ref heads advance by CAS.
 - **The object store is PAYLOAD-ONLY**: immutable data objects
-  (`objects/{object-id}.data`, envelope v1: magic, format version,
-  kind, encoder, cipher, logical length, sha256) plus backend-internal
+  (`objects/{object-id}.data`, envelope v2 — format, checksum scope and
+  length semantics are specified in §6) plus backend-internal
   physical structures. Normal commits write NOTHING else — no
   `meta/refs`, no `meta/commits`, no `meta/trees` (the S4.19
   per-commit recovery copies are gone, not deferred or batched).
@@ -90,7 +90,7 @@ backend-neutrality boundaries sit.
 ## 2. Commit protocol
 
 ```
-1. PUT data object   (envelope v1, immutable Object-ID key) — NO SQLite
+1. PUT data object   (envelope v2, immutable Object-ID key) — NO SQLite
                      write lock is held across the upload
 2. BEGIN IMMEDIATE   walk base trees INSIDE the tx (no stale-snapshot
                      lost updates); REGISTER the uploaded object
@@ -158,9 +158,9 @@ missing SQLite fails the store open, so gc has no entry point at all.
 `vnext::recover::salvage_all_data` enumerates the data prefix (a
 DECLARED capability of this salvage path — a backend without
 enumeration cannot offer it, explicitly), verifies each object's
-envelope (magic, format version, kind, encoder/cipher, logical length,
-sha256) and exports byte-exact payloads with their original physical
-LOCATORS — diagnostic information only, never parsed into a logical
+envelope (magic, format version, kind, encoder/cipher, checksum id,
+payload length, footer checksum — §6) and exports byte-exact payloads
+with their original physical LOCATORS — diagnostic information only, never parsed into a logical
 identity (S4.21 rule: no File ID is claimed from key shape) — and
 per-object status:
 corrupt, unknown-format, unknown-type and unreadable objects are
@@ -208,3 +208,84 @@ database-loss guarantee to content salvage. The COW tree, CAS, ref and
 envelope model is unchanged. Legacy `meta/` objects from S4.19-era
 deployments may exist in old buckets; nothing in vnext reads them
 anymore, and nothing deletes them automatically.
+
+## 6. Object encoding layer (S4.23)
+
+**Responsibilities.** The CORE owns files, versions, CAS, commits and
+logical references — it contains no envelope byte arithmetic (no header
+size, no footer offset); it speaks only the encoding layer's API:
+`encoded_len`, `prefix_range`, `payload_range`, `payload_slice`,
+`seal`/`open`, `seal_reader`. The ENCODING LAYER (`vnext::envelope`)
+owns the wire format and integrity. The PHYSICAL BACKEND persists,
+reads back (whole or ranged) and honestly declares capabilities; it
+never interprets envelope bytes (S3-side checksums/multipart/ETag are
+the backend's own concerns, not contract terms for other backends).
+
+**Wire format v2** (replaces v1; v1 objects are refused by name, no
+migration branch — pre-v2 buckets fail closed at first read):
+
+```
+0    4   magic "LF2\n"
+4    1   format version = 2
+5    1   object type (1 data, 2 tree, 3 commit, 4 ref, 5 namespace)
+6    1   encoder id (0 = raw; unknown → explicit refusal)
+7    1   cipher id (0 = none; unknown → explicit refusal)
+8    1   checksum algorithm id (1 = SHA-256; unknown → refusal)
+9    3   reserved (must be zero)
+12   8   payload length (little-endian)
+20   ..  payload
+end-32  FOOTER: SHA-256( header[0..20] || payload[0..len] )
+```
+
+Total overhead is 52 bytes per object — identical to v1. The checksum
+covers the canonical header AND the full payload (v1 covered the
+payload only), so metadata tampering is detected on a full read. The
+footer is computable in one streaming pass — the v1 header digest
+required hashing before writing, hence a second pass or a full in-memory
+copy; v2 emits header, streams payload through the hasher, then emits
+the footer.
+
+**Length vocabulary (do not collapse these).** LOGICAL FILE LENGTH —
+how long the application's file is; owned by the caller/core metadata,
+UNKNOWN to the envelope. PAYLOAD LENGTH — the 8-byte header field, the
+only length this format defines and the checksum's data scope.
+PHYSICAL ENCODED LENGTH — `header + payload + footer`, known before any
+upload. Under `enc=0` (raw) all three coincide; that identity belongs
+to the raw encoder id, NOT to the format. A future trusted-client
+encoder (compression or AEAD applied before the RPC) delivers
+ciphertext payloads: the server still verifies what it sees (header +
+ciphertext), learns nothing about plaintext digests, keys or decoders,
+and the logical length becomes a property of that encoder's format.
+`enc`/`cipher`/checksum ids are refused explicitly when unknown; no
+envelope rule assumes payload bytes are readable plaintext.
+
+**Hash inventory (purposes are distinct; none of these is content
+deduplication):**
+
+| hash | where | purpose / invariant | owner |
+|---|---|---|---|
+| envelope SHA-256 footer | `vnext::envelope` | integrity of the bytes the encoding layer stores (header+payload); verified on FULL reads, pinned reads and salvage; never a lookup key | encoding layer |
+| Object ID digest | `core::new_object_id` = sha256(uuid)[:32hex] | UNIQUE key material only (`objects/{oid}.data`); randomness folding, not content addressing | core |
+| etag | object store responses | BACKEND VALIDATOR: recorded-vs-observed object identity on reads (and cache revalidation); for multipart uploads it is NOT an MD5 of content and is never described as one | physical backend |
+| SigV4 payload hash + HMAC-SHA256 | `sigv4.rs` / HTTP client | request signing (transport), per request | HTTP layer |
+| tree/commit content hashes | — | do not exist: SQLite is the sole metadata authority (S4.20); `Tree/Commit/Ref` kinds decode as legacy identifiers only | — |
+
+**Read guarantees by shape.** Full read: header fields, physical
+length and footer checksum all verified — a damaged object is refused,
+never served. Range read: ONE ranged GET from offset 0 (header +
+requested window; the footer is not fetched and adds NO request);
+deeper ranges: header GET + window GET; payload integrity rests on the
+recorded etag comparison. Pinned/past-commit reads: always full-verified.
+Empty objects decode and verify like any other. Unknown format/encoder/
+cipher/checksum id, non-canonical header, truncated payload, missing or
+wrong footer: all fail closed with named errors.
+
+**Memory bounds (measured, S4.23 report).** `write_stream` (the server
+RPC path): staging file on disk → single-pass streamed encode →
+`put_stream` (single PUT ≤8 MiB objects, 8 MiB parts above) → server
+upload-window peak RSS is FLAT in file size (~31-40 MB at 256 MiB, vs
+~277 MB linear on the pre-streaming build). `commit_write` (interactive
+session path) still holds the session buffer: O(file size), documented,
+NOT claimed bounded. Full reads (both paths) fetch and verify the whole
+object: O(file size) by contract — the streaming-read question is a
+separate, unclaimed task.
