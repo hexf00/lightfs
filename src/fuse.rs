@@ -1243,7 +1243,7 @@ impl Filesystem for FuseAdapter {
             }
         };
         let node_id = self.node_id_of(ino.0, &path);
-        match self.read_with_session(node_id, &path, offset, size as u64) {
+        match self.read_with_session(node_id as u64, &path, offset, size as u64) {
             Ok(data) => reply.data(&data),
             Err(e) => reply.error(errno(&e)),
         }
