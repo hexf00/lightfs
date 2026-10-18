@@ -360,11 +360,18 @@ the trait DEFAULT propagates the base-read error, which is exactly why
 every first flush of a new file failed on a real mount while in-process
 tests passed. Adapters must go through the override, not the default.
 
-**Zero-length reads never touch content.** A ranged HEAD read of 0
-bytes returns empty without resolving the object (POSIX read semantics).
-A file created but never written has NO object; truncate-extend of such
-a file (set_len before any flush) must not fail its base read. Nonzero
-reads keep the `ObjectMissing` contract, and whole-file
+**Reads at EOF never touch content.** An explicitly zero-length
+request returns empty without any object I/O. A file created but never
+written has NO object at all, and ANY read of it is end-of-file (POSIX)
+— never `ObjectMissing`. WinFsp accept A9 falsified the earlier
+"nonzero reads keep ObjectMissing" boundary: real filesystem reads
+always request >= 32 bytes (std::fs::read drives read_to_end), so a
+request-size-only short-circuit never fires for them. The precise
+contract, identical on all four read entries (`read` / `open_read` /
+`read_by_id` / `open_read_by_id`): zero-length REQUEST = success with
+no object I/O (even if the object is gone); a no-object file reading
+at/past EOF = empty; a file WITH an object always takes the verified
+path (an empty object is verified, never assumed). Whole-file
 `read_stream_by_id` stays strict — "no base" is a signal the commit
 merge consumes, not an error to erase.
 
