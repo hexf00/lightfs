@@ -1263,6 +1263,10 @@ fn s425_slow_reader_holds_budget_until_drop() {
 fn s425_failed_verification_releases_budget() {
     let mut cfg = fresh("s425fail");
     cfg.staging.budget_bytes = 8 * 1024 * 1024;
+    // private staging root for the residue assertion (parallel-test races)
+    let stage_root = std::env::temp_dir().join(format!("s425fail-stage-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&stage_root);
+    cfg.staging.dir = stage_root.to_string_lossy().to_string();
     let eng = lightfs::engine::open_engine(&cfg).unwrap();
     let big = spool_file("s425fail", 4 * 1024 * 1024);
     write_spooled(&eng.core, "/f.bin", &big, true, None);
