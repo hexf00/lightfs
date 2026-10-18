@@ -446,8 +446,13 @@ fn commit_write(fh: u64) -> Result<(), Error> {
     let (path, expected, mut drained) = {
         let mut writes = WRITES.lock().unwrap();
         let Some(sess) = writes.get_mut(&fh) else {
+            eprintln!("lightfs-winfsp: commit_write fh={fh}: NO SESSION (read-only handle)");
             return Ok(()); // read-only handle
         };
+        eprintln!(
+            "lightfs-winfsp: commit_write fh={fh} path={} dirty={} committed={} orphaned={} expected={}",
+            sess.path, sess.spool.is_dirty(), sess.committed, sess.orphaned, sess.expected_version
+        );
         if sess.committed {
             return Ok(());
         }
@@ -490,9 +495,17 @@ fn commit_write(fh: u64) -> Result<(), Error> {
             if let Some(v) = observed {
                 sess.rebase(v);
             }
+            eprintln!(
+                "lightfs-winfsp: commit_write fh={fh} FAILED ({e}); merged back dirty={} size={} expected={}",
+                sess.spool.is_dirty(),
+                sess.spool.size(),
+                sess.expected_version
+            );
             // mirror fuse.rs: the app saw this failure; release must not
             // retry it behind its back (flush_failed gates cb_release)
             sess.flush_failed = true;
+        } else {
+            eprintln!("lightfs-winfsp: commit_write fh={fh} FAILED ({e}); NO SESSION to merge back");
         }
         e
     };
@@ -512,6 +525,10 @@ fn commit_write(fh: u64) -> Result<(), Error> {
             }
         };
     drop(drained);
+    eprintln!(
+        "lightfs-winfsp: commit_write fh={fh} COMMITTED version={} size={}",
+        committed_node.version, committed_node.size
+    );
     let end = {
         let mut writes = WRITES.lock().unwrap();
         if let Some(sess) = writes.get_mut(&fh) {
