@@ -1,0 +1,41 @@
+# fuse-acceptance task line: dispatch-only Linux x86_64 build producing the
+# three binaries the ECS-native FUSE acceptance needs (lightfs server/mount,
+# lightfs-shell for the C3b cross-check, lightfs-accept runner).
+#
+# This is BUILD infrastructure for the gate environment, not a test entry:
+# acceptance verdicts come from lightfs-accept driving real FUSE mounts on
+# the ECS host. The BINARIES.sha file inside the artifact pins the exact
+# source SHA and binary hashes, so "the binary was built from the verified
+# source" is checkable on the target host.
+name: linux-gate-artifacts
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Toolchain is pinned by rust-toolchain.toml; rustup picks it up.
+      - name: Build release binaries
+        run: cargo build --release --bin lightfs --bin lightfs-shell --bin lightfs-accept
+
+      - name: Pin built SHA + binary hashes
+        run: |
+          {
+            echo "source-sha $(git rev-parse HEAD)"
+            sha256sum target/release/lightfs target/release/lightfs-shell target/release/lightfs-accept
+          } > BINARIES.sha
+          cat BINARIES.sha
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-binaries-${{ github.sha }}
+          path: |
+            target/release/lightfs
+            target/release/lightfs-shell
+            target/release/lightfs-accept
+            BINARIES.sha
+          retention-days: 14
