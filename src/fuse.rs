@@ -128,6 +128,12 @@ pub struct FuseAdapter {
     /// operations (reads, truncate) resolve the real node id here,
     /// falling back to one path lookup when unknown.
     node_ids: Mutex<HashMap<u64, i64>>,
+    /// inos that were last seen as FILE nodes. getattr's by-id fallback
+    /// (a cross-client rename changed the cached name) is restricted to
+    /// files: directory ids churn on every COW commit, so a stored dir id
+    /// goes stale by design and must never be trusted across a failed
+    /// path lookup.
+    file_ids: Mutex<HashMap<u64, ()>>,
     uid: u32,
     gid: u32,
 }
@@ -236,6 +242,7 @@ impl FuseAdapter {
             next_fh: AtomicU64::new(1),
             next_ino: AtomicU64::new(2),
             node_ids: Mutex::new(HashMap::new()),
+            file_ids: Mutex::new(HashMap::new()),
             uid,
             gid,
         }
@@ -254,11 +261,28 @@ impl FuseAdapter {
         ino
     }
 
-    /// `ino_for` plus the entry's node id (callers that know it).
-    fn ino_for_node(&self, path: &str, node_id: i64) -> u64 {
+    /// `ino_for` plus the entry's node id and kind (callers that have the
+    /// node at hand).
+    fn ino_for_node(&self, path: &str, node: &Node) -> u64 {
         let ino = self.ino_for(path);
-        self.node_ids.lock().unwrap().insert(ino, node_id);
+        self.node_ids.lock().unwrap().insert(ino, node.id);
+        if node.is_file() {
+            self.file_ids.lock().unwrap().insert(ino, ());
+        } else {
+            self.file_ids.lock().unwrap().remove(&ino);
+        }
         ino
+    }
+
+    /// The node id for an adapter FILE ino, when known. getattr's by-id
+    /// fallback (a cross-client rename changed the cached name) resolves
+    /// only files: directory ids churn on every COW commit and must stay
+    /// path-anchored.
+    fn file_node_id_of(&self, ino: u64) -> Option<i64> {
+        if !self.file_ids.lock().unwrap().contains_key(&ino) {
+            return None;
+        }
+        self.node_ids.lock().unwrap().get(&ino).copied()
     }
 
     /// The node id for an adapter ino. Id-anchored operations need the
@@ -308,7 +332,7 @@ impl FuseAdapter {
                 FileType::RegularFile
             };
             let child_path = Self::child_path(path, std::ffi::OsStr::new(&c.name));
-            let child_ino = self.ino_for_node(&child_path, c.id);
+            let child_ino = self.ino_for_node(&child_path, &c);
             entries.push((child_ino, kind, c.name.clone()));
         }
         entries
@@ -794,7 +818,7 @@ impl Filesystem for FuseAdapter {
             .map(|(n, _)| n.clone());
         if let Some(node) = cached {
             crate::metrics::observe("fuse.lookup.cache_hit", Duration::ZERO);
-            let ino = self.ino_for_node(&path, node.id);
+            let ino = self.ino_for_node(&path, &node);
             reply.entry(
                 &self.attr_ttl,
                 &attr_for(ino, &node, self.uid, self.gid),
@@ -804,7 +828,7 @@ impl Filesystem for FuseAdapter {
         }
         match self.fs.lookup(&path) {
             Ok(node) => {
-                let ino = self.ino_for_node(&path, node.id);
+                let ino = self.ino_for_node(&path, &node);
                 self.attr_cache
                     .lock()
                     .unwrap()
@@ -865,7 +889,31 @@ impl Filesystem for FuseAdapter {
                             .insert(path.clone(), (n.clone(), std::time::Instant::now()));
                         n
                     }
-                    Err(e) => return reply.error(errno(&e)),
+                    Err(e) => {
+                        // Cross-client rename (D5): the name this ino is
+                        // cached under was changed by ANOTHER mount, and
+                        // with ATTR_TTL=0 the kernel revalidates attrs
+                        // BEFORE serving reads through the open handle -
+                        // a path-anchored ENOENT here would break I/O that
+                        // POSIX requires to keep working. A FILE ino with
+                        // a known node id resolves BY ID instead. Identity
+                        // that is truly gone (unlink, rename-over) still
+                        // fails explicitly: lookup_by_id misses and the
+                        // original path-lookup error stands (D2/D3).
+                        match self
+                            .file_node_id_of(ino.0)
+                            .and_then(|id| self.fs.lookup_by_id(id, &path).ok())
+                        {
+                            Some(n) => {
+                                self.attr_cache
+                                    .lock()
+                                    .unwrap()
+                                    .insert(path.clone(), (n.clone(), std::time::Instant::now()));
+                                n
+                            }
+                            None => return reply.error(errno(&e)),
+                        }
+                    }
                 },
             }
         };
@@ -1115,7 +1163,7 @@ impl Filesystem for FuseAdapter {
         match self.fs.mkdir(&path, mode & 0o7777) {
             Ok(node) => {
                 self.dirent_invalidate();
-                let ino = self.ino_for_node(&path, node.id);
+                let ino = self.ino_for_node(&path, &node);
                 reply.entry(
                     &self.attr_ttl,
                     &attr_for(ino, &node, self.uid, self.gid),
@@ -1147,7 +1195,7 @@ impl Filesystem for FuseAdapter {
         match self.fs.symlink(&target, &path) {
             Ok(node) => {
                 self.dirent_invalidate();
-                let ino = self.ino_for_node(&path, node.id);
+                let ino = self.ino_for_node(&path, &node);
                 reply.entry(
                     &self.attr_ttl,
                     &attr_for(ino, &node, self.uid, self.gid),
@@ -1195,7 +1243,7 @@ impl Filesystem for FuseAdapter {
             Ok((node, fh)) => {
                 self.dirent_invalidate();
                 self.pending.drop_path(&path);
-                let ino = self.ino_for_node(&path, node.id);
+                let ino = self.ino_for_node(&path, &node);
                 reply.created(
                     &self.attr_ttl,
                     &attr_for(ino, &node, self.uid, self.gid),
