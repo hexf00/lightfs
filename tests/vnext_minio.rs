@@ -911,10 +911,6 @@ fn s423_damaged_and_legacy_objects_fail_closed() {
 
 // ---- S4.24: bounded full reads, read_at, salvage streaming, temp hygiene ----
 
-fn temp_residue() -> usize {
-    temp_residue_in(&std::env::temp_dir())
-}
-
 fn temp_residue_in(root: &std::path::Path) -> usize {
     // staging files live either in a managed `lightfs-staging-*` subdir
     // (engine/core path) or at the root itself (headless salvage budgets).
@@ -1064,7 +1060,22 @@ fn s424_salvage_rss_is_object_bounded_not_total_bounded() {
 
 #[test]
 fn s424_empty_file_and_dropped_reader_cleanup() {
-    let cfg = fresh("s424empty");
+    let mut cfg = fresh("s424empty");
+    // The drop-cleanup assertion counts staging files in a PRIVATE root:
+    // the system temp dir is shared with every concurrently-running test
+    // that stages (temp_residue's own warning), and one parallel run
+    // flaked exactly that way (2026-10-19: a neighbor's staging file
+    // landed inside the 50ms window; 5/5 green isolated, 25/25 serial,
+    // parallel rerun green). Teeth unchanged: the reader's staging file
+    // must still be gone after drop - now counted where only THIS engine
+    // stages.
+    let staging_root = std::env::temp_dir().join(format!(
+        "lightfs-s424-private-{}-{}",
+        std::process::id(),
+        "s424empty"
+    ));
+    std::fs::create_dir_all(&staging_root).unwrap();
+    cfg.staging.dir = staging_root.to_string_lossy().to_string();
     let eng = lightfs::engine::open_engine(&cfg).unwrap();
     let e0 = spool_file("s424e0", 0);
     write_spooled(&eng.core, "/empty", &e0, true, None);
@@ -1081,12 +1092,17 @@ fn s424_empty_file_and_dropped_reader_cleanup() {
     // dropping a published verified reader deletes its staging file
     let one = spool_file("s424one", 1);
     write_spooled(&eng.core, "/one", &one, true, None);
-    let before = temp_residue();
+    let before = temp_residue_in(&staging_root);
     let (mut rd, _) = eng.core.open_read("/one", 0, 1).unwrap();
     std::io::Read::read_exact(&mut rd, &mut [0u8; 1]).unwrap();
     drop(rd);
     std::thread::sleep(std::time::Duration::from_millis(50));
-    assert!(temp_residue() <= before, "staging file must be deleted on drop");
+    assert!(
+        temp_residue_in(&staging_root) <= before,
+        "staging file must be deleted on drop"
+    );
+    drop(eng); // the engine still uses its managed staging dir: tear the root down after
+    let _ = std::fs::remove_dir_all(&staging_root);
 }
 
 #[test]
@@ -1155,7 +1171,16 @@ fn s425_empty_file_object_is_verified_not_assumed() {
 
 #[test]
 fn s424_salvage_streaming_many_objects_bounded_report() {
-    let cfg = fresh("s424salvage");
+    let mut cfg = fresh("s424salvage");
+    // private staging root for the residue assertion: the global temp dir
+    // races with any concurrently-running test that stages (same flake
+    // class s424/s425 hit); teeth unchanged - a leaked salvage staging
+    // file still fails, now counted where only THIS engine stages.
+    let stage_root =
+        std::env::temp_dir().join(format!("s424salvage-stage-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&stage_root);
+    std::fs::create_dir_all(&stage_root).unwrap();
+    cfg.staging.dir = stage_root.to_string_lossy().to_string();
     let eng = lightfs::engine::open_engine(&cfg).unwrap();
     // 12 files of 64 KiB each through the streamed write path
     for i in 0..12u32 {
@@ -1172,7 +1197,7 @@ fn s424_salvage_streaming_many_objects_bounded_report() {
         .unwrap();
 
     let mut hashed: Vec<(String, u64, u64)> = Vec::new();
-    let before = temp_residue();
+    let before = temp_residue_in(&stage_root);
     let rep = lightfs::vnext::recover::salvage_all_data(
         eng.core.objects().as_ref(),
         &mut |loc: &str, len: u64, r: &mut dyn std::io::Read| {
@@ -1193,7 +1218,12 @@ fn s424_salvage_streaming_many_objects_bounded_report() {
     assert!(hashed.iter().all(|(_, l, _)| *l == 64 * 1024));
     assert!(rep.recovered.iter().all(|i| i.payload_len == 64 * 1024));
     std::thread::sleep(std::time::Duration::from_millis(50));
-    assert!(temp_residue() <= before, "salvage staging files must be cleaned");
+    assert!(
+        temp_residue_in(&stage_root) <= before,
+        "salvage staging files must be cleaned"
+    );
+    drop(eng); // managed staging dir must outlive the engine
+    let _ = std::fs::remove_dir_all(&stage_root);
 }
 
 // ---- S4.25 §二: staging admission on the read path ----
@@ -1285,7 +1315,13 @@ fn s425_failed_verification_releases_budget() {
     let last = damaged.len() - 1;
     damaged[last] ^= 0xff;
     raw.put(&key, &damaged).unwrap();
-    let before = temp_residue();
+    // `before` used to count the GLOBAL temp dir while the assert counts
+    // the private root - different scopes. Any concurrently-running test
+    // with a live staging file made `before >= 1` while the private side
+    // correctly read 0, failing a healthy engine (observed 2026-10-19,
+    // parallel run). Same scope on both sides; a real leak still fails
+    // because the failed read's staging file would remain HERE.
+    let before = temp_residue_in(&stage_root);
     let err = eng
         .core
         .open_read("/f.bin", 0, 4 * 1024 * 1024)
