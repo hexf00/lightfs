@@ -10,6 +10,11 @@
 name: linux-gate-artifacts
 
 on:
+  # push-scoped to this task branch: a workflow that exists only on a
+  # non-default branch is not dispatchable until it has run once, and the
+  # fix loop wants an artifact per push anyway.
+  push:
+    branches: [fuse-acceptance]
   workflow_dispatch: {}
 
 jobs:
