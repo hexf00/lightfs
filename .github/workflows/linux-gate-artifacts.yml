@@ -24,14 +24,25 @@ jobs:
       - uses: actions/checkout@v4
 
       # Toolchain is pinned by rust-toolchain.toml; rustup picks it up.
-      - name: Build release binaries
-        run: cargo build --release --bin lightfs --bin lightfs-shell --bin lightfs-accept
+      # MUSL STATIC: the gate host is CentOS 7 (glibc 2.17) — glibc builds
+      # from the ubuntu runner (2.39) fail with GLIBC_x.y not found. A
+      # static musl binary has no host-libc dependency at all.
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build release binaries (x86_64-unknown-linux-musl)
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --target x86_64-unknown-linux-musl \
+            --bin lightfs --bin lightfs-shell --bin lightfs-accept
 
       - name: Pin built SHA + binary hashes
         run: |
           {
             echo "source-sha $(git rev-parse HEAD)"
-            sha256sum target/release/lightfs target/release/lightfs-shell target/release/lightfs-accept
+            sha256sum target/x86_64-unknown-linux-musl/release/lightfs \
+                      target/x86_64-unknown-linux-musl/release/lightfs-shell \
+                      target/x86_64-unknown-linux-musl/release/lightfs-accept
           } > BINARIES.sha
           cat BINARIES.sha
 
@@ -39,8 +50,8 @@ jobs:
         with:
           name: linux-binaries-${{ github.sha }}
           path: |
-            target/release/lightfs
-            target/release/lightfs-shell
-            target/release/lightfs-accept
+            target/x86_64-unknown-linux-musl/release/lightfs
+            target/x86_64-unknown-linux-musl/release/lightfs-shell
+            target/x86_64-unknown-linux-musl/release/lightfs-accept
             BINARIES.sha
           retention-days: 14
