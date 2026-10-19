@@ -1072,6 +1072,40 @@ fn rpc_post(server_url: &str, method: &str, params: &str) {
     assert!(ok, "rpc {method} failed: {resp}");
 }
 
+/// The node id the metadata AUTHORITY reports for a server-root-relative
+/// path, via a fresh `lightfs-shell stat` process (caches are off in the
+/// acceptance config). Cross-mount st_ino is NOT identity under vnext -
+/// every mount adapter numbers inos by its own first-encounter order -
+/// so assertions on node identity must read the id, not an st_ino.
+fn shell_stat_id(ctx: &Ctx, path: &str, what: &str) -> i64 {
+    let shell = ctx
+        .shell
+        .as_ref()
+        .unwrap_or_else(|| panic!("{what}: --shell is required for the node-id check"));
+    let out = Command::new(shell)
+        .args(["--config"])
+        .arg(&ctx.config)
+        .args(["--server", &ctx.server_url, "stat", path])
+        .output()
+        .unwrap_or_else(|e| panic!("{what}: shell spawn failed: {e}"));
+    if !out.status.success() {
+        panic!(
+            "{what}: shell stat failed ({:?}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("id: ") {
+            return v.trim().parse().unwrap_or_else(|_| {
+                panic!("{what}: shell stat id unparsable: {line:?}");
+            });
+        }
+    }
+    panic!("{what}: shell stat reported no id line: {text:?}");
+}
+
 fn section_b(ctx: &mut Ctx, root: &Path) {
     println!("--- B: flush paths ---");
     let sm = root.join("sm");
@@ -1886,10 +1920,15 @@ fn section_d(ctx: &mut Ctx, root: &Path, root2: &Path) {
     // D7 identity survives a server restart: metadata (node id, version)
     // is durable, so an open handle's CAS anchor still matches after the
     // restart and the commit lands on the SAME node - never on a lookalike.
+    // The id is read through the network client (shell stat), not through
+    // either mount: adapter inos are adapter-local counters under vnext
+    // (S4.25) and are not comparable across mounts - the pre-vnext core
+    // had ino==node.id globally, which is what the old cross-mount st_ino
+    // assertion silently assumed.
     {
         let f7 = root.join("d/persist");
         write_strong(&f7, b"PERSIST", "D7 seed");
-        let ino7 = ino_of(&f7);
+        let id7 = shell_stat_id(ctx, "/d/persist", "D7 before restart");
         let mut fa = open_rw(&f7);
         write_at(&mut fa, 7, b"X");
         ctx.kill_server();
@@ -1903,8 +1942,8 @@ fn section_d(ctx: &mut Ctx, root: &Path, root2: &Path) {
             b"PERSISTX",
         );
         assert_eq!(
-            ino_of(&root2.join("d/persist")),
-            ino7,
+            shell_stat_id(ctx, "/d/persist", "D7 after restart"),
+            id7,
             "D7: node id survives the restart"
         );
         println!("  OK  D7 identity + CAS anchor survive server restart");
